@@ -1,0 +1,17 @@
+# 上游源码与构建产物
+/build/
+/out/
+
+# 厂商固件与备份镜像，按 docs/firmware.md 在本地放置
+/kernel/firmware/*
+!/kernel/firmware/.gitkeep
+/dumps/
+
+# 本地归档
+/Archived/
+
+# 中间文件
+/.tmp/
+__pycache__/
+*.pyc
+/.ruff_cache/
