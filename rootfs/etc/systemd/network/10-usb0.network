@@ -1,0 +1,9 @@
+# USB ECM gadget 在设备侧呈现为 usb0，与主机 10.0.0.1/24 对接。
+# 仅用于直连 SSH 与控制台，主机不做转发，因此不设置默认网关与 DNS，
+# 避免抢占 wlan0 的上网路由；关闭 IPv6 链路本地地址，避免主机侧出现多余路由。
+[Match]
+Name=usb0
+
+[Network]
+Address=10.0.0.2/24
+LinkLocalAddressing=no

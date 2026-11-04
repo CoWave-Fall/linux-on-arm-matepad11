@@ -1,0 +1,27 @@
+# LoA：设备 USB ECM 网络的主机侧连接配置
+#
+# 安装位置：/etc/NetworkManager/system-connections/loa-usb0.nmconnection
+# 权限必须为 600，否则 NetworkManager 拒绝加载。
+#
+# 之前由 NetworkManager 自动生成的 DHCP 配置会持续失败，因为设备侧
+# 不提供 DHCP 服务。这里显式配置静态地址，并设置 never-default，
+# 避免把设备的链路当作主机默认路由。
+
+[connection]
+id=loa-usb0
+uuid=168f0ecb-58f1-475f-83b3-57be1411f72e
+type=ethernet
+interface-name=loa-usb0
+autoconnect=true
+autoconnect-priority=100
+
+[ethernet]
+mac-address-blacklist=
+
+[ipv4]
+method=manual
+address1=10.0.0.1/24
+never-default=true
+
+[ipv6]
+method=ignore

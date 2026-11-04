@@ -1,0 +1,13 @@
+# LoA：将设备的 USB ECM 网口固定命名为 loa-usb0
+#
+# 主机侧网口名原本随 USB 端口变化（enp103s0f3u1i2 一类），导致
+# NetworkManager 配置失效。设备侧 gadget 固定使用
+# 02:11:22:33:44:56 作为主机端 MAC，据此匹配即可获得稳定名称。
+#
+# 安装位置：/etc/systemd/network/10-loa-usb0.link
+
+[Match]
+MACAddress=02:11:22:33:44:56
+
+[Link]
+Name=loa-usb0
