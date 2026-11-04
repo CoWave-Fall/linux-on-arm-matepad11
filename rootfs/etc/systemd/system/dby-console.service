@@ -1,0 +1,13 @@
+[Unit]
+Description=DBY-W09 USB ACM console
+After=sys-kernel-config.mount
+Wants=sys-kernel-config.mount
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/dby-console.sh
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
