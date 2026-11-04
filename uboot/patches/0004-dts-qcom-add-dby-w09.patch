@@ -1,0 +1,240 @@
+From: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
+Subject: [PATCH] dts: qcom: add Huawei MatePad 11 (DBY-W09)
+
+Applied to U-Boot v2026.10.
+
+Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
+
+--- /dev/null
++++ b/dts/upstream/src/arm64/qcom/sm8250-huawei-dby-w09.dts
+@@ -0,0 +1,230 @@
++// SPDX-License-Identifier: BSD-3-Clause
++/*
++ * Huawei MatePad 11 2021 (DBY-W09), Qualcomm SM8250 (kona).
++ *
++ * U-Boot 设备树：内存布局、连续显示帧缓冲、调试串口、按键、SD 卡、
++ * USB 2.0 外设模式与 UFS。
++ */
++
++/dts-v1/;
++
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/input/linux-event-codes.h>
++#include <dt-bindings/regulator/qcom,rpmh-regulator.h>
++#include <dt-bindings/arm/qcom,ids.h>
++#include "sm8250.dtsi"
++#include "pm8150.dtsi"
++
++/ {
++	model = "Huawei MatePad 11 (DBY-W09)";
++	compatible = "qcom,kona-qrd", "qcom,kona", "qcom,qrd";
++
++	/* SM8250 v2.1，与设备 qcom,msm-id / qcom,board-id 一致 */
++	qcom,msm-id = <QCOM_ID_SM8250 0x20001>;
++	qcom,board-id = <0x200e 0>;
++
++	aliases {
++		serial0 = &uart12;
++	};
++
++	/*
++	 * 内存布局取自设备运行时设备树。
++	 * 节点名保持为 memory：U-Boot 的 qcom_parse_memory()
++	 * 按固定路径 /memory 查找。
++	 */
++	memory {
++		device_type = "memory";
++		reg = <0x0 0x80000000 0x0 0x3bb00000>,
++		      <0x0 0xc0000000 0x0 0xc0000000>,
++		      <0x1 0x80000000 0x1 0x0>;
++	};
++
++	reserved-memory {
++		/* XBL 初始化显示后保留的连续帧缓冲，U-Boot 直接复用 */
++		cont_splash_mem: cont-splash@9c000000 {
++			reg = <0x0 0x9c000000 0x0 0x2300000>;
++			no-map;
++		};
++	};
++
++	chosen {
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++
++		stdout-path = "serial0:115200n8";
++
++		framebuffer: framebuffer@9c000000 {
++			compatible = "simple-framebuffer";
++			reg = <0x0 0x9c000000 0x0 0x2300000>;
++			width = <1600>;
++			height = <2560>;
++			stride = <(1600 * 4)>;
++			format = "a8r8g8b8";
++		};
++	};
++
++	/*
++	 * 音量上键：PM8150 GPIO 6，低电平有效。
++	 * 音量下键由 PM8150 的 resin 输入提供，见文件末尾的 &pon_resin。
++	 */
++	gpio-keys {
++		compatible = "gpio-keys";
++		pinctrl-names = "default";
++		pinctrl-0 = <&vol_up_n>;
++
++		key-vol-up {
++			label = "Volume Up";
++			gpios = <&pm8150_gpios 6 GPIO_ACTIVE_LOW>;
++			linux,code = <KEY_VOLUMEUP>;
++			debounce-interval = <15>;
++			linux,can-disable;
++		};
++	};
++};
++
++&qupv3_id_1 {
++	status = "okay";
++};
++
++&uart12 {
++	status = "okay";
++};
++
++/*
++ * SD 卡供电取自 PM8150L 的 LDO6（vqmmc）与 LDO9（vmmc）。
++ * 电压范围与原厂设备树一致：LDO6 1.8-2.96 V，LDO9 2.7-2.96 V。
++ */
++&apps_rsc {
++	regulators-1 {
++		compatible = "qcom,pm8150l-rpmh-regulators";
++		qcom,pmic-id = "c";
++
++		vreg_l6c_2p96: ldo6 {
++			regulator-name = "vreg_l6c_2p96";
++			regulator-min-microvolt = <1800000>;
++			regulator-max-microvolt = <2960000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++			regulator-allow-set-load;
++			regulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM
++						   RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		vreg_l9c_2p96: ldo9 {
++			regulator-name = "vreg_l9c_2p96";
++			regulator-min-microvolt = <2704000>;
++			regulator-max-microvolt = <2960000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++			regulator-allow-set-load;
++			regulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM
++						   RPMH_REGULATOR_MODE_HPM>;
++		};
++	};
++};
++
++&sdhc_2 {
++	status = "okay";
++
++	bus-width = <4>;
++	cap-sd-highspeed;
++	/*
++	 * 与 Linux 侧保持 202 MHz。该频率由 GPLL9 提供，201.5 MHz 不在
++	 * SDCC2 频率表中，qcom_find_freq 会向上取到同一档位。
++	 */
++	max-frequency = <202000000>;
++
++	vmmc-supply = <&vreg_l9c_2p96>;
++	vqmmc-supply = <&vreg_l6c_2p96>;
++
++	/*
++	 * 原厂设备树写作高电平有效，但卡检测引脚带内部上拉、插卡时拉低，
++	 * 按低电平有效配置才能与 U-Boot 的 dm_gpio 极性处理一致。
++	 */
++	cd-gpios = <&tlmm 77 GPIO_ACTIVE_LOW>;
++
++	pinctrl-names = "default";
++	pinctrl-0 = <&sdc2_default_state &sdc2_cd_default>;
++};
++
++&tlmm {
++	sdc2_default_state: sdc2-default-state {
++		clk-pins {
++			pins = "sdc2_clk";
++			bias-disable;
++			drive-strength = <16>;
++		};
++
++		cmd-pins {
++			pins = "sdc2_cmd";
++			bias-pull-up;
++			drive-strength = <10>;
++		};
++
++		data-pins {
++			pins = "sdc2_data";
++			bias-pull-up;
++			drive-strength = <10>;
++		};
++	};
++
++	sdc2_cd_default: sdc2-cd-default-state {
++		pins = "gpio77";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-pull-up;
++	};
++};
++
++/*
++ * USB 2.0 外设模式。只启用 HS PHY，避免 dwc3 在高层 PHY 未就绪时
++ * 探测失败。
++ */
++&usb_1 {
++	status = "okay";
++
++	/* 未启用 SS PHY，由 UTMI 时钟充当 PIPE 时钟 */
++	qcom,select-utmi-as-pipe-clk;
++};
++
++&usb_1_dwc3 {
++	dr_mode = "peripheral";
++	maximum-speed = "high-speed";
++	phys = <&usb_1_hsphy>;
++	phy-names = "usb2-phy";
++};
++
++&usb_1_hsphy {
++	status = "okay";
++};
++
++/* 电源键由 PM8150 PON 的 KPDPWR 输入提供 */
++&pon_pwrkey {
++	status = "okay";
++};
++
++&pon_resin {
++	linux,code = <KEY_VOLUMEDOWN>;
++	status = "okay";
++};
++
++/*
++ * 内置 UFS。XBL 启动时已完成链路与设备初始化，
++ * U-Boot 重新初始化控制器后即可枚举出 SCSI 磁盘与 GPT 分区。
++ */
++&ufs_mem_hc {
++	status = "okay";
++};
++
++&ufs_mem_phy {
++	status = "okay";
++};
++
++&pm8150_gpios {
++	vol_up_n: vol-up-n-state {
++		pins = "gpio6";
++		function = "normal";
++		power-source = <1>;
++		input-enable;
++		bias-pull-up;
++	};
++};
