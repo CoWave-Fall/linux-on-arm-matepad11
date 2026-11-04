@@ -1,0 +1,52 @@
+From: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
+Subject: [PATCH] board: qualcomm: add the DBY-W09 default environment
+
+Applied to U-Boot v2026.10.
+
+Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
+
+--- /dev/null
++++ b/board/qualcomm/dby-w09.env
+@@ -0,0 +1,42 @@
++bootdelay=0
++bootretry=1
++stdin=serial,button-kbd
++stdout=serial,vidconsole
++stderr=serial,vidconsole
++fastboot=fastboot -l $fastboot_addr_r usb 0
++preboot=scsi scan
++
++# Linux 从 reserved3 中的 FIT 启动。该分区为 24 MiB，整块读入内存；
++# bootm 只解析 FIT 头部声明的长度，尾部未写入的扇区不影响启动。
++# bootargs 由环境变量传入，FIT 配置里的 bootargs 不生效。
++#
++# root=PARTLABEL=archroot 与 scripts/install-rootfs.sh 创建的 GPT 分区
++# 标号一致。clk_ignore_unused 与 pd_ignore_unused 保住引导阶段已点亮的
++# 时钟与电源域。
++bootargs=console=tty0 loglevel=4 panic=10 clk_ignore_unused pd_ignore_unused root=PARTLABEL=archroot rw rootwait rootfstype=f2fs
++fit_part=reserved3
++fit_addr=0x98000000
++fit_blocks=0xc000
++boot_linux=part start scsi 0 ${fit_part} cs && scsi read ${fit_addr} ${cs} ${fit_blocks} && bootm ${fit_addr}
++
++# misc 中的 boot-recovery 让 ABL 进入 recovery（U-Boot）。只清空 command
++# 字段，保留 misc 其余内容，ABL 按正常流程启动 HarmonyOS。
++boot_harmonyos=bcb load scsi 0 misc && bcb clear command && bcb store && reset
++
++# 每次开机显示启动菜单，10 秒后执行第一项。
++bootcmd=run menucmd
++
++# 音量下放在首位：电源键与音量下同时按住时优先进入 fastboot。
++button_cmd_0_name=Volume Down
++button_cmd_0=run fastboot
++button_cmd_1_name=Volume Up
++button_cmd_1=run menucmd
++button_cmd_2_name=Power Button
++button_cmd_2=run menucmd
++
++menucmd=bootmenu
++bootmenu_delay=10
++bootmenu_0=Boot Linux from reserved3=run boot_linux
++bootmenu_1=Boot HarmonyOS=run boot_harmonyos
++bootmenu_2=Enable fastboot mode=run fastboot
++bootmenu_3=Reset device=reset
