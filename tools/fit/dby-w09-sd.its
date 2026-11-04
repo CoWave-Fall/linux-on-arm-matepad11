@@ -1,0 +1,43 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// DBY-W09 SD 根文件系统启动 FIT：只含内核与设备树，根在 microSD
+/dts-v1/;
+
+/ {
+	description = "DBY-W09 Linux (sm8250) SD root";
+	#address-cells = <2>;
+
+	images {
+		kernel {
+			description = "Linux Image";
+			data = /incbin/("Image.gz");
+			type = "kernel";
+			arch = "arm64";
+			os = "linux";
+			compression = "gzip";
+			load = <0x0 0x91000000>;
+			entry = <0x0 0x91000000>;
+		};
+
+		/*
+		 * 内核解压后约 44 MiB（0x91000000 至 0x93C00000），
+		 * 设备树必须落在其上方，否则会被解压覆盖。
+		 */
+		fdt {
+			description = "DBY-W09 DTB";
+			data = /incbin/("dby-w09.dtb");
+			type = "flat_dt";
+			arch = "arm64";
+			compression = "none";
+			load = <0x0 0x96000000>;
+		};
+	};
+
+	configurations {
+		default = "conf";
+		conf {
+			kernel = "kernel";
+			fdt = "fdt";
+			/* bootargs 由 U-Boot 环境变量传入，此处不生效 */
+		};
+	};
+};
