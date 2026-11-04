@@ -1,0 +1,75 @@
+From: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
+Subject: [PATCH] gpio: qcom_pmic: support bias and input pin configuration
+
+Applied to U-Boot v2026.10.
+
+Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
+
+--- a/drivers/gpio/qcom_pmic_gpio.c
++++ b/drivers/gpio/qcom_pmic_gpio.c
+@@ -56,6 +56,9 @@
+ #define REG_DIG_VIN_VIN0       0
+ 
+ #define REG_DIG_PULL_CTL       0x42
++#define REG_DIG_PULL_MASK      0x7
++#define REG_DIG_PULL_UP_30     0x0
++#define REG_DIG_PULL_DOWN      0x4
+ #define REG_DIG_PULL_NO_PU     0x5
+ 
+ #define REG_LV_MV_OUTPUT_CTL	0x44
+@@ -362,6 +365,10 @@
+ };
+ 
+ static const struct pinconf_param qcom_pmic_pinctrl_conf_params[] = {
++	{ "bias-pull-up", PIN_CONFIG_BIAS_PULL_UP, 1 },
++	{ "bias-pull-down", PIN_CONFIG_BIAS_PULL_DOWN, 1 },
++	{ "bias-disable", PIN_CONFIG_BIAS_DISABLE, 1 },
++	{ "input-enable", PIN_CONFIG_INPUT_ENABLE, 1 },
+ 	{ "output-high", PIN_CONFIG_OUTPUT_ENABLE, 1 },
+ 	{ "output-low", PIN_CONFIG_OUTPUT, 0 },
+ };
+@@ -386,9 +393,41 @@
+ static int qcom_pmic_pinctrl_pinconf_set(struct udevice *dev, unsigned int selector,
+ 					 unsigned int param, unsigned int arg)
+ {
+-	/* We only support configuring the pin as an output, either low or high */
+-	return _qcom_gpio_set_direction(dev, selector, false,
+-					param == PIN_CONFIG_OUTPUT_ENABLE);
++	struct qcom_pmic_gpio_data *plat = dev_get_plat(dev);
++	u32 gpio_base = plat->pid + REG_OFFSET(selector);
++	int ret;
++
++	/*
++	 * PIN_CONFIG_BIAS_* 只写 pull 寄存器，不改变引脚方向与使能位。
++	 * 调用方需要先通过 GPIO 接口或 input-enable/output 属性完成方向
++	 * 配置；button-gpio 先请求 GPIO 并进入输入模式，满足该前提。
++	 */
++	switch (param) {
++	case PIN_CONFIG_BIAS_PULL_UP:
++		ret = pmic_clrsetbits(plat->pmic, gpio_base + REG_DIG_PULL_CTL,
++				      REG_DIG_PULL_MASK, REG_DIG_PULL_UP_30);
++		break;
++	case PIN_CONFIG_BIAS_PULL_DOWN:
++		ret = pmic_clrsetbits(plat->pmic, gpio_base + REG_DIG_PULL_CTL,
++				      REG_DIG_PULL_MASK, REG_DIG_PULL_DOWN);
++		break;
++	case PIN_CONFIG_BIAS_DISABLE:
++		ret = pmic_clrsetbits(plat->pmic, gpio_base + REG_DIG_PULL_CTL,
++				      REG_DIG_PULL_MASK, REG_DIG_PULL_NO_PU);
++		break;
++	case PIN_CONFIG_INPUT_ENABLE:
++		ret = _qcom_gpio_set_direction(dev, selector, true, 0);
++		break;
++	case PIN_CONFIG_OUTPUT_ENABLE:
++	case PIN_CONFIG_OUTPUT:
++		ret = _qcom_gpio_set_direction(dev, selector, false,
++					       param == PIN_CONFIG_OUTPUT_ENABLE);
++		break;
++	default:
++		return -ENOTSUPP;
++	}
++
++	return ret;
+ }
+ 
+ static const char *qcom_pmic_pinctrl_get_function_name(struct udevice *dev, unsigned int selector)
