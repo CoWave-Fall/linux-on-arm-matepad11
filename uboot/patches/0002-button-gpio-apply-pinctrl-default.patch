@@ -1,0 +1,35 @@
+From: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
+Subject: [PATCH] button: gpio: apply the default pinctrl state after requesting GPIOs
+
+Applied to U-Boot v2026.10.
+
+Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
+
+--- a/drivers/button/button-gpio.c
++++ b/drivers/button/button-gpio.c
+@@ -6,6 +6,7 @@
+ #include <button.h>
+ #include <dm.h>
+ #include <dm/lists.h>
++#include <dm/pinctrl.h>
+ #include <dm/uclass-internal.h>
+ #include <log.h>
+ #include <asm/gpio.h>
+@@ -59,6 +60,17 @@
+ 	if (ret || !dm_gpio_is_valid(&priv->gpio))
+ 		return ret;
+ 
++	/*
++	 * PMIC GPIO 在 direction_input 时会把上拉写成“无上拉”，悬空引脚
++	 * 的读数会漂移。请求 GPIO 之后按设备树重新应用 pinctrl 默认状态，
++	 * 让 bias-pull-up 生效。状态通常写在 gpio-keys 父节点上。
++	 */
++	ret = pinctrl_select_state(dev, "default");
++	if (ret)
++		ret = pinctrl_select_state(dev->parent, "default");
++	if (ret && ret != -ENOSYS)
++		return ret;
++
+ 	ret = dev_read_u32(dev, "linux,code", &priv->linux_code);
+ 
+ 	return ret;
