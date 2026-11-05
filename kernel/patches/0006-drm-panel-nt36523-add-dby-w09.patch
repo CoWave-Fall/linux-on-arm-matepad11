@@ -1,0 +1,598 @@
+From: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
+Subject: [PATCH] drm: panel: nt36523: add Huawei DBY-W09 190_20d panel
+
+Applied to Linux 7.3.1.
+
+Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
+
+--- a/Documentation/devicetree/bindings/display/panel/novatek,nt36523.yaml
++++ b/Documentation/devicetree/bindings/display/panel/novatek,nt36523.yaml
+@@ -19,6 +19,7 @@
+     oneOf:
+       - items:
+           - enum:
++              - huawei,dby-w09-190-20d
+               - xiaomi,elish-boe-nt36523
+               - xiaomi,elish-csot-nt36523
+           - const: novatek,nt36523
+@@ -37,6 +38,15 @@
+   vddio-supply:
+     description: regulator that supplies the I/O voltage
+ 
++  vci-supply:
++    description: regulator that supplies the analog voltage
++
++  vsp-supply:
++    description: regulator that supplies the positive bias voltage
++
++  vsn-supply:
++    description: regulator that supplies the negative bias voltage
++
+ required:
+   - compatible
+   - reg
+--- a/drivers/gpu/drm/panel/panel-novatek-nt36523.c
++++ b/drivers/gpu/drm/panel/panel-novatek-nt36523.c
+@@ -28,11 +28,18 @@
+ 	struct drm_panel panel;
+ 	struct mipi_dsi_device *dsi[2];
+ 	const struct panel_desc *desc;
++	struct drm_connector *connector;
+ 	enum drm_panel_orientation orientation;
+ 
+ 	struct gpio_desc *reset_gpio;
+ 	struct backlight_device *backlight;
+ 	struct regulator *vddio;
++	struct regulator *vci;
++	struct regulator *vsp;
++	struct regulator *vsn;
++
++	/* 首次上电前需要一次真实断电，见 nt36523_boot_power_cycle() */
++	bool boot_power_cycled;
+ };
+ 
+ struct panel_desc {
+@@ -51,6 +58,8 @@
+ 
+ 	bool is_dual_dsi;
+ 	bool has_dcs_backlight;
++	/* 引导阶段可能保持面板供电，首次 prepare 前需要一次真实断电 */
++	bool power_cycle_on_boot;
+ };
+ 
+ static inline struct panel_info *to_panel_info(struct drm_panel *panel)
+@@ -887,6 +896,229 @@
+ 	return dsi_ctx.accum_err;
+ }
+ 
++/*
++ * DBY-W09 的 190_20d 面板。命令流逐条取自厂商设备树
++ * lcd_kit_debussy_190_20d_10p9_qcom 的 qcom,mdss-dsi-on-command，
++ * 按 dsi_lp_mode 下发；双 DSI 两侧收到完全相同的初始化序列。
++ */
++static int dby_w09_190_20d_init_sequence(struct panel_info *pinfo)
++{
++	struct mipi_dsi_device *dsi0 = pinfo->dsi[0];
++	struct mipi_dsi_device *dsi1 = pinfo->dsi[1];
++	struct mipi_dsi_multi_context dsi_ctx = { .dsi = NULL };
++	struct drm_crtc_state *crtc_state = NULL;
++	unsigned int vrefresh;
++
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0x20);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xfb, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x30, 0x10);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0x22);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xfb, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x9f, 0x50);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0x23);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xfb, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xa3, 0x50);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0x24);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xfb, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x55, 0x0b, 0x0b);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x59, 0x20);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x5a, 0x43);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x5b, 0x3c);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x5e, 0x00, 0x0b);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xb1, 0x0e);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xb2, 0x0d);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xab, 0x22);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xdb, 0x71);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xdc, 0x4b);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xe0, 0x4b);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xe2, 0x4b);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xe4, 0x4b);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xe6, 0x4b);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0x25);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xfb, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x1f, 0x43);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x20, 0x3c);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x26, 0x43);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x27, 0x3c);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x33, 0x43);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x34, 0x3c);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x3f, 0x00);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x45, 0x4b);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x48, 0x43);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x49, 0x3c);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x61, 0x43);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x62, 0x3c);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0x26);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xfb, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x02, 0x21);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x2f, 0x04);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x31, 0x04);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x32, 0x5e);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0xe0);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xfb, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x14, 0x60);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x16, 0xc0);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x4f, 0x02);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0xf0);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xfb, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x3a, 0x08);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0xd0);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xfb, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x1c, 0x88);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x1d, 0x08);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0x2a);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xfb, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x23, 0x0c);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0x27);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xfb, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x30, 0x02);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x76, 0x02);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x96, 0x02);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xf8, 0x02);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0x22);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xfb, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x6f, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x70, 0x11);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x73, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x74, 0x4b);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x76, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x77, 0x4b);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x8a, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x8b, 0x4b);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xa0, 0x3f);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xa9, 0x50);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xaa, 0x28);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xab, 0x28);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xad, 0x10);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xb8, 0x00);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xb9, 0x4b);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xba, 0x92);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xbb, 0x4b);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xbe, 0x04);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xbf, 0x4b);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xc0, 0x04);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xc1, 0x5b);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xc2, 0x00);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xc5, 0x00);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xc6, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xc7, 0x4b);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xca, 0x43);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xcb, 0x3c);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xce, 0x00);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xcf, 0x43);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xd0, 0x3c);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xd3, 0x43);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xd4, 0x3c);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xd7, 0x00);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xdc, 0x43);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xdd, 0x3c);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xe1, 0x43);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xe2, 0x3c);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xf2, 0x00);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xf3, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xf4, 0x4b);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0x26);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xfb, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x00, 0x81);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x01, 0xb0);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0x25);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xfb, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x13, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x14, 0x1c);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xbc, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xbd, 0x1c);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0x2a);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xfb, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x97, 0x3c);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x98, 0x02);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x99, 0x95);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x9a, 0x03);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x9b, 0x00);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x9c, 0x0b);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x9d, 0x0a);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x9e, 0x90);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0x10);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xfb, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xb9, 0x05);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0x20);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xfb, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x18, 0x40);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0x27);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xfb, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xd2, 0x00);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0x10);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xfb, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xb9, 0x02);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1,
++					  MIPI_DCS_SET_TEAR_ON, 0x00);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xbb, 0x13);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x3b, 0x03, 0xf1, 0x1a, 0x04, 0x04);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1,
++					  MIPI_DCS_EXIT_SLEEP_MODE);
++	mipi_dsi_msleep(&dsi_ctx, 50);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1,
++					  MIPI_DCS_SET_DISPLAY_ON);
++	mipi_dsi_msleep(&dsi_ctx, 20);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0xf0);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xfb, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x84, 0x08);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x85, 0x0c);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0x20);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xfb, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x31, 0x04);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x32, 0x44);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1,
++					  MIPI_DCS_SET_DISPLAY_BRIGHTNESS, 0x10);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0x25);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xfb, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x91, 0x1f);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x92, 0x0f);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x93, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x94, 0x18);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x95, 0x03);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x96, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0x24);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xfb, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xb8, 0x28);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0x27);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xfb, 0x01);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xd0, 0x31);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xd1, 0x84);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xd2, 0x30);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xde, 0x43);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xdf, 0x02);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0x10);
++
++	/*
++	 * 面板内部刷新率需要与主机时序一致。厂商的 to-30/60/120 命令在
++	 * 页 0x2a 的 0x23 寄存器依次写 0x0e/0x0c/0x0d，随后回到页 0x10。
++	 * DRM 在 pre_enable 之前已经换入新的 CRTC 状态，这里直接读取当前
++	 * 模式的垂直刷新率，缺省按 60 Hz 处理。
++	 */
++	if (pinfo->connector && pinfo->connector->state &&
++	    pinfo->connector->state->crtc)
++		crtc_state = pinfo->connector->state->crtc->state;
++
++	vrefresh = crtc_state ? drm_mode_vrefresh(&crtc_state->adjusted_mode) : 60;
++
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0x2a);
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xfb, 0x01);
++	switch (vrefresh) {
++	case 30:
++		mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x23, 0x0e);
++		break;
++	case 120:
++		mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x23, 0x0d);
++		break;
++	default:
++		mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0x23, 0x0c);
++		break;
++	}
++	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0x10);
++
++	return dsi_ctx.accum_err;
++}
++
+ static const struct drm_display_mode elish_boe_modes[] = {
+ 	{
+ 		.clock = (1600 + 60 + 8 + 60) * (2560 + 26 + 4 + 168) * 120 / 1000,
+@@ -931,6 +1163,58 @@
+ 	},
+ };
+ 
++/*
++ * 厂商时序按单侧 800 x 2560 给出：HFP 22、HPW 20、HBP 20，VFP 2853、
++ * VPW 4、VBP 237。绑定 DSI 模式下 DRM 模式按整屏填写，msm 驱动在
++ * dsi_host.c 中把水平时序二等分后分别下发给两个控制器，因此水平参数
++ * 取单侧值的两倍；垂直参数两侧共用，保持原值。
++ *
++ * 三档刷新率共用 1724 x 5654 x 60 = 584849 kHz 的像素时钟，只改变垂直
++ * 总计：120 Hz 取 2827（VFP 26），30 Hz 取 11308（VFP 8507）。面板的
++ * 内部刷新率由初始化序列末尾按当前模式写入 0x23 寄存器。
++ */
++static const struct drm_display_mode dby_w09_190_20d_modes[] = {
++	{
++		.clock = (1600 + 44 + 40 + 40) * (2560 + 2853 + 4 + 237) * 60 / 1000,
++		.hdisplay = 1600,
++		.hsync_start = 1600 + 44,
++		.hsync_end = 1600 + 44 + 40,
++		.htotal = 1600 + 44 + 40 + 40,
++		.vdisplay = 2560,
++		.vsync_start = 2560 + 2853,
++		.vsync_end = 2560 + 2853 + 4,
++		.vtotal = 2560 + 2853 + 4 + 237,
++		.width_mm = 145,
++		.height_mm = 232,
++	},
++	{
++		.clock = (1600 + 44 + 40 + 40) * (2560 + 26 + 4 + 237) * 120 / 1000,
++		.hdisplay = 1600,
++		.hsync_start = 1600 + 44,
++		.hsync_end = 1600 + 44 + 40,
++		.htotal = 1600 + 44 + 40 + 40,
++		.vdisplay = 2560,
++		.vsync_start = 2560 + 26,
++		.vsync_end = 2560 + 26 + 4,
++		.vtotal = 2560 + 26 + 4 + 237,
++		.width_mm = 145,
++		.height_mm = 232,
++	},
++	{
++		.clock = (1600 + 44 + 40 + 40) * (2560 + 8507 + 4 + 237) * 30 / 1000,
++		.hdisplay = 1600,
++		.hsync_start = 1600 + 44,
++		.hsync_end = 1600 + 44 + 40,
++		.htotal = 1600 + 44 + 40 + 40,
++		.vdisplay = 2560,
++		.vsync_start = 2560 + 8507,
++		.vsync_end = 2560 + 8507 + 4,
++		.vtotal = 2560 + 8507 + 4 + 237,
++		.width_mm = 145,
++		.height_mm = 232,
++	},
++};
++
+ static const struct panel_desc elish_boe_desc = {
+ 	.modes = elish_boe_modes,
+ 	.num_modes = ARRAY_SIZE(elish_boe_modes),
+@@ -981,6 +1265,90 @@
+ 	.has_dcs_backlight = true,
+ };
+ 
++static const struct panel_desc dby_w09_190_20d_desc = {
++	.modes = dby_w09_190_20d_modes,
++	.num_modes = ARRAY_SIZE(dby_w09_190_20d_modes),
++	.dsi_info = {
++		.type = "190_20d",
++		.channel = 0,
++		.node = NULL,
++	},
++	.width_mm = 145,
++	.height_mm = 232,
++	.bpc = 8,
++	.lanes = 3,
++	.format = MIPI_DSI_FMT_RGB888,
++	.mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_CLOCK_NON_CONTINUOUS | MIPI_DSI_MODE_LPM,
++	.init_sequence = dby_w09_190_20d_init_sequence,
++	.is_dual_dsi = true,
++	.power_cycle_on_boot = true,
++};
++
++/*
++ * 引导阶段（ABL 与 U-Boot）会为面板供电并持续扫描启动画面。内核第一次
++ * prepare 时，这些供电在硬件上已经开启，仅靠复位与初始化命令无法让面板
++ * 从复位默认状态启动：命令与读回都正常，背光也点亮，但屏幕保持全黑，
++ * 直到一次 DPMS 关开屏才恢复。
++ *
++ * 首次上电前先使能再关闭一次供电，保证面板经历真实的断电上电。使能调用
++ * 让 regulator 的引用计数与实际硬件状态一致，随后的关闭才真正拉低使能脚。
++ */
++static int nt36523_boot_power_cycle(struct panel_info *pinfo)
++{
++	int ret;
++
++	if (!pinfo->desc->power_cycle_on_boot || pinfo->boot_power_cycled)
++		return 0;
++
++	if (pinfo->vci) {
++		ret = regulator_enable(pinfo->vci);
++		if (ret)
++			return ret;
++	}
++
++	ret = regulator_enable(pinfo->vddio);
++	if (ret)
++		goto err_vci;
++
++	if (pinfo->vsp) {
++		ret = regulator_enable(pinfo->vsp);
++		if (ret)
++			goto err_vddio;
++	}
++
++	if (pinfo->vsn) {
++		ret = regulator_enable(pinfo->vsn);
++		if (ret)
++			goto err_vsp;
++	}
++
++	usleep_range(2000, 3000);
++
++	if (pinfo->vsn)
++		regulator_disable(pinfo->vsn);
++	if (pinfo->vsp)
++		regulator_disable(pinfo->vsp);
++	regulator_disable(pinfo->vddio);
++	if (pinfo->vci)
++		regulator_disable(pinfo->vci);
++
++	/* 完整完成一次断电上电后才不再重试，失败时保留标志供下次 prepare 重来。 */
++	pinfo->boot_power_cycled = true;
++	msleep(100);
++
++	return 0;
++
++err_vsp:
++	if (pinfo->vsp)
++		regulator_disable(pinfo->vsp);
++err_vddio:
++	regulator_disable(pinfo->vddio);
++err_vci:
++	if (pinfo->vci)
++		regulator_disable(pinfo->vci);
++	return ret;
++}
++
+ static void nt36523_reset(struct panel_info *pinfo)
+ {
+ 	gpiod_set_value_cansleep(pinfo->reset_gpio, 1);
+@@ -993,27 +1361,80 @@
+ 	usleep_range(12000, 13000);
+ }
+ 
++/*
++ * 面板上电顺序取自厂商 lcd-kit 的 power-on-stage：VCI、IOVCC、VSP、VSN
++ * 依次使能，每路上电后留 1 到 2 ms，再等 10 ms 让偏压稳定，最后复位。
++ * 各供电在设备树中按顺序通过 vin-supply 串接，缺省时跳过对应步骤。
++ */
+ static int nt36523_prepare(struct drm_panel *panel)
+ {
+ 	struct panel_info *pinfo = to_panel_info(panel);
+ 	int ret;
+ 
++	ret = nt36523_boot_power_cycle(pinfo);
++	if (ret) {
++		dev_err(panel->dev, "failed to power cycle panel: %d\n", ret);
++		return ret;
++	}
++
++	if (pinfo->vci) {
++		ret = regulator_enable(pinfo->vci);
++		if (ret) {
++			dev_err(panel->dev, "failed to enable vci regulator: %d\n", ret);
++			return ret;
++		}
++		usleep_range(1000, 2000);
++	}
++
+ 	ret = regulator_enable(pinfo->vddio);
+ 	if (ret) {
+ 		dev_err(panel->dev, "failed to enable vddio regulator: %d\n", ret);
+-		return ret;
++		goto err_disable_vci;
+ 	}
++	usleep_range(2000, 3000);
++
++	if (pinfo->vsp) {
++		ret = regulator_enable(pinfo->vsp);
++		if (ret) {
++			dev_err(panel->dev, "failed to enable vsp regulator: %d\n", ret);
++			goto err_disable_vddio;
++		}
++		usleep_range(2000, 3000);
++	}
++
++	if (pinfo->vsn) {
++		ret = regulator_enable(pinfo->vsn);
++		if (ret) {
++			dev_err(panel->dev, "failed to enable vsn regulator: %d\n", ret);
++			goto err_disable_vsp;
++		}
++		usleep_range(2000, 3000);
++	}
++
++	usleep_range(10000, 20000);
+ 
+ 	nt36523_reset(pinfo);
+ 
+ 	ret = pinfo->desc->init_sequence(pinfo);
+ 	if (ret < 0) {
+-		regulator_disable(pinfo->vddio);
+ 		dev_err(panel->dev, "failed to initialize panel: %d\n", ret);
+-		return ret;
++		goto err_disable_vsn;
+ 	}
+ 
+ 	return 0;
++
++err_disable_vsn:
++	if (pinfo->vsn)
++		regulator_disable(pinfo->vsn);
++err_disable_vsp:
++	if (pinfo->vsp)
++		regulator_disable(pinfo->vsp);
++err_disable_vddio:
++	regulator_disable(pinfo->vddio);
++err_disable_vci:
++	if (pinfo->vci)
++		regulator_disable(pinfo->vci);
++	return ret;
+ }
+ 
+ static int nt36523_disable(struct drm_panel *panel)
+@@ -1043,7 +1464,14 @@
+ 	struct panel_info *pinfo = to_panel_info(panel);
+ 
+ 	gpiod_set_value_cansleep(pinfo->reset_gpio, 1);
++
++	if (pinfo->vsn)
++		regulator_disable(pinfo->vsn);
++	if (pinfo->vsp)
++		regulator_disable(pinfo->vsp);
+ 	regulator_disable(pinfo->vddio);
++	if (pinfo->vci)
++		regulator_disable(pinfo->vci);
+ 
+ 	return 0;
+ }
+@@ -1061,6 +1489,9 @@
+ 	struct panel_info *pinfo = to_panel_info(panel);
+ 	int i;
+ 
++	/* 记住连接器，prepare 中据此得知当前选中的刷新率 */
++	pinfo->connector = connector;
++
+ 	for (i = 0; i < pinfo->desc->num_modes; i++) {
+ 		const struct drm_display_mode *m = &pinfo->desc->modes[i];
+ 		struct drm_display_mode *mode;
+@@ -1174,6 +1605,34 @@
+ 	if (IS_ERR(pinfo->vddio))
+ 		return dev_err_probe(dev, PTR_ERR(pinfo->vddio), "failed to get vddio regulator\n");
+ 
++	/*
++	 * VCI、VSP、VSN 只在部分面板上单独引出；缺省时按可选供电处理，
++	 * 由设备树决定是否需要在上电序列中使能。
++	 */
++	pinfo->vci = devm_regulator_get_optional(dev, "vci");
++	if (IS_ERR(pinfo->vci)) {
++		if (PTR_ERR(pinfo->vci) != -ENODEV)
++			return dev_err_probe(dev, PTR_ERR(pinfo->vci),
++					     "failed to get vci regulator\n");
++		pinfo->vci = NULL;
++	}
++
++	pinfo->vsp = devm_regulator_get_optional(dev, "vsp");
++	if (IS_ERR(pinfo->vsp)) {
++		if (PTR_ERR(pinfo->vsp) != -ENODEV)
++			return dev_err_probe(dev, PTR_ERR(pinfo->vsp),
++					     "failed to get vsp regulator\n");
++		pinfo->vsp = NULL;
++	}
++
++	pinfo->vsn = devm_regulator_get_optional(dev, "vsn");
++	if (IS_ERR(pinfo->vsn)) {
++		if (PTR_ERR(pinfo->vsn) != -ENODEV)
++			return dev_err_probe(dev, PTR_ERR(pinfo->vsn),
++					     "failed to get vsn regulator\n");
++		pinfo->vsn = NULL;
++	}
++
+ 	pinfo->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
+ 	if (IS_ERR(pinfo->reset_gpio))
+ 		return dev_err_probe(dev, PTR_ERR(pinfo->reset_gpio), "failed to get reset gpio\n");
+@@ -1254,6 +1713,10 @@
+ 		.compatible = "xiaomi,elish-csot-nt36523",
+ 		.data = &elish_csot_desc,
+ 	},
++	{
++		.compatible = "huawei,dby-w09-190-20d",
++		.data = &dby_w09_190_20d_desc,
++	},
+ 	{},
+ };
+ MODULE_DEVICE_TABLE(of, nt36523_of_match);
