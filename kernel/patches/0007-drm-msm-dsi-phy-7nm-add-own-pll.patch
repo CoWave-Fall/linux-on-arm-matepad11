@@ -1,0 +1,197 @@
+From: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
+Subject: [PATCH] drm/msm/dsi/phy: allow a slave 7nm PHY to use its own PLL
+
+Applied to Linux 7.3.1.
+
+Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
+
+--- a/Documentation/devicetree/bindings/phy/qcom,dsi-phy-7nm.yaml
++++ b/Documentation/devicetree/bindings/phy/qcom,dsi-phy-7nm.yaml
+@@ -61,6 +61,15 @@
+     enum: [ 10, 11 ]
+     default: 10
+ 
++  qcom,dsi-phy-own-pll:
++    type: boolean
++    description: |
++      Some dual-DSI panels require the bit clock of each link to be generated
++      by the local PHY PLL instead of routing the byte clock from the master
++      PHY to the slave. On such platforms every PHY keeps its internal PLL
++      as the clock source and the master PLL does not drive the global clocks
++      of the slave PHY.
++
+ required:
+   - compatible
+   - reg
+--- a/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c
++++ b/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c
+@@ -8,6 +8,7 @@
+ #include <linux/clk.h>
+ #include <linux/clk-provider.h>
+ #include <linux/iopoll.h>
++#include <linux/of.h>
+ 
+ #include "dsi_phy.h"
+ #include "dsi.xml.h"
+@@ -99,6 +100,9 @@
+ 
+ 	struct pll_7nm_cached_state cached_state;
+ 
++	/* 从 PHY 的本地 PLL 是否已由本驱动使能，用于配平关闭路径 */
++	bool own_pll_enabled;
++
+ 	struct dsi_pll_7nm *slave;
+ };
+ 
+@@ -412,8 +416,14 @@
+ 		return;
+ 	} /* else: == 0 */
+ 
++	/*
++	 * 数字顶层与 PLL 一同掉电。dispcc 的像素时钟带 CLK_OPS_PARENT_ENABLE，
++	 * 时钟框架会在 PHY 上电前就启动 PLL，这里必须同时打开数字顶层，
++	 * 否则 PLL 无法锁定并留下不平衡的使能计数。
++	 */
+ 	data = readl(pll->phy->base + REG_DSI_7nm_PHY_CMN_CTRL_0);
+-	data &= ~DSI_7nm_PHY_CMN_CTRL_0_PLL_SHUTDOWNB;
++	data &= ~(DSI_7nm_PHY_CMN_CTRL_0_DIGTOP_PWRDN_B |
++		  DSI_7nm_PHY_CMN_CTRL_0_PLL_SHUTDOWNB);
+ 	writel(0, pll->phy->pll_base + REG_DSI_7nm_PHY_PLL_SYSTEM_MUXES);
+ 	writel(data, pll->phy->base + REG_DSI_7nm_PHY_CMN_CTRL_0);
+ 	spin_unlock_irqrestore(&pll->pll_enable_lock, flags);
+@@ -433,7 +443,8 @@
+ 	}
+ 
+ 	data = readl(pll->phy->base + REG_DSI_7nm_PHY_CMN_CTRL_0);
+-	data |= DSI_7nm_PHY_CMN_CTRL_0_PLL_SHUTDOWNB;
++	data |= DSI_7nm_PHY_CMN_CTRL_0_DIGTOP_PWRDN_B |
++		DSI_7nm_PHY_CMN_CTRL_0_PLL_SHUTDOWNB;
+ 	writel(data, pll->phy->base + REG_DSI_7nm_PHY_CMN_CTRL_0);
+ 
+ 	writel(0xc0, pll->phy->pll_base + REG_DSI_7nm_PHY_PLL_SYSTEM_MUXES);
+@@ -598,7 +609,12 @@
+ 	pll_freq += div_u64(tmp64, multiplier);
+ 
+ 	vco_rate = pll_freq;
+-	pll_7nm->vco_current_rate = vco_rate;
++	/*
++	 * 这里只报告实际频率，不回写 vco_current_rate。回写之后，下一次
++	 * 使能时 restore_state 会用取整后的频率重新计算分频，分数分频在
++	 * 边界上可能少一个步进（约 146 Hz）；从 PHY 的自有 PLL 按请求值
++	 * 编程，两条链路的字节速率出现偏差，链路 FIFO 可能周期性错位。
++	 */
+ 
+ 	DBG("DSI PLL%d returning vco rate = %lu, dec = %x, frac = %x",
+ 	    pll_7nm->phy->id, (unsigned long)vco_rate, dec, frac);
+@@ -688,9 +704,67 @@
+ 	return 0;
+ }
+ 
++/*
++ * 部分双 DSI 面板要求每条链路使用本 PHY 的 PLL（厂商配置为自身 PLL）。
++ * 这类平台没有可用的 PHY0 到 PHY1 外部字节时钟通路，从 PHY 必须保持
++ * 内部 PLL 源，主 PLL 也不再接管从 PHY 的全局时钟。
++ */
++static bool dsi_7nm_phy_owns_pll(struct msm_dsi_phy *phy)
++{
++	return of_property_read_bool(phy->pdev->dev.of_node,
++				     "qcom,dsi-phy-own-pll");
++}
++
++/*
++ * 从 PHY 使用自身 PLL 时，位时钟由本 PHY 的 PLL 产生，主 PHY 不再向它
++ * 输出时钟。PLL 的速率按链路字节时钟反推（CPHY 每字节 7 个符号），
++ * 直接通过时钟框架启动，保证分频比与 DSI 控制器的字节时钟一致。
++ */
++static int dsi_7nm_phy_enable_own_pll(struct msm_dsi_phy *phy,
++				      struct msm_dsi_phy_clk_request *clk_req)
++{
++	struct dsi_pll_7nm *pll_7nm = to_pll_7nm(phy->vco_hw);
++	struct clk *byte_clk = phy->provided_clocks->hws[DSI_BYTE_PLL_CLK]->clk;
++	unsigned long byte_rate;
++	int ret;
++
++	byte_rate = clk_req->bitclk_rate / (phy->cphy_mode ? 7 : 8);
++
++	ret = clk_set_rate(byte_clk, byte_rate);
++	if (ret) {
++		DRM_DEV_ERROR(&phy->pdev->dev,
++			      "failed to set slave byte clock rate %lu: %d\n",
++			      byte_rate, ret);
++		return ret;
++	}
++
++	ret = clk_prepare_enable(byte_clk);
++	if (ret) {
++		DRM_DEV_ERROR(&phy->pdev->dev,
++			      "failed to enable slave PLL: %d\n", ret);
++		return ret;
++	}
++
++	pll_7nm->own_pll_enabled = true;
++	return 0;
++}
++
++static void dsi_7nm_phy_disable_own_pll(struct msm_dsi_phy *phy)
++{
++	struct dsi_pll_7nm *pll_7nm = to_pll_7nm(phy->vco_hw);
++
++	/* 使能阶段失败时不会留下需要关闭的引用 */
++	if (!pll_7nm->own_pll_enabled)
++		return;
++
++	clk_disable_unprepare(phy->provided_clocks->hws[DSI_BYTE_PLL_CLK]->clk);
++	pll_7nm->own_pll_enabled = false;
++}
++
+ static int dsi_7nm_set_usecase(struct msm_dsi_phy *phy)
+ {
+ 	struct dsi_pll_7nm *pll_7nm = to_pll_7nm(phy->vco_hw);
++	struct dsi_pll_7nm *other = pll_7nm_list[(pll_7nm->phy->id + 1) % DSI_MAX];
+ 	void __iomem *base = phy->base;
+ 	u32 data = 0x0;	/* internal PLL */
+ 
+@@ -700,13 +774,16 @@
+ 	case MSM_DSI_PHY_STANDALONE:
+ 		break;
+ 	case MSM_DSI_PHY_MASTER:
+-		pll_7nm->slave = pll_7nm_list[(pll_7nm->phy->id + 1) % DSI_MAX];
++		/* 从 PHY 使用自身 PLL 时，两条链路互不牵连 */
++		pll_7nm->slave = (other && dsi_7nm_phy_owns_pll(other->phy)) ?
++				 NULL : other;
+ 		/* v7.0: Enable ATB_EN0 and alternate clock output to external phy */
+ 		if (phy->cfg->quirks & DSI_PHY_7NM_QUIRK_V7_2)
+ 			writel(0x07, base + REG_DSI_7nm_PHY_CMN_CTRL_5);
+ 		break;
+ 	case MSM_DSI_PHY_SLAVE:
+-		data = 0x1; /* external PLL */
++		if (!dsi_7nm_phy_owns_pll(phy))
++			data = 0x1; /* external PLL */
+ 		break;
+ 	default:
+ 		return -EINVAL;
+@@ -1187,6 +1264,13 @@
+ 	/* DSI lane settings */
+ 	dsi_phy_hw_v4_0_lane_settings(phy);
+ 
++	/* 从 PHY 自己产生位时钟时，在寄存器配置完成后启动本地 PLL */
++	if (phy->usecase == MSM_DSI_PHY_SLAVE && dsi_7nm_phy_owns_pll(phy)) {
++		ret = dsi_7nm_phy_enable_own_pll(phy, clk_req);
++		if (ret)
++			return ret;
++	}
++
+ 	DBG("DSI%d PHY enabled", phy->id);
+ 
+ 	return 0;
+@@ -1216,6 +1300,10 @@
+ 
+ 	DBG("");
+ 
++	/* 从 PHY 的本地 PLL 先停掉，再关闭 PHY 本体 */
++	if (phy->usecase == MSM_DSI_PHY_SLAVE && dsi_7nm_phy_owns_pll(phy))
++		dsi_7nm_phy_disable_own_pll(phy);
++
+ 	if (dsi_phy_hw_v4_0_is_pll_on(phy))
+ 		pr_warn("Turning OFF PHY while PLL is on\n");
+ 
