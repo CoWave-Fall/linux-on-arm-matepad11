@@ -1,0 +1,121 @@
+From: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
+Subject: [PATCH] firmware: psci: add S2RAM through CPU_SUSPEND
+
+Applied to Linux 7.3.1.
+
+Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
+
+--- a/drivers/firmware/psci/psci.c
++++ b/drivers/firmware/psci/psci.c
+@@ -551,12 +551,56 @@
+ 	return 0;
+ }
+ 
+-static const struct platform_suspend_ops psci_suspend_ops = {
++static const struct platform_suspend_ops psci_system_suspend_ops = {
+ 	.valid          = suspend_valid_only_mem,
+ 	.enter          = psci_system_suspend_enter,
+ 	.begin          = psci_system_suspend_begin,
+ };
+ 
++/*
++ * 部分固件没有实现 PSCI SYSTEM_SUSPEND，S3 级睡眠隐藏在 CPU_SUSPEND 的
++ * power_state 参数里。设备树用 arm,psci-s2ram-param 指定该参数，进入系统
++ * 挂起时按 CPU_SUSPEND 执行，并沿用 SYSTEM_SUSPEND 的固件电源语义。
++ * Qualcomm SM8250 的值为 0x4100c244：CPU rail power collapse、cluster
++ * LLCC off、亲和级别 1，与下游 lpm-levels 的系统睡眠状态一致。
++ */
++static u32 psci_s2ram_suspend_param;
++
++static int psci_cpu_suspend_s2ram(unsigned long unused)
++{
++	phys_addr_t pa_cpu_resume = __pa_symbol(cpu_resume);
++
++	return psci_ops.cpu_suspend(psci_s2ram_suspend_param, pa_cpu_resume);
++}
++
++static int psci_cpu_suspend_s2ram_enter(suspend_state_t state)
++{
++	pm_set_resume_via_firmware();
++
++	return cpu_suspend(0, psci_cpu_suspend_s2ram);
++}
++
++static const struct platform_suspend_ops psci_cpu_suspend_s2ram_ops = {
++	.valid          = suspend_valid_only_mem,
++	.enter          = psci_cpu_suspend_s2ram_enter,
++	.begin          = psci_system_suspend_begin,
++};
++
++static void __init psci_init_s2ram(const struct device_node *np)
++{
++	if (!IS_ENABLED(CONFIG_SUSPEND))
++		return;
++
++	if (of_property_read_u32(np, "arm,psci-s2ram-param",
++				 &psci_s2ram_suspend_param))
++		return;
++
++	pr_info("Using CPU_SUSPEND 0x%08x for S2RAM\n",
++		psci_s2ram_suspend_param);
++
++	suspend_set_ops(&psci_cpu_suspend_s2ram_ops);
++}
++
+ static void __init psci_init_system_reset2(void)
+ {
+ 	int ret;
+@@ -589,7 +633,7 @@
+ 	ret = psci_features(PSCI_FN_NATIVE(1_0, SYSTEM_SUSPEND));
+ 
+ 	if (ret != PSCI_RET_NOT_SUPPORTED)
+-		suspend_set_ops(&psci_suspend_ops);
++		suspend_set_ops(&psci_system_suspend_ops);
+ }
+ 
+ static void __init psci_init_cpu_suspend(void)
+@@ -738,7 +782,13 @@
+ 	 * can be carried out according to the specific version reported
+ 	 * by firmware
+ 	 */
+-	return psci_probe();
++	err = psci_probe();
++	if (err)
++		return err;
++
++	psci_init_s2ram(np);
++
++	return 0;
+ }
+ 
+ /*
+--- a/Documentation/devicetree/bindings/arm/psci.yaml
++++ b/Documentation/devicetree/bindings/arm/psci.yaml
+@@ -86,6 +86,16 @@
+     $ref: /schemas/types.yaml#/definitions/uint32
+     description: Function ID for MIGRATE operation
+ 
++  arm,psci-s2ram-param:
++    $ref: /schemas/types.yaml#/definitions/uint32
++    description: |
++      power_state parameter that enters the platform's S2RAM state through
++      CPU_SUSPEND. Some firmware implementations do not expose PSCI
++      SYSTEM_SUSPEND and instead provide an S3-like suspend state through
++      CPU_SUSPEND; when present, this property designates that state, and
++      the kernel registers it as a system suspend method instead of an
++      idle state.
++
+   arm,psci-suspend-param:
+     $ref: /schemas/types.yaml#/definitions/uint32
+     description: |
+--- a/arch/arm64/boot/dts/qcom/sm8250.dtsi
++++ b/arch/arm64/boot/dts/qcom/sm8250.dtsi
+@@ -692,7 +692,7 @@
+ 		interrupts = <GIC_PPI 7 IRQ_TYPE_LEVEL_LOW>;
+ 	};
+ 
+-	psci {
++	psci: psci {
+ 		compatible = "arm,psci-1.0";
+ 		method = "smc";
+ 
