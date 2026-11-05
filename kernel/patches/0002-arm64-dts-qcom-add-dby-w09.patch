@@ -1,0 +1,1142 @@
+From: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
+Subject: [PATCH] arm64: dts: qcom: add Huawei MatePad 11 (DBY-W09)
+
+Applied to Linux 7.3.1.
+
+Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
+
+--- a/arch/arm64/boot/dts/qcom/Makefile
++++ b/arch/arm64/boot/dts/qcom/Makefile
+@@ -363,6 +363,7 @@
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm8150-sony-xperia-kumano-bahamut.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm8150-sony-xperia-kumano-griffin.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm8250-hdk.dtb
++dtb-$(CONFIG_ARCH_QCOM)	+= sm8250-huawei-dby-w09.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm8250-mtp.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm8250-samsung-r8q.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm8250-samsung-x1q.dtb
+--- /dev/null
++++ b/arch/arm64/boot/dts/qcom/sm8250-huawei-dby-w09.dts
+@@ -0,0 +1,1122 @@
++// SPDX-License-Identifier: BSD-3-Clause
++/*
++ * Huawei MatePad 11 2021 (DBY-W09), Qualcomm SM8250 (kona).
++ *
++ * 板级设备树：内存与保留区、UFS/SD/USB、双 DSI 显示与触摸、
++ * 无线供电、WLAN 与蓝牙、RTC、按键以及 GPU 配置。
++ */
++
++/dts-v1/;
++
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/iio/qcom,spmi-vadc.h>
++#include <dt-bindings/leds/common.h>
++#include <dt-bindings/input/linux-event-codes.h>
++#include <dt-bindings/interrupt-controller/irq.h>
++#include <dt-bindings/phy/phy.h>
++#include <dt-bindings/regulator/qcom,rpmh-regulator.h>
++#include "sm8250.dtsi"
++#include "pm8150.dtsi"
++#include "pm8150b.dtsi"
++#include "pm8150l.dtsi"
++
++/ {
++	model = "Huawei MatePad 11 (DBY-W09)";
++	compatible = "qcom,sm8250-mtp", "qcom,sm8250";
++	chassis-type = "tablet";
++
++	aliases {
++		serial0 = &uart12;
++	};
++
++	/*
++	 * 内存布局取自设备运行时设备树。三个区段之间由固件保留区隔开，
++	 * 中间区段从 0xc0000000 起，避开了 0x9c000000 附近的显示保留区。
++	 */
++	memory@80000000 {
++		device_type = "memory";
++		reg = <0x0 0x80000000 0x0 0x3bb00000>,
++		      <0x0 0xc0000000 0x0 0xc0000000>,
++		      <0x1 0x80000000 0x1 0x0>;
++	};
++
++	reserved-memory {
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++
++		/* XBL 保留的 UEFI 日志区，内核不得覆盖 */
++		xbl_uefi_log_mem: memory@80880000 {
++			reg = <0x0 0x80880000 0x0 0x14000>;
++			no-map;
++		};
++
++		/* U-Boot 初始化 DSI 面板后使用的连续帧缓冲 */
++		cont_splash_mem: memory@9c000000 {
++			reg = <0x0 0x9c000000 0x0 0x2300000>;
++			no-map;
++		};
++
++		/* 动态帧率切换数据区 */
++		dfps_data_mem: memory@9e300000 {
++			reg = <0x0 0x9e300000 0x0 0x100000>;
++			no-map;
++		};
++
++	};
++
++	chosen {
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++
++		stdout-path = "serial0:115200n8";
++
++		/*
++		 * 与 U-Boot 控制台共用同一块显存：引导阶段面板保持点亮，
++		 * 内核接管后继续向同一地址绘制。
++		 */
++		framebuffer: framebuffer@9c000000 {
++			compatible = "simple-framebuffer";
++			reg = <0x0 0x9c000000 0x0 0x2300000>;
++			width = <1600>;
++			height = <2560>;
++			stride = <(1600 * 4)>;
++			format = "a8r8g8b8";
++		};
++	};
++
++	/*
++	 * 震动马达：tlmm gpio72 经驱动管控制 ERM 转子马达。原厂设备树在同一
++	 * 引脚上使用 qcom,qpnp-vibrator-gpio，拉高即通电；主线用通用
++	 * gpio-vibrator 驱动，通过 FF_RUMBLE 事件触发。
++	 */
++	vibrator {
++		compatible = "gpio-vibrator";
++		enable-gpios = <&tlmm 72 GPIO_ACTIVE_HIGH>;
++	};
++
++	/* 音量上键：PM8150 GPIO 6，低电平有效 */
++	gpio-keys {
++		compatible = "gpio-keys";
++		pinctrl-names = "default";
++		pinctrl-0 = <&vol_up_n>;
++
++		key-vol-up {
++			label = "Volume Up";
++			gpios = <&pm8150_gpios 6 GPIO_ACTIVE_LOW>;
++			linux,code = <KEY_VOLUMEUP>;
++			debounce-interval = <15>;
++			linux,can-disable;
++			wakeup-source;
++		};
++	};
++
++	/*
++	 * QCA6391 的电源管理单元。原厂树把蓝牙模块的 aon、rfa 与 asd 电源
++	 * 直接接到 PMIC，没有可控的 PMU LDO，因此这里的 regulators 子节点
++	 * 只用于给蓝牙节点提供电源引用，使电源时序驱动能够把蓝牙与 PMU
++	 * 关联起来；实际硬件不提供这些输出。
++	 */
++	qca6390_pmu: qca6390-pmu {
++		compatible = "qcom,qca6390-pmu";
++
++		pinctrl-names = "default";
++		pinctrl-0 = <&bt_en_state>, <&wlan_en_state>;
++
++		vddaon-supply = <&vreg_s6a_0p95>;
++		vddpmu-supply = <&vreg_s6a_0p95>;
++		vddrfa0p95-supply = <&vreg_s6a_0p95>;
++		vddrfa1p3-supply = <&vreg_s8c_1p3>;
++		vddrfa1p9-supply = <&vreg_s5a_1p9>;
++		vddpcie1p3-supply = <&vreg_s8c_1p3>;
++		vddpcie1p9-supply = <&vreg_s5a_1p9>;
++		vddio-supply = <&vreg_s4a_1p8>;
++
++		/* 原厂 qca,bt-reset-gpio 与 wlan-en-gpio */
++		bt-enable-gpios = <&tlmm 21 GPIO_ACTIVE_HIGH>;
++		wlan-enable-gpios = <&tlmm 20 GPIO_ACTIVE_HIGH>;
++
++		regulators {
++			vreg_pmu_rfa_cmn: ldo0 {
++				regulator-name = "vreg_pmu_rfa_cmn";
++			};
++
++			vreg_pmu_aon_0p59: ldo1 {
++				regulator-name = "vreg_pmu_aon_0p59";
++			};
++
++			vreg_pmu_wlcx_0p8: ldo2 {
++				regulator-name = "vreg_pmu_wlcx_0p8";
++			};
++
++			vreg_pmu_wlmx_0p85: ldo3 {
++				regulator-name = "vreg_pmu_wlmx_0p85";
++			};
++
++			vreg_pmu_btcmx_0p85: ldo4 {
++				regulator-name = "vreg_pmu_btcmx_0p85";
++			};
++
++			vreg_pmu_rfa_0p8: ldo5 {
++				regulator-name = "vreg_pmu_rfa_0p8";
++			};
++
++			vreg_pmu_rfa_1p2: ldo6 {
++				regulator-name = "vreg_pmu_rfa_1p2";
++			};
++
++			vreg_pmu_rfa_1p7: ldo7 {
++				regulator-name = "vreg_pmu_rfa_1p7";
++			};
++
++			vreg_pmu_pcie_0p9: ldo8 {
++				regulator-name = "vreg_pmu_pcie_0p9";
++			};
++
++			vreg_pmu_pcie_1p8: ldo9 {
++				regulator-name = "vreg_pmu_pcie_1p8";
++			};
++		};
++	};
++
++	/*
++	 * 面板供电。厂商 huawei,lcd_panel 节点给出 iovcc_gpio = 6、
++	 * vsp_gpio_id = 11、vsn_gpio_id = 12：
++	 *   IOVCC 由 PM8150 LDO14 经 gpio6 控制的负载开关提供；
++	 *   VSP/VSN 由偏压芯片产生 +-5.7 V，gpio11/gpio12 分别是两路使能。
++	 * 固定稳压器只负责按顺序拉高使能脚，电压值仅用于描述。
++	 */
++	vreg_panel_iovcc: regulator-panel-iovcc {
++		compatible = "regulator-fixed";
++		regulator-name = "panel-iovcc";
++		/* regulator-fixed 要求上下限相等，实际由 LDO14 提供 1.8 V */
++		regulator-min-microvolt = <1800000>;
++		regulator-max-microvolt = <1800000>;
++		vin-supply = <&vreg_l14a_1p8>;
++		enable-gpios = <&tlmm 6 GPIO_ACTIVE_HIGH>;
++		regulator-enable-ramp-delay = <2000>;
++	};
++
++	vreg_panel_vsp: regulator-panel-vsp {
++		compatible = "regulator-fixed";
++		regulator-name = "panel-vsp";
++		regulator-min-microvolt = <5700000>;
++		regulator-max-microvolt = <5700000>;
++		vin-supply = <&vreg_l11c_3p0>;
++		enable-gpios = <&tlmm 11 GPIO_ACTIVE_HIGH>;
++		regulator-enable-ramp-delay = <2000>;
++	};
++
++	vreg_panel_vsn: regulator-panel-vsn {
++		compatible = "regulator-fixed";
++		regulator-name = "panel-vsn";
++		regulator-min-microvolt = <5700000>;
++		regulator-max-microvolt = <5700000>;
++		vin-supply = <&vreg_l11c_3p0>;
++		enable-gpios = <&tlmm 12 GPIO_ACTIVE_HIGH>;
++		regulator-enable-ramp-delay = <2000>;
++	};
++};
++
++/*
++ * USB PHY 供电取自 PM8150（a）的三个 LDO：
++ * L5 0.88 V 供 PLL，L12 1.8 V 与 L2 3.072 V 供 PHY 模拟电路。
++ * 数值取自设备运行时设备树。
++ */
++&apps_rsc {
++	/*
++	 * 这些电源在 XBL 与 U-Boot 阶段已经打开，且被显示、存储等多个硬件模块
++	 * 共用。UFS 与 USB 尚未 probe 时，regulator 核心会在 late_initcall
++	 * 关闭无人认领的稳压器，因此全部标记为常开，避免引导阶段的硬件被断电。
++	 */
++	regulators-0 {
++		compatible = "qcom,pm8150-rpmh-regulators";
++		qcom,pmic-id = "a";
++
++		vreg_l2a_3p1: ldo2 {
++			regulator-name = "vreg_l2a_3p1";
++			regulator-min-microvolt = <3072000>;
++			regulator-max-microvolt = <3072000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++			regulator-always-on;
++			regulator-boot-on;
++		};
++
++		vreg_l5a_0p88: ldo5 {
++			regulator-name = "vreg_l5a_0p88";
++			regulator-min-microvolt = <880000>;
++			regulator-max-microvolt = <880000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++			regulator-always-on;
++			regulator-boot-on;
++		};
++
++		vreg_l12a_1p8: ldo12 {
++			regulator-name = "vreg_l12a_1p8";
++			regulator-min-microvolt = <1800000>;
++			regulator-max-microvolt = <1800000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++			regulator-always-on;
++			regulator-boot-on;
++		};
++
++		/* UFS 控制器与 PHY 供电 */
++		vreg_l6a_1p2: ldo6 {
++			regulator-name = "vreg_l6a_1p2";
++			regulator-min-microvolt = <1200000>;
++			regulator-max-microvolt = <1200000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++			regulator-always-on;
++			regulator-boot-on;
++		};
++
++		vreg_l9a_1p2: ldo9 {
++			regulator-name = "vreg_l9a_1p2";
++			regulator-min-microvolt = <1200000>;
++			regulator-max-microvolt = <1200000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++			regulator-always-on;
++			regulator-boot-on;
++		};
++
++		vreg_l17a_3p0: ldo17 {
++			regulator-name = "vreg_l17a_3p0";
++			regulator-min-microvolt = <2496000>;
++			regulator-max-microvolt = <3010000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++			regulator-always-on;
++			regulator-boot-on;
++		};
++
++		vreg_s4a_1p8: smps4 {
++			regulator-name = "vreg_s4a_1p8";
++			regulator-min-microvolt = <1800000>;
++			regulator-max-microvolt = <1920000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++			regulator-always-on;
++			regulator-boot-on;
++		};
++
++		/*
++		 * 触摸屏模拟电源：原厂 st_fts 触摸节点的 avdd-supply 指向
++		 * pm8150_l13，电压 2.96 V。主线此前未定义该稳压器，触摸 IC 的
++		 * vdd 只可能由引导阶段遗留状态维持。标记常开，交由 RPMh 明确使能。
++		 */
++		vreg_l13a_ts_3p0: ldo13 {
++			regulator-name = "vreg_l13a_ts_3p0";
++			regulator-min-microvolt = <2960000>;
++			regulator-max-microvolt = <2960000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++			regulator-always-on;
++			regulator-boot-on;
++		};
++
++		/* 面板 IOVCC 的输入电源，经 gpio6 负载开关后送到面板 */
++		vreg_l14a_1p8: ldo14 {
++			regulator-name = "vreg_l14a_1p8";
++			regulator-min-microvolt = <1800000>;
++			regulator-max-microvolt = <1920000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		/*
++		 * QCA6391（WiFi/蓝牙模块）供电。原厂树给 BT 节点标注的三路
++		 * 电源分别指向 smpa5、smpa6 与 ldoa16；WLAN 另用 smpa4 作 IO。
++		 * 电压取值来自原厂节点中的 voltage-level 字段。
++		 */
++		vreg_s5a_1p9: smps5 {
++			regulator-name = "vreg_s5a_1p9";
++			regulator-min-microvolt = <1904000>;
++			regulator-max-microvolt = <2000000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		vreg_s6a_0p95: smps6 {
++			regulator-name = "vreg_s6a_0p95";
++			regulator-min-microvolt = <950000>;
++			regulator-max-microvolt = <1128000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		vreg_l16a_3p0: ldo16 {
++			regulator-name = "vreg_l16a_3p0";
++			regulator-min-microvolt = <3022464>;
++			regulator-max-microvolt = <3304000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++	};
++};
++
++/*
++ * 内置 UFS：XBL 已完成链路初始化，内核接管控制器后即可枚举出 LUN
++ * 与 GPT 分区。
++ */
++&ufs_mem_hc {
++	status = "okay";
++
++	vcc-supply = <&vreg_l17a_3p0>;
++	vcc-max-microamp = <800000>;
++	vccq-supply = <&vreg_l6a_1p2>;
++	vccq-max-microamp = <800000>;
++	vccq2-supply = <&vreg_s4a_1p8>;
++	vccq2-max-microamp = <800000>;
++};
++
++&ufs_mem_phy {
++	status = "okay";
++
++	vdda-phy-supply = <&vreg_l5a_0p88>;
++	vdda-pll-supply = <&vreg_l9a_1p2>;
++};
++
++/*
++ * USB 2.0 外设模式：initramfs 用它建立 ACM 串口，主机侧出现 /dev/ttyACM*，
++ * 作为无法读取屏幕时的控制台通道。
++ */
++&usb_1 {
++	status = "okay";
++
++	/* 未启用 SS PHY，由 UTMI 时钟充当 PIPE 时钟 */
++	qcom,select-utmi-as-pipe-clk;
++};
++
++&usb_1_dwc3 {
++	dr_mode = "peripheral";
++	maximum-speed = "high-speed";
++	phys = <&usb_1_hsphy>;
++	phy-names = "usb2-phy";
++};
++
++&usb_1_hsphy {
++	status = "okay";
++
++	vdda-pll-supply = <&vreg_l5a_0p88>;
++	vdda18-supply = <&vreg_l12a_1p8>;
++	vdda33-supply = <&vreg_l2a_3p1>;
++};
++
++&qupv3_id_1 {
++	status = "okay";
++};
++
++/*
++ * 蓝牙：QCA6391 挂在 QUPv3 wrap0 SE6（uart6）上，四线流控，
++ * 主机侧使能脚为 tlmm gpio21，电源时序由 qca6390-pmu 节点管理。
++ */
++&qupv3_id_0 {
++	status = "okay";
++};
++
++&uart6 {
++	status = "okay";
++
++	pinctrl-names = "default";
++	pinctrl-0 = <&uart6_default_state>;
++
++	bluetooth {
++		compatible = "qcom,qca6390-bt";
++
++		/*
++		 * QCA6391 的 BD_ADDR 未被固化，控制器返回全零地址，内核会把
++		 * 设备判定为未配置并从 mgmt 索引列表中过滤掉。这里使用本地
++		 * 管理的地址作为默认值，按设备树约定以小端字节序填写。需要
++		 * 与本机原厂地址一致时，从 oeminfo 读取后替换这六个字节。
++		 */
++		local-bd-address = [01 00 00 00 00 02];
++
++		vddrfacmn-supply = <&vreg_pmu_rfa_cmn>;
++		vddaon-supply = <&vreg_pmu_aon_0p59>;
++		vddbtcmx-supply = <&vreg_pmu_btcmx_0p85>;
++		vddrfa0p8-supply = <&vreg_pmu_rfa_0p8>;
++		vddrfa1p2-supply = <&vreg_pmu_rfa_1p2>;
++		vddrfa1p7-supply = <&vreg_pmu_rfa_1p7>;
++	};
++};
++
++/*
++ * PCIe0 承载板载 QCA6391（QCA6390 封装）。原厂节点 qcom,wlan-rc-num = <0>
++ * 确认 WLAN 使用 1x1 的 PCIe0；PHY 供电与其他 SM8250 参考设计一致，
++ * 取 PM8150 的 L5A 0.88 V 与 L9A 1.2 V。
++ */
++&pcie0 {
++	status = "okay";
++};
++
++&pcie0_phy {
++	vdda-phy-supply = <&vreg_l5a_0p88>;
++	vdda-pll-supply = <&vreg_l9a_1p2>;
++	status = "okay";
++};
++
++/*
++ * PCI 端点节点由 pci-pwrctrl-pwrseq 创建平台设备，经 qca6390-pmu 的
++ * wlan 时序上电后再触发总线扫描。九个 supply 与原厂 cnss 节点的电压
++ * 一一对应，均指向 PMU 的逻辑 LDO；这些 LDO 没有可控输出，只用于建立
++ * 供电关系，实际电源由 PMIC 常开轨提供。
++ *
++ * 校准数据变体名与固件目录中 board-2.bin 的条目一致，board-2.bin
++ * 由原厂 dby_lx9 板级数据生成。
++ */
++&pcieport0 {
++	wifi@0 {
++		compatible = "pci17cb,1101";
++		reg = <0x10000 0x0 0x0 0x0 0x0>;
++
++		vddrfacmn-supply = <&vreg_pmu_rfa_cmn>;
++		vddaon-supply = <&vreg_pmu_aon_0p59>;
++		vddwlcx-supply = <&vreg_pmu_wlcx_0p8>;
++		vddwlmx-supply = <&vreg_pmu_wlmx_0p85>;
++		vddrfa0p8-supply = <&vreg_pmu_rfa_0p8>;
++		vddrfa1p2-supply = <&vreg_pmu_rfa_1p2>;
++		vddrfa1p7-supply = <&vreg_pmu_rfa_1p7>;
++		vddpcie0p9-supply = <&vreg_pmu_pcie_0p9>;
++		vddpcie1p8-supply = <&vreg_pmu_pcie_1p8>;
++
++		qcom,calibration-variant = "Huawei_DBY-W09";
++	};
++};
++
++/*
++ * 背光与偏压器件挂在 QUPv3 wrap1 SE3（0xa8c000，主线标号 i2c11）上。
++ * 厂商启动参数 hw_backlight=hw_rt8555 与 Android 日志中的 0x04/0x05
++ * 亮度写入共同确认板上贴装 RT8555，地址 0x31，使能脚为 tlmm gpio10。
++ * 总线上还保留 tps65132、icn68116、rt4801h 的候选地址，实际只贴装一组。
++ */
++&i2c11 {
++	status = "okay";
++
++	backlight: backlight@31 {
++		compatible = "richtek,rt8555";
++		reg = <0x31>;
++		enable-gpios = <&tlmm 10 GPIO_ACTIVE_HIGH>;
++
++		pinctrl-names = "default";
++		pinctrl-0 = <&bl_en_default>;
++	};
++};
++
++/*
++ * 无线供电发射端：MT5727 挂在 QUPv3 wrap0 SE3（0x98c000，主线标号
++ * i2c3）上，地址 0x2b。芯片由 tlmm gpio50 使能的 5 V 升压供电，
++ * gpio92 为芯片使能（低电平有效），gpio117 与 gpio155 选择笔和键盘
++ * 线圈，gpio129 为中断。gpio121 与 gpio23 是键盘、笔的霍尔开关，
++ * 磁吸到位时拉低。
++ */
++&i2c3 {
++	status = "okay";
++	clock-frequency = <400000>;
++
++	wireless_tx: mt5727@2b {
++		compatible = "mediatek,mt5727";
++		reg = <0x2b>;
++
++		interrupt-parent = <&tlmm>;
++		interrupts = <129 IRQ_TYPE_EDGE_FALLING>;
++
++		enable-gpios = <&tlmm 92 GPIO_ACTIVE_LOW>;
++		boost-gpios = <&tlmm 50 GPIO_ACTIVE_HIGH>;
++		pen-en-gpios = <&tlmm 117 GPIO_ACTIVE_HIGH>;
++		keyboard-en-gpios = <&tlmm 155 GPIO_ACTIVE_HIGH>;
++		int-gpios = <&tlmm 129 GPIO_ACTIVE_LOW>;
++		keyboard-hall-gpios = <&tlmm 121 GPIO_ACTIVE_LOW>;
++		pen-hall-gpios = <&tlmm 23 GPIO_ACTIVE_LOW>;
++
++		mediatek,ping-freq-khz = <130>;
++		mediatek,ping-interval-ms = <120>;
++		mediatek,ping-ocp-ma = <900>;
++		mediatek,min-fop-khz = <120>;
++		mediatek,max-fop-khz = <145>;
++		mediatek,fod-threshold = <2700>;
++		mediatek,fod-count = <3>;
++
++		pinctrl-names = "default";
++		pinctrl-0 = <&mt5727_boost_state &mt5727_enable_state
++			     &mt5727_coil_state &mt5727_int_state
++			     &mt5727_hall_kb_state &mt5727_hall_pen_state>;
++	};
++};
++
++/*
++ * 显示链路：MDSS/DPU 驱动两个 DSI 控制器，两块 7nm PHY 以 C-PHY 工作，
++ * 每侧 3 lane。DSI0 为主链路并提供 PLL，DSI1 作为从链路复用 DSI0 的
++ * 时钟，绑定后由 DPU 合成 1600 x 2560 输出。
++ */
++&mdss {
++	status = "okay";
++};
++
++&mdss_mdp {
++	status = "okay";
++};
++
++&mdss_dsi0 {
++	vdda-supply = <&vreg_l9a_1p2>;
++	qcom,dual-dsi-mode;
++	qcom,sync-dual-dsi;
++	qcom,master-dsi;
++	status = "okay";
++
++	panel: panel@0 {
++		compatible = "huawei,dby-w09-190-20d", "novatek,nt36523";
++		reg = <0>;
++
++		vddio-supply = <&vreg_panel_iovcc>;
++		vci-supply = <&vreg_l11c_3p0>;
++		vsp-supply = <&vreg_panel_vsp>;
++		vsn-supply = <&vreg_panel_vsn>;
++
++		reset-gpios = <&tlmm 38 GPIO_ACTIVE_LOW>;
++		backlight = <&backlight>;
++		rotation = <90>;
++
++		ports {
++			#address-cells = <1>;
++			#size-cells = <0>;
++
++			port@0 {
++				reg = <0>;
++
++				panel_in_0: endpoint {
++					remote-endpoint = <&mdss_dsi0_out>;
++				};
++			};
++
++			port@1 {
++				reg = <1>;
++
++				panel_in_1: endpoint {
++					remote-endpoint = <&mdss_dsi1_out>;
++				};
++			};
++		};
++	};
++};
++
++&mdss_dsi0_out {
++	data-lanes = <0 1 2>;
++	remote-endpoint = <&panel_in_0>;
++};
++
++&mdss_dsi0_phy {
++	vdds-supply = <&vreg_l5a_0p88>;
++	phy-type = <PHY_TYPE_CPHY>;
++	status = "okay";
++};
++
++&mdss_dsi1 {
++	vdda-supply = <&vreg_l9a_1p2>;
++	qcom,dual-dsi-mode;
++	qcom,sync-dual-dsi;
++	/*
++	 * 控制器时钟保持 DSI0 PHY 的 PLL。probe 阶段 RCG 已经启用，
++	 * 改到 DSI1 的 PLL 会返回 -EBUSY；DSI1 PHY 只用自身 PLL
++	 * 产生位时钟。
++	 */
++	assigned-clock-parents = <&mdss_dsi0_phy DSI_BYTE_PLL_CLK>,
++				 <&mdss_dsi0_phy DSI_PIXEL_PLL_CLK>;
++	status = "okay";
++};
++
++&mdss_dsi1_out {
++	data-lanes = <0 1 2>;
++	remote-endpoint = <&panel_in_1>;
++};
++
++&mdss_dsi1_phy {
++	vdds-supply = <&vreg_l5a_0p88>;
++	phy-type = <PHY_TYPE_CPHY>;
++	/* 该面板要求每条链路由本 PHY 的 PLL 产生位时钟 */
++	qcom,dsi-phy-own-pll;
++	status = "okay";
++};
++
++&uart12 {
++	status = "okay";
++};
++
++/*
++ * 固件没有实现 PSCI SYSTEM_SUSPEND，S3 级睡眠由 CPU_SUSPEND 触发。
++ * 0x4100c244 由 CPU rail power collapse、cluster LLCC off、亲和级别 1
++ * 与 is-reset 位组成，与下游 lpm-levels 的 system sleep 状态一致。
++ */
++&psci {
++	arm,psci-s2ram-param = <0x4100c244>;
++};
++
++/* 电源键由 PM8150 PON 的 KPDPWR 输入提供 */
++&pon_pwrkey {
++	status = "okay";
++};
++
++/* 音量下键由 PM8150 PON 的 resin 输入提供 */
++&pon_resin {
++	linux,code = <KEY_VOLUMEDOWN>;
++	wakeup-source;
++	status = "okay";
++};
++
++/*
++ * PMIC RTC 的计数器对 AP 只读（寄存器写入返回 EPERM），Unix 时间基准由
++ * PM8150 SDAM 0xb1bc 处的 4 字节小端偏移量提供，含义是计数器归零时刻的
++ * Unix 秒。原厂内核读取同一槽，Linux 与 HarmonyOS 的时间可以互相继承。
++ */
++&pm8150_0 {
++	/*
++	 * 在板级设备树内补齐主 PMIC 的 RTC 属性与 SDAM 节点，避免改动
++	 * 共享的 pm8150.dtsi。同名节点与上游定义合并。
++	 */
++	rtc@6000 {
++		nvmem-cells = <&rtc_offset>;
++		nvmem-cell-names = "offset";
++	};
++
++	pm8150_sdam_2: nvram@b100 {
++		compatible = "qcom,spmi-sdam";
++		reg = <0xb100>;
++		#address-cells = <1>;
++		#size-cells = <1>;
++		ranges = <0 0xb100 0x100>;
++
++		rtc_offset: rtc-offset@bc {
++			reg = <0xbc 0x4>;
++		};
++	};
++};
++
++&pm8150_gpios {
++	vol_up_n: vol-up-n-state {
++		pins = "gpio6";
++		function = "normal";
++		power-source = <1>;
++		input-enable;
++		bias-pull-up;
++	};
++};
++
++/*
++ * SD 卡供电取自 PM8150L 的 LDO6（vqmmc）与 LDO9（vmmc）。
++ * 电压范围与 U-Boot 设备树、原厂设备树一致。
++ */
++&apps_rsc {
++	regulators-1 {
++		compatible = "qcom,pm8150l-rpmh-regulators";
++		qcom,pmic-id = "c";
++
++		/* QCA6391 的 rfa1 与 pcie 电源，原厂节点标注为 pm8150a_s8 */
++		vreg_s8c_1p3: smps8 {
++			regulator-name = "vreg_s8c_1p3";
++			regulator-min-microvolt = <1352000>;
++			regulator-max-microvolt = <1352000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		/*
++		 * 触摸屏 IO 电源：原厂 st_fts 触摸节点的 vdd-supply 指向
++		 * pm8150a_l1（资源 ldoc1），电压 1.8 V。与模拟电源一样标记常开。
++		 */
++		vreg_l1c_1p8: ldo1 {
++			regulator-name = "vreg_l1c_1p8";
++			regulator-min-microvolt = <1800000>;
++			regulator-max-microvolt = <1800000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++			regulator-always-on;
++			regulator-boot-on;
++		};
++
++		/* 霍尔开关电源：原厂 hall 节点 vdd-supply 指向 pm8150a_l8 */
++		vreg_l8c_1p8: ldo8 {
++			regulator-name = "vreg_l8c_1p8";
++			regulator-min-microvolt = <1800000>;
++			regulator-max-microvolt = <1800000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++			regulator-always-on;
++			regulator-boot-on;
++		};
++
++		/*
++		 * 面板 VCI：原厂 lcd-vci 为 3.2 V，取自 pm8150a_l11，
++		 * 也是面板偏压芯片的输入电源。
++		 */
++		vreg_l11c_3p0: ldo11 {
++			regulator-name = "vreg_l11c_3p0";
++			regulator-min-microvolt = <3200000>;
++			regulator-max-microvolt = <3300000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		vreg_l6c_2p96: ldo6 {
++			regulator-name = "vreg_l6c_2p96";
++			regulator-min-microvolt = <1800000>;
++			regulator-max-microvolt = <2960000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++			regulator-allow-set-load;
++			regulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM
++						   RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		vreg_l9c_2p96: ldo9 {
++			regulator-name = "vreg_l9c_2p96";
++			regulator-min-microvolt = <2704000>;
++			regulator-max-microvolt = <2960000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++			regulator-allow-set-load;
++			regulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM
++						   RPMH_REGULATOR_MODE_HPM>;
++		};
++	};
++};
++
++&sdhc_2 {
++	status = "okay";
++
++	bus-width = <4>;
++	cap-sd-highspeed;
++	/*
++	 * vqmmc（PM8150L LDO6）覆盖 1.8 V 到 2.96 V，可随 UHS 模式切换
++	 * 信号电平。max-frequency 取 OPP 表与 GCC 频率表共有的 202 MHz：
++	 * 该时钟由 GPLL9 提供，写成 201.5 MHz 会让 clk_rcg2_floor_ops 落到
++	 * 100 MHz 档，DLL 的 FLL 按 202 MHz 配置后无法锁定。
++	 */
++	sd-uhs-sdr50;
++	sd-uhs-ddr50;
++	sd-uhs-sdr104;
++	max-frequency = <202000000>;
++
++	vmmc-supply = <&vreg_l9c_2p96>;
++	vqmmc-supply = <&vreg_l6c_2p96>;
++
++	/*
++	 * 厂商树的卡检测脚为 gpio77 高电平有效；实测插卡后该脚仍为高电平，
++	 * 检测脚与卡槽开关的对应关系无法确认。broken-cd 让内核每秒轮询卡片，
++	 * 不再依赖该引脚；确认检测脚行为后可换回 cd-gpios。
++	 */
++	broken-cd;
++
++	pinctrl-names = "default";
++	pinctrl-0 = <&sdc2_default_state &sdc2_cd_default>;
++};
++
++/*
++ * 触摸屏：原厂 thp 驱动按 support_vendor_ic_type = 5 选中 Novatek N9Z 系列，
++ * 挂在 QUPv3 wrap2 SE0（主线 spi14）上，模式 0，16 MHz。
++ * 中断 gpio39 下降沿触发，复位 gpio98 高电平有效，CS 由 GENI 控制器产生。
++ */
++&gpi_dma2 {
++	status = "okay";
++};
++
++&qupv3_id_2 {
++	status = "okay";
++};
++
++&spi14 {
++	status = "okay";
++
++	pinctrl-names = "default";
++	pinctrl-0 = <&qup_spi14_data_clk &qup_spi14_cs>;
++
++	touchscreen@0 {
++		compatible = "novatek,n9z-spi";
++		reg = <0>;
++		spi-max-frequency = <16000000>;
++
++		interrupt-parent = <&tlmm>;
++		interrupts = <39 IRQ_TYPE_EDGE_FALLING>;
++		reset-gpios = <&tlmm 98 GPIO_ACTIVE_HIGH>;
++		touchscreen-size-x = <1600>;
++		touchscreen-size-y = <2560>;
++
++		/*
++		 * 跟随面板电源状态。面板关屏时触摸 IC 掉电并停在
++		 * bootloader，只有重新执行固件下载才能恢复触摸。
++		 */
++		panel = <&panel>;
++
++		/*
++		 * 实测得到的 raw 坐标到面板像素的分段线性映射。raw 坐标
++		 * 已按“状态字不占节点”重新解析；首末两点把传感器边缘
++		 * 延伸到显示边缘，保证整屏可触摸。
++		 */
++		novatek,x-calibration = <0 0 49 80 794 799 1495 1519
++					 1600 1599>;
++		novatek,y-calibration = <0 0 71 76 687 677 1304 1279
++					 1900 1881 2507 2483 2560 2559>;
++
++		pinctrl-names = "default";
++		pinctrl-0 = <&ts_int_active_state &ts_reset_active_state>;
++	};
++};
++
++&tlmm {
++	/* 背光使能脚，输出高电平使能 RT8555 */
++	bl_en_default: bl-en-default-state {
++		pins = "gpio10";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-disable;
++		output-high;
++	};
++
++	/* 蓝牙使能脚，复位期间保持低电平；引脚偏置取自原厂配置 */
++	bt_en_state: bt-default-state {
++		pins = "gpio21";
++		function = "gpio";
++		drive-strength = <2>;
++		output-low;
++		bias-pull-up;
++	};
++
++	/*
++	 * WLAN 使能脚。pwrseq 驱动接管后先输出低电平，再由电源时序拉高；
++	 * 驱动强度与偏置取自原厂 cnss_wlan_en_active。
++	 */
++	wlan_en_state: wlan-default-state {
++		pins = "gpio20";
++		function = "gpio";
++		drive-strength = <16>;
++		output-low;
++		bias-pull-up;
++	};
++
++	/* uart6 四线流控的偏置与原厂 qupv3_se6_4uart_pins 一致 */
++	uart6_default_state: uart6-default-state {
++		cts-pins {
++			pins = "gpio16";
++			function = "qup6";
++			drive-strength = <2>;
++			bias-disable;
++		};
++
++		rts-pins {
++			pins = "gpio17";
++			function = "qup6";
++			drive-strength = <2>;
++			bias-pull-down;
++		};
++
++		tx-pins {
++			pins = "gpio18";
++			function = "qup6";
++			drive-strength = <2>;
++			bias-pull-up;
++		};
++
++		rx-pins {
++			pins = "gpio19";
++			function = "qup6";
++			drive-strength = <2>;
++			bias-disable;
++		};
++	};
++
++	ts_int_active_state: ts-int-active-state {
++		pins = "gpio39";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-pull-up;
++	};
++
++	ts_reset_active_state: ts-reset-active-state {
++		pins = "gpio98";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-disable;
++	};
++
++	sdc2_default_state: sdc2-default-state {
++		clk-pins {
++			pins = "sdc2_clk";
++			bias-disable;
++			drive-strength = <16>;
++		};
++
++		cmd-pins {
++			pins = "sdc2_cmd";
++			bias-pull-up;
++			drive-strength = <10>;
++		};
++
++		data-pins {
++			pins = "sdc2_data";
++			bias-pull-up;
++			drive-strength = <10>;
++		};
++	};
++
++	sdc2_cd_default: sdc2-cd-default-state {
++		pins = "gpio77";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-pull-up;
++	};
++
++	/*
++	 * 无线供电的引脚状态。原厂把升压使能脚配置为 output-high，
++	 * 这里改为 output-low，避免驱动接管前空载升压。
++	 */
++	mt5727_boost_state: mt5727-boost-state {
++		pins = "gpio50";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-disable;
++		output-low;
++	};
++
++	mt5727_enable_state: mt5727-enable-state {
++		pins = "gpio92";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-pull-up;
++		output-high;
++	};
++
++	mt5727_coil_state: mt5727-coil-state {
++		pins = "gpio117", "gpio155";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-disable;
++		output-low;
++	};
++
++	mt5727_int_state: mt5727-int-state {
++		pins = "gpio129";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-pull-up;
++		input-enable;
++	};
++
++	mt5727_hall_kb_state: mt5727-hall-kb-state {
++		pins = "gpio121";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-pull-up;
++		input-enable;
++	};
++
++	mt5727_hall_pen_state: mt5727-hall-pen-state {
++		pins = "gpio23";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-pull-up;
++		input-enable;
++	};
++};
++
++/*
++ * GPU 与 GMU。zap shader 使用本机 vendor 分区中的签名固件，路径由
++ * firmware-name 直接指定，驱动不再自动补 qcom/ 前缀。
++ *
++ * gpu_mem 原为 0x2000。本机 a650_zap.mdt 只有一个可加载段（b02，
++ * 0x68c 字节，物理地址 0x5000），qcom_mdt_get_size() 需要 0x1000；
++ * 这里扩大到 0x4000 留出余量，结束地址 0x8681e000 仍低于 npu_mem
++ * 的 0x86900000。
++ */
++&gpu_mem {
++	reg = <0x0 0x8681a000 0x0 0x4000>;
++};
++
++&gpu {
++	status = "okay";
++};
++
++&gmu {
++	status = "okay";
++};
++
++&gpu_zap_shader {
++	firmware-name = "qcom/sm8250/a650_zap.mdt";
++};
++
++/*
++ * PM8150B 内的充电器（SMB5）、电量计（FG gen4）与电池电压 ADC。
++ * 驱动按固定偏移访问各子外设，节点只需声明所属 PMIC 与寄存器基址。
++ * pm8150b.dtsi 已经展开 pmic@2，这里按相同路径追加电池节点。
++ */
++&spmi_bus {
++	pmic@2 {
++		battery@1000 {
++			compatible = "qcom,pm8150b-battery";
++			reg = <0x1000>;
++			io-channels = <&pm8150b_adc ADC5_VBAT_SNS>;
++			io-channel-names = "vbat";
++		};
++	};
++};
++
++&pm8150b_adc {
++	channel@84 {
++		reg = <ADC5_VBAT_SNS>;
++		qcom,pre-scaling = <1 3>;
++		label = "vbat_sns";
++	};
++};
++
++/*
++ * SLPI（sensor DSP，0x5c00000）。本机全部传感器只由 SLPI 固件访问：
++ * 加速度计与陀螺仪 t1000（SPI 实例 3）、磁力计 mmc56x3x（I2C 实例 5，
++ * 地址 0x30）、环境光与色彩 TCS3408（I2C 实例 5，地址 0x39）都出现在
++ * 原厂 SLPI 固件里，AP 设备树没有任何对应总线节点。因此这里加载原厂
++ * 分片固件启动 SLPI，再通过 glink 的 IPCRTR 通道把 QRTR 暴露给用户空间，
++ * 由 libssc 向 SSC 服务获取传感器数据。
++ *
++ * 固件必须是设备 vendor 分区里的原厂签名分片，放在 SD 卡根文件系统的
++ * /lib/firmware/qcom/sm8250/dby-w09/ 下。
++ */
++&slpi {
++	firmware-name = "qcom/sm8250/dby-w09/slpi.mdt";
++	status = "okay";
++
++	glink-edge {
++		qrtr_requests {
++			qcom,glink-channels = "IPCRTR";
++		};
++	};
++};
++
++/*
++ * PM8150L 通知灯，位于后摄左侧。原厂节点为 qcom,tri-led，声明红、
++ * 绿、蓝三路，实测硬件只贴装红绿两颗 LED，蓝通道无光输出。这里按
++ * leds-qcom-lpg 的多色 LED 绑定接入两路，reg 从 1 开始编号；原厂
++ * 默认由 timer 触发红绿闪烁。
++ */
++&pm8150l_lpg {
++	status = "okay";
++
++	multi-led {
++		color = <LED_COLOR_ID_MULTI>;
++		function = LED_FUNCTION_STATUS;
++
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		led@1 {
++			reg = <1>;
++			color = <LED_COLOR_ID_RED>;
++		};
++
++		led@2 {
++			reg = <2>;
++			color = <LED_COLOR_ID_GREEN>;
++		};
++	};
++};
++
++/*
++ * PM8150L 闪光灯模块，硬件为 3 通道。原厂后摄只连接通道 0
++ * （led-sources 从 1 开始计数），torch 上限 500 mA，flash 上限
++ * 1.5 A、最长 1280 ms，参数取自原厂 qpnp-flash-led-v2 节点。
++ */
++&pm8150l_flash {
++	status = "okay";
++
++	led-0 {
++		function = LED_FUNCTION_FLASH;
++		color = <LED_COLOR_ID_WHITE>;
++		led-sources = <1>;
++		led-max-microamp = <500000>;
++		flash-max-microamp = <1500000>;
++		flash-max-timeout-us = <1280000>;
++	};
++};
