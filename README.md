@@ -12,6 +12,7 @@ U-Boot 写入 `recovery` 分区，Linux 从 microSD 启动，HarmonyOS
 |:--|:--|:--|
 | U-Boot 与双系统菜单 | 可用 | 启动 Linux、HarmonyOS、fastboot 与复位 |
 | 显示 | 可用 | 双 DSI，1600 x 2560，30 / 60 / 120 Hz |
+| 背光 | 可用 | RT8555，10 位亮度 |
 
 ## 构建与安装
 

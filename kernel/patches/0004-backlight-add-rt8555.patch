@@ -1,0 +1,248 @@
+From: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
+Subject: [PATCH] backlight: add Richtek RT8555 WLED driver
+
+Applied to Linux 7.3.1.
+
+Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
+
+--- a/drivers/video/backlight/Kconfig
++++ b/drivers/video/backlight/Kconfig
+@@ -351,6 +351,15 @@
+ 	  It's commonly used to drive the display WLED. There're four channels
+ 	  inisde, and each channel can provide up to 30mA current.
+ 
++config BACKLIGHT_RT8555
++	tristate "Richtek RT8555 Backlight Driver"
++	depends on I2C
++	help
++	  Say Y here to enable the backlight driver for the Richtek RT8555
++	  WLED boost converter. The brightness is controlled through a
++	  10-bit I2C register, split into an 8-bit low byte and a 2-bit
++	  high byte.
++
+ config BACKLIGHT_SAHARA
+ 	tristate "Tabletkiosk Sahara Touch-iT Backlight Driver"
+ 	depends on X86
+--- a/drivers/video/backlight/Makefile
++++ b/drivers/video/backlight/Makefile
+@@ -39,6 +39,7 @@
+ obj-$(CONFIG_BACKLIGHT_KTD253)		+= ktd253-backlight.o
+ obj-$(CONFIG_BACKLIGHT_KTD2801)		+= ktd2801-backlight.o
+ obj-$(CONFIG_BACKLIGHT_KTZ8866)		+= ktz8866.o
++obj-$(CONFIG_BACKLIGHT_RT8555)		+= rt8555.o
+ obj-$(CONFIG_BACKLIGHT_LM3509)		+= lm3509_bl.o
+ obj-$(CONFIG_BACKLIGHT_LM3533)		+= lm3533_bl.o
+ obj-$(CONFIG_BACKLIGHT_LM3630A)		+= lm3630a_bl.o
+--- /dev/null
++++ b/Documentation/devicetree/bindings/leds/backlight/richtek,rt8555.yaml
+@@ -0,0 +1,53 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/leds/backlight/richtek,rt8555.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Richtek RT8555 6-channel WLED backlight controller
++
++description: |
++  The RT8555 is a 6-channel white LED boost converter with a 10-bit
++  brightness register accessible over I2C. Channel current, boost frequency
++  and dimming mode are configured by the bootloader or by on-chip OTP; the
++  Linux driver only controls the brightness register.
++
++maintainers:
++  - CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
++
++allOf:
++  - $ref: common.yaml#
++
++properties:
++  compatible:
++    const: richtek,rt8555
++
++  reg:
++    maxItems: 1
++
++  enable-gpios:
++    maxItems: 1
++    description: GPIO that enables the backlight converter.
++
++required:
++  - compatible
++  - reg
++
++unevaluatedProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/gpio/gpio.h>
++
++    i2c {
++        #address-cells = <1>;
++        #size-cells = <0>;
++
++        backlight@31 {
++            compatible = "richtek,rt8555";
++            reg = <0x31>;
++            enable-gpios = <&tlmm 10 GPIO_ACTIVE_HIGH>;
++        };
++    };
++
++...
+--- /dev/null
++++ b/drivers/video/backlight/rt8555.c
+@@ -0,0 +1,154 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Richtek RT8555 背光控制器驱动。
++ *
++ * RT8555 是 6 通道 WLED 升压驱动器，亮度由 I2C 寄存器控制：
++ * 0x04 保存亮度低 8 位，0x05 的低 2 位保存高 2 位，合计 10 位，
++ * 有效范围 0 到 0x3FF。厂商驱动按低字节在前、高字节在后的顺序写入，
++ * 这里保持一致。
++ *
++ * 芯片的通道电流、升压频率与调光方式由引导阶段或片上 OTP 配置完成，
++ * 驱动只接管亮度寄存器，避免在 Linux 侧重复写入厂商初始化序列。
++ */
++
++#include <linux/backlight.h>
++#include <linux/gpio/consumer.h>
++#include <linux/i2c.h>
++#include <linux/module.h>
++#include <linux/of.h>
++
++#define RT8555_REG_BRT_LSB	0x04
++#define RT8555_REG_BRT_MSB	0x05
++
++#define RT8555_BRT_MAX		0x3FF
++#define RT8555_BRT_MSB_MASK	0x03
++
++struct rt8555 {
++	struct i2c_client *client;
++	struct backlight_device *bl;
++	struct gpio_desc *enable;
++};
++
++static int rt8555_write_brightness(struct rt8555 *priv, unsigned int level)
++{
++	int ret;
++
++	ret = i2c_smbus_write_byte_data(priv->client, RT8555_REG_BRT_LSB,
++					level & 0xff);
++	if (ret)
++		return ret;
++
++	return i2c_smbus_write_byte_data(priv->client, RT8555_REG_BRT_MSB,
++					 (level >> 8) & RT8555_BRT_MSB_MASK);
++}
++
++static int rt8555_read_brightness(struct rt8555 *priv)
++{
++	int lsb, msb;
++
++	lsb = i2c_smbus_read_byte_data(priv->client, RT8555_REG_BRT_LSB);
++	if (lsb < 0)
++		return lsb;
++
++	msb = i2c_smbus_read_byte_data(priv->client, RT8555_REG_BRT_MSB);
++	if (msb < 0)
++		return msb;
++
++	return ((msb & RT8555_BRT_MSB_MASK) << 8) | lsb;
++}
++
++static int rt8555_update_status(struct backlight_device *bl)
++{
++	struct rt8555 *priv = bl_get_data(bl);
++
++	return rt8555_write_brightness(priv, backlight_get_brightness(bl));
++}
++
++static const struct backlight_ops rt8555_bl_ops = {
++	.options = BL_CORE_SUSPENDRESUME,
++	.update_status = rt8555_update_status,
++};
++
++static int rt8555_probe(struct i2c_client *client)
++{
++	struct backlight_properties props;
++	struct backlight_device *bl;
++	struct rt8555 *priv;
++	int level;
++
++	priv = devm_kzalloc(&client->dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	priv->client = client;
++
++	/*
++	 * 使能脚由引导阶段保持高电平。这里重新请求一次并在移除时释放，
++	 * 让内核明确持有该引脚；GPIO 不存在时按无使能脚处理。
++	 */
++	priv->enable = devm_gpiod_get_optional(&client->dev, "enable",
++					      GPIOD_OUT_HIGH);
++	if (IS_ERR(priv->enable))
++		return dev_err_probe(&client->dev, PTR_ERR(priv->enable),
++				     "cannot get enable GPIO\n");
++
++	level = rt8555_read_brightness(priv);
++	if (level < 0)
++		return dev_err_probe(&client->dev, level,
++				     "cannot read brightness\n");
++
++	memset(&props, 0, sizeof(props));
++	props.type = BACKLIGHT_PLATFORM;
++	props.max_brightness = RT8555_BRT_MAX;
++	props.brightness = level;
++	props.scale = BACKLIGHT_SCALE_LINEAR;
++
++	bl = devm_backlight_device_register(&client->dev, "rt8555-backlight",
++					   &client->dev, priv,
++					   &rt8555_bl_ops, &props);
++	if (IS_ERR(bl))
++		return dev_err_probe(&client->dev, PTR_ERR(bl),
++				     "cannot register backlight device\n");
++
++	priv->bl = bl;
++	i2c_set_clientdata(client, priv);
++
++	return 0;
++}
++
++static void rt8555_remove(struct i2c_client *client)
++{
++	struct rt8555 *priv = i2c_get_clientdata(client);
++
++	rt8555_write_brightness(priv, 0);
++
++	if (priv->enable)
++		gpiod_set_value_cansleep(priv->enable, 0);
++}
++
++static const struct i2c_device_id rt8555_ids[] = {
++	{ .name = "rt8555" },
++	{ }
++};
++MODULE_DEVICE_TABLE(i2c, rt8555_ids);
++
++static const struct of_device_id rt8555_match_table[] = {
++	{ .compatible = "richtek,rt8555" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, rt8555_match_table);
++
++static struct i2c_driver rt8555_driver = {
++	.driver = {
++		.name = "rt8555",
++		.of_match_table = rt8555_match_table,
++	},
++	.probe = rt8555_probe,
++	.remove = rt8555_remove,
++	.id_table = rt8555_ids,
++};
++
++module_i2c_driver(rt8555_driver);
++
++MODULE_DESCRIPTION("Richtek RT8555 Backlight Driver");
++MODULE_LICENSE("GPL");
