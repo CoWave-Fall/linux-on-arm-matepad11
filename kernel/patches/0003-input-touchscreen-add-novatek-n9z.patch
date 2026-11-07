@@ -1,0 +1,2500 @@
+From: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
+Subject: [PATCH] input: touchscreen: add Novatek N9Z SPI touchscreen
+
+Applied to Linux 7.3.1.
+
+Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
+
+--- a/drivers/input/touchscreen/Kconfig
++++ b/drivers/input/touchscreen/Kconfig
+@@ -701,6 +701,25 @@
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called novatek-nvt-ts.
+ 
++config TOUCHSCREEN_NOVATEK_N9Z
++	tristate "Novatek N9Z series SPI touchscreen support"
++	# Needs drm_panel follower; depends on DRM so DRM=m limits this driver to m
++	depends on DRM
++	depends on SPI
++	select INPUT_MT
++	help
++	  Say Y here if you have a Novatek N9Z series touch controller
++	  connected over SPI. The controller has no firmware of its own;
++	  the driver downloads the AFE firmware whenever the attached
++	  panel is enabled, reads raw capacitive frames from the interrupt
++	  handler, and reports multitouch coordinates. If the device tree
++	  links the controller to a DRM panel through the "panel" property,
++	  the driver follows the panel power state and reinitializes the
++	  controller after every screen-on.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called novatek-n9z.
++
+ config TOUCHSCREEN_IMAGIS
+ 	tristate "Imagis touchscreen support"
+ 	depends on I2C
+--- a/drivers/input/touchscreen/Makefile
++++ b/drivers/input/touchscreen/Makefile
+@@ -69,6 +69,8 @@
+ obj-$(CONFIG_TOUCHSCREEN_MSG2638)	+= msg2638.o
+ obj-$(CONFIG_TOUCHSCREEN_MTOUCH)	+= mtouch.o
+ obj-$(CONFIG_TOUCHSCREEN_NOVATEK_NVT_TS)	+= novatek-nvt-ts.o
++obj-$(CONFIG_TOUCHSCREEN_NOVATEK_N9Z)	+= novatek-n9z.o
++novatek-n9z-y := novatek-n9z-core.o novatek-n9z-fw.o novatek-n9z-afe.o
+ obj-$(CONFIG_TOUCHSCREEN_HP600)		+= hp680_ts_input.o
+ obj-$(CONFIG_TOUCHSCREEN_HP7XX)		+= jornada720_ts.o
+ obj-$(CONFIG_TOUCHSCREEN_IPAQ_MICRO)	+= ipaq-micro-ts.o
+--- /dev/null
++++ b/Documentation/devicetree/bindings/input/touchscreen/novatek,n9z.yaml
+@@ -0,0 +1,98 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/input/touchscreen/novatek,n9z.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Novatek N9Z series SPI touchscreen controller
++
++description: |
++  The Novatek N9Z is a capacitive touch controller with an integrated
++  stylus AFE. It has no on-chip firmware: the host loads the AFE image into
++  the controller SRAM after every power-up of the attached panel and then
++  reads raw frames over SPI.
++
++  The N9Z may be integrally connected to a DSI panel. When the panel phandle
++  is present the driver follows the panel enable state, resetting the
++  controller and reloading the firmware each time the panel is turned on.
++
++maintainers:
++  - CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
++
++allOf:
++  - $ref: touchscreen.yaml#
++  - $ref: /schemas/spi/spi-peripheral-props.yaml#
++
++properties:
++  compatible:
++    const: novatek,n9z-spi
++
++  reg:
++    maxItems: 1
++
++  interrupts:
++    maxItems: 1
++
++  reset-gpios:
++    maxItems: 1
++    description: GPIO connected to the controller reset line (active high).
++
++  spi-max-frequency: true
++
++  touchscreen-size-x: true
++  touchscreen-size-y: true
++
++  novatek,x-calibration:
++    $ref: /schemas/types.yaml#/definitions/uint32-array
++    minItems: 4
++    maxItems: 20
++    description: |
++      Piecewise linear mapping from raw X coordinates to panel pixels,
++      given as raw/panel pairs. Raw values shall be strictly increasing.
++      When absent the driver maps the raw axis linearly onto the
++      touchscreen size.
++
++  novatek,y-calibration:
++    $ref: /schemas/types.yaml#/definitions/uint32-array
++    minItems: 4
++    maxItems: 20
++    description: |
++      Piecewise linear mapping from raw Y coordinates to panel pixels,
++      given as raw/panel pairs. Raw values shall be strictly increasing.
++      When absent the driver maps the raw axis linearly onto the
++      touchscreen size.
++
++required:
++  - compatible
++  - reg
++  - interrupts
++  - reset-gpios
++
++unevaluatedProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/gpio/gpio.h>
++    #include <dt-bindings/interrupt-controller/irq.h>
++
++    spi {
++        #address-cells = <1>;
++        #size-cells = <0>;
++
++        touchscreen@0 {
++            compatible = "novatek,n9z-spi";
++            reg = <0>;
++            spi-max-frequency = <16000000>;
++
++            interrupt-parent = <&tlmm>;
++            interrupts = <39 IRQ_TYPE_EDGE_FALLING>;
++            reset-gpios = <&tlmm 98 GPIO_ACTIVE_HIGH>;
++
++            touchscreen-size-x = <1600>;
++            touchscreen-size-y = <2560>;
++            novatek,x-calibration = <0 0 794 799 1600 1599>;
++            novatek,y-calibration = <0 0 687 677 2560 2559>;
++        };
++    };
++
++...
+--- /dev/null
++++ b/drivers/input/touchscreen/novatek-n9z.h
+@@ -0,0 +1,272 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Novatek N9Z 系列 SPI 触摸控制器驱动共享定义。
++ *
++ * 控制器不保存固件，每次面板上电后由主机把 AFE 固件写入 SRAM。
++ * AFE 帧由 2 字节 SPI 前导、4 字节状态字和 1598 个 16 位节点组成；
++ * 状态字不占用电容节点，节点流从帧偏移 6 开始。
++ *
++ * 行列数取自厂商算法参数 W2599Z1300_caplimit_default.csv 的
++ * row_col_num 段：50 行、32 列。
++ */
++
++#ifndef _NOVATEK_N9Z_H
++#define _NOVATEK_N9Z_H
++
++#include <linux/bitmap.h>
++#include <linux/mutex.h>
++#include <linux/types.h>
++#include <linux/workqueue.h>
++
++#include <drm/drm_panel.h>
++
++struct gpio_desc;
++struct input_dev;
++struct spi_device;
++struct device;
++
++#define NVT_ROWS		50
++#define NVT_COLS		32
++#define NVT_NODE_COUNT		(NVT_ROWS * NVT_COLS)
++
++/*
++ * AFE 帧布局。厂商帧长表取 0xC80，单次传输再加 3 字节：
++ * 2 字节 SPI 前导、4 字节状态字、1598 个节点、1 字节尾部数据。
++ * 状态字占据帧偏移 2..5，节点流从偏移 6 开始，不能当作两个电容
++ * 节点参与解算，否则坐标会整体偏移约两列。
++ */
++#define NVT_FRAME_PREAMBLE	2
++#define NVT_FRAME_STATUS_BYTES	4
++#define NVT_FRAME_NODE_OFFSET	(NVT_FRAME_PREAMBLE + NVT_FRAME_STATUS_BYTES)
++#define NVT_FRAME_NODES		(NVT_NODE_COUNT - NVT_FRAME_STATUS_BYTES / 2)
++#define NVT_FRAME_LEN		0xC83
++
++#define NVT_CMD_GET_FRAME	0x20
++#define NVT_PAGE_WRITE		0xFF
++
++/*
++ * 帧长表的其他表项：厂商 HAL 同时记录 0xC80、0xC8E、0xCB6 与 0x310。
++ * 0xC80 是手指电容帧，笔扫描模式下的帧长可能切换到更大的表项，
++ * 调试时通过 frame_len 参数读取更长的数据观察尾部。最大值 0xCB9
++ * 即 3257 字节，是完整笔扫描帧的长度。
++ */
++#define NVT_FRAME_MAX_LEN	(0xCB6 + 3)
++
++/*
++ * 主动笔扫描帧在节点流开头的同步字。笔帧的线数据布局与手指电容帧
++ * 完全不同，进入手指解算会产生错误坐标；驱动识别并跳过这些帧，
++ * 坐标解码与笔 input 设备另行处理。
++ */
++#define NVT_PEN_SYNC0		0xa5
++#define NVT_PEN_SYNC1		0x5a
++#define NVT_PEN_SYNC_LEN	4
++
++/*
++ * 笔扫描帧布局：帧偏移 6 起为同步字，随后 2 字节序号，节点数据从
++ * 偏移 12 开始。节点编号以偏移 12 为 0，与 HarmonyOS 侧采集的
++ * pen_XXXX.bin（以同步字开头、节点从 6 开始）一致。
++ *
++ * X 轴为 893..924 连续 32 线。厂商标定脚本使用 896 作为窗口起点，
++ * 该偏移在中部被线性截距吸收，左边缘的峰值落到窗口之外，实测
++ * 峰值出现在节点 893/894，因此以 893 为起点。
++ *
++ * Y 轴为两组 4 相位跨步数组，基址 989 与 1385，每相位取
++ * base+p, base+p+4, ... 共 50 线，选择幅度最大的相位。
++ */
++#define NVT_PEN_NODE_OFFSET	(NVT_FRAME_NODE_OFFSET + NVT_PEN_SYNC_LEN + 2)
++#define NVT_PEN_X_OFF		893
++#define NVT_PEN_X_LINES		32
++#define NVT_PEN_Y_BASE0		989
++#define NVT_PEN_Y_BASE1		1385
++#define NVT_PEN_Y_PHASES	4
++#define NVT_PEN_Y_SLOTS		50
++#define NVT_PEN_Y_STRIDE	4
++
++/* 第二组 Y 数组的最后一条线，以及覆盖它的最短帧长 */
++#define NVT_PEN_NODE_MAX	(NVT_PEN_Y_BASE1 + NVT_PEN_Y_PHASES - 1 + \
++				 (NVT_PEN_Y_SLOTS - 1) * NVT_PEN_Y_STRIDE)
++#define NVT_PEN_FRAME_LEN	(NVT_PEN_NODE_OFFSET + (NVT_PEN_NODE_MAX + 1) * 2)
++
++/* 笔离开后保持悬浮坐标的时间，超过后上报 BTN_TOOL_PEN=0 */
++#define NVT_PEN_RELEASE_MS	100
++
++/* 单帧坐标跳变门限，超过视为信号衰减时的噪声峰值 */
++#define NVT_PEN_JUMP_LIMIT	300
++
++#define NVT_SW_RESET_ADDR	0x3F0FE
++#define NVT_SW_RESET_IDLE	0xAA
++#define NVT_BOOTLOADER_ENTER	0x69
++
++#define NVT_NODE_BASELINE	0x8000
++#define NVT_MAX_TOUCH		10
++#define NVT_TRACK_DIST		8	/* 同一触点跨帧匹配上限，单位节点 */
++#define NVT_DEFAULT_WIDTH	1600
++#define NVT_DEFAULT_HEIGHT	2560
++
++/* 分段线性校准最多支持的节点对数 */
++#define NVT_CAL_MAX		10
++
++/* 检测到大面积手掌后抑制碎片的持续时间 */
++#define NVT_PALM_LOCK_MS	300
++
++/*
++ * AFE 有效性判定。固件未启动 AFE 时，0x20 命令回落到 SRAM，返回的数据
++ * 相对基线的分布与电容帧完全不同：正常帧有 99% 以上的节点落在基线附近，
++ * 回落数据只有 20% 左右。用该比例区分两种状态，避免把 SRAM 内容当作
++ * 触点上报。
++ */
++#define NVT_AFE_WINDOW		0x1000
++#define NVT_AFE_VALID_PCT	70
++
++/*
++ * 连续无效帧达到上限后重新初始化。面板上电后 AFE 需要一段启动时间，
++ * 因此恢复流程先轮询有效帧，再打开中断。
++ */
++#define NVT_AFE_LOST_FRAMES	4
++#define NVT_BAD_FRAME_LIMIT	32
++#define NVT_SETTLE_MAX_MS	10000	/* 启动校准暂态的最长等待时间 */
++#define NVT_AFE_POLL_TRIES	25	/* 每次 20 ms，最长等待 500 ms */
++#define NVT_AFE_POLL_MS		20
++#define NVT_INIT_RETRIES	3
++#define NVT_INIT_RETRY_MS	200
++
++/* 固件下载寄存器与分段格式，取自厂商 AFE HAL 的下载流程 */
++#define NVT_FW_TX_BLOCK		0x13FD
++#define NVT_FW_SEG_MAX		16
++#define NVT_FW_MAX_SIZE		0x30000
++#define NVT_REG_TX_AUTO_COPY	0x3F7E8
++#define NVT_REG_BOOT_READY	0x3F10D
++#define NVT_REG_BLD_CRC_EN	0x3F30E
++#define NVT_REG_CMD		0x2FE50
++#define NVT_REG_FW_STAMP	0x2FE77
++#define NVT_REG_FW_STATUS	0x2FE60
++
++/*
++ * 笔扫描固件命令。载荷为 6 字节：命令、子命令、两个参数、stamp 与
++ * 校验和，写入 0x2FE50 后轮询 0x2FE77 回读 stamp 确认固件已处理。
++ * 命令含义取自厂商 HAL。
++ */
++#define NVT_FW_CMD_STYLUS_STATUS	0xC2
++#define NVT_FW_CMD_STYLUS_PARAM		0xCA
++#define NVT_FW_CMD_STYLUS_CFG		0x2A
++#define NVT_FW_CMD_AFE_MODE		0x1D
++#define NVT_FW_CMD_KEEPALIVE		0x3B
++#define NVT_FW_HANDSHAKE		0xBB
++#define NVT_FW_CMD_RETRIES		5
++#define NVT_STYLUS_CMD_DISABLE		0x00
++#define NVT_STYLUS_CMD_ENABLE		0x01
++#define NVT_STYLUS_CMD_STATUS		0x02
++#define NVT_STYLUS_PARAM_FREQ		0x00
++#define NVT_STYLUS_PARAM_ID		0x04
++#define NVT_STYLUS_PARAM_PRESS		0x05
++#define NVT_REG_FW_DMA_INFO	0x3F7F1
++#define NVT_FW_START_CMD	0xAE
++
++struct nvt_contact {
++	bool used;	/* 槽位占用标记，仅对 prev[] 有意义 */
++	int id;
++	int x;
++	int y;
++	int row;	/* 质心，单位 1/16 行 */
++	int col;	/* 质心，单位 1/16 列 */
++	int area;	/* 连通区域内的节点数 */
++	int pressure;
++	int major;
++};
++
++struct nvt_fw_seg {
++	u32 bin_off;
++	u32 sram;
++	u32 size;
++	u32 crc;
++};
++
++struct nvt_data {
++	struct spi_device *spi;
++	struct input_dev *input;
++	struct input_dev *pen_input;
++	struct gpio_desc *reset_gpio;
++
++	u8 *tx_buf;
++	u8 *rx_buf;
++	s16 delta[NVT_NODE_COUNT];
++	u16 stack[NVT_NODE_COUNT];
++	unsigned long visited[BITS_TO_LONGS(NVT_NODE_COUNT)];
++	struct nvt_contact prev[NVT_MAX_TOUCH];
++	unsigned int next_id;
++	bool touch_active;
++	u32 x_max;
++	u32 y_max;
++
++	/* 悬浮笔状态：坐标与最近一次收到笔帧的时刻 */
++	bool pen_active;
++	int pen_x;
++	int pen_y;
++	unsigned long pen_last;
++
++	/* 设备树给出的 raw -> 面板像素分段线性校准节点 */
++	u16 cal_x_raw[NVT_CAL_MAX];
++	u16 cal_x_map[NVT_CAL_MAX];
++	u16 cal_y_raw[NVT_CAL_MAX];
++	u16 cal_y_map[NVT_CAL_MAX];
++	unsigned int ncal_x;
++	unsigned int ncal_y;
++
++	/* 手掌大块检测与碎片抑制窗口 */
++	bool palm_blob_seen;
++	unsigned long palm_lock_until;
++
++	/*
++	 * 笔扫描固件命令。stamp 为固件命令序号；applied 记录已经下发
++	 * 成功的参数，AFE 重新初始化后清零以便重新下发。
++	 */
++	struct delayed_work pen_cmd_work;
++	u8 pen_stamp;
++	unsigned int pen_enable_applied;
++	unsigned int pen_status_applied;
++	unsigned long pen_heartbeat_until;
++
++	/*
++	 * 面板电源状态机。面板通知回调可能与中断线程、恢复工作并发，
++	 * power_lock 串行化初始化、挂起、AFE 状态变更以及固件命令通道。
++	 */
++	struct drm_panel_follower follower;
++	/* 串行化初始化、挂起、AFE 状态变更与固件命令通道 */
++	struct mutex power_lock;
++	struct delayed_work resume_work;
++	bool panel_on;
++	bool afe_ready;
++	bool irq_enabled;
++	bool reinit_pending;
++	unsigned int bad_frames;
++	unsigned int dead_frames;
++	unsigned long bad_since;
++	unsigned int init_retries;
++};
++
++/* SPI 传输层，novatek-n9z-core.c */
++int nvt_send_fw_cmd(struct nvt_data *ts, u8 cmd, u8 subcmd, u8 arg0, u8 arg1);
++int nvt_page_write(struct spi_device *spi, u32 addr);
++int nvt_write(struct spi_device *spi, u32 addr, u8 val);
++int nvt_read(struct spi_device *spi, u32 addr, u8 *buf, size_t len);
++int nvt_write_buf(struct spi_device *spi, u32 addr,
++		  const u8 *data, size_t len);
++int nvt_write_u24(struct spi_device *spi, u32 addr, u32 val);
++int nvt_write_u32(struct spi_device *spi, u32 addr, u32 val);
++int nvt_read_frame(struct nvt_data *ts);
++
++/* 固件下载与芯片复位，novatek-n9z-fw.c */
++int nvt_hw_init(struct nvt_data *ts);
++
++/* AFE 帧解算与输入上报，novatek-n9z-afe.c */
++bool nvt_status_valid(const u8 *buf);
++bool nvt_frame_valid(const u8 *buf);
++bool nvt_pen_frame(const u8 *buf, unsigned int len);
++bool nvt_process_pen_frame(struct nvt_data *ts, unsigned int len);
++void nvt_release_pen(struct nvt_data *ts);
++void nvt_dump_frame(const struct nvt_data *ts);
++void nvt_process_frame(struct nvt_data *ts);
++void nvt_release_contacts(struct nvt_data *ts);
++void nvt_read_calibration(struct nvt_data *ts);
++
++#endif /* _NOVATEK_N9Z_H */
+--- /dev/null
++++ b/drivers/input/touchscreen/novatek-n9z-core.c
+@@ -0,0 +1,1020 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Novatek N9Z 系列 SPI 触摸控制器驱动：总线、面板电源与中断。
++ *
++ * 该 IC 不保存固件：每次面板上电由主机把 AFE 固件写入 SRAM，随后 IC
++ * 以约 130 次/秒的频率在中断线上通知主机，主机用 0x20 命令读取整帧
++ * 电容原始数据。触摸点解算在 novatek-n9z-afe.c 中完成，固件下载在
++ * novatek-n9z-fw.c 中完成。
++ *
++ * 关屏时面板电源断开，触摸 IC 随之掉电并停在 bootloader；此时中断线
++ * 保持低电平，不会产生任何中断。驱动通过 drm_panel_follower 跟随面板
++ * 的使能状态，在每次亮屏后重新复位 IC、下载固件并轮询 AFE 就绪，然后
++ * 才打开中断。
++ */
++
++#include <linux/delay.h>
++#include <linux/err.h>
++#include <linux/gpio/consumer.h>
++#include <linux/input.h>
++#include <linux/input/mt.h>
++#include <linux/interrupt.h>
++#include <linux/jiffies.h>
++#include <linux/kstrtox.h>
++#include <linux/math.h>
++#include <linux/module.h>
++#include <linux/printk.h>
++#include <linux/property.h>
++#include <linux/slab.h>
++#include <linux/spi/spi.h>
++#include <linux/string.h>
++#include <linux/unaligned.h>
++
++#include "novatek-n9z.h"
++
++/*
++ * 诊断开关：大于 0 时对下一帧无效数据输出分布统计，写入次数后自动关闭。
++ * 正常使用时保持 0，避免异常帧刷屏。
++ */
++static unsigned int dump_frames;
++module_param(dump_frames, uint, 0644);
++MODULE_PARM_DESC(dump_frames, "输出接下来 N 帧无效数据的分布统计");
++
++/*
++ * 诊断参数：把接下来的 N 帧原始数据以十六进制写入内核日志，用于
++ * 对比笔在场与手指触摸时的帧内容。连续采集会冲垮日志，只适合少量
++ * 抽帧；连续采集需要另设二进制接口。
++ */
++static unsigned int dump_raw;
++module_param(dump_raw, uint, 0644);
++MODULE_PARM_DESC(dump_raw, "输出接下来 N 帧原始数据，包含无效帧");
++
++/*
++ * 诊断参数：0x20 命令的读取长度。默认值覆盖完整笔扫描帧 3257 字节，
++ * 手指电容帧为 3203 字节，多读的尾部数据不参与手指解算。写入范围
++ * 由 nvt_frame_read_len() 收紧。
++ */
++static unsigned int frame_len = NVT_FRAME_MAX_LEN;
++module_param(frame_len, uint, 0644);
++MODULE_PARM_DESC(frame_len, "0x20 命令的读取字节数");
++
++/*
++ * 只读诊断计数：累计识别为笔扫描帧的帧数。纯手指采集时该值应保持
++ * 为 0，用来确认笔帧判据没有把手指电容帧误判为笔帧。
++ */
++static unsigned int pen_sync_count;
++module_param(pen_sync_count, uint, 0444);
++MODULE_PARM_DESC(pen_sync_count, "累计识别为笔扫描帧的帧数");
++
++/*
++ * 设备上下文与参数写入、remove() 共用同一把锁。参数写入在进程上下文
++ * 访问 nvt_cmd_ctx 指向的私有数据，而 remove() 返回后 devm 立即释放
++ * 它。仅靠 READ_ONCE 读写指针无法建立生命周期保证：写入方可能在读取
++ * 指针后被抢占，remove() 清空指针并完成释放，写入方恢复后访问已释放
++ * 的 power_lock。
++ *
++ * remove() 清空前先取同一把锁，从而等待在途写入结束。锁顺序固定为
++ * nvt_cmd_lock 再到 power_lock，其他路径只取 power_lock，不会形成环。
++ */
++static DEFINE_MUTEX(nvt_cmd_lock);
++static struct nvt_data *nvt_cmd_ctx;
++
++/*
++ * 笔配置工作项空闲时停止自调度，写入参数后由这里重新排队。设备尚未
++ * probe 时只保存参数值，probe 路径会做首次处理。
++ */
++static void nvt_schedule_pen_cmd(void)
++{
++	struct nvt_data *ts;
++
++	mutex_lock(&nvt_cmd_lock);
++	ts = nvt_cmd_ctx;
++	if (ts)
++		schedule_delayed_work(&ts->pen_cmd_work, 0);
++	mutex_unlock(&nvt_cmd_lock);
++}
++
++/* 笔配置参数共用写入路径：保存新值并激活工作项。 */
++static int nvt_pen_uint_set(const char *val, const struct kernel_param *kp)
++{
++	unsigned int v;
++	int ret;
++
++	ret = kstrtouint(val, 0, &v);
++	if (ret)
++		return ret;
++
++	WRITE_ONCE(*(unsigned int *)kp->arg, v);
++	nvt_schedule_pen_cmd();
++	return 0;
++}
++
++static const struct kernel_param_ops nvt_pen_uint_ops = {
++	.set = nvt_pen_uint_set,
++	.get = param_get_uint,
++};
++
++/*
++ * 笔蓝牙状态。厂商驱动在笔连接状态变化时下发 0xC2(0x02,status)：
++ * 0 断开、1 连接、2 靠近。固件据此切换主动笔扫描。0xFF 表示未设置，
++ * 默认跳过该命令。
++ */
++static unsigned int pen_status = 0xFF;
++module_param_cb(pen_status, &nvt_pen_uint_ops, &pen_status, 0644);
++MODULE_PARM_DESC(pen_status, "笔蓝牙状态：0 断开，1 连接，2 吸附，0xFF 未设置");
++
++/*
++ * HPP3.0 主动笔协议开关。厂商 HAL 在笔会话建立后依次下发
++ * C2 BB 01 00（连续两次）、2A BB 00 00、3B BB 02 00（连续两次）、
++ * 1D 02 00 00；关闭时把第一条的参数换成 0x00。序列只在参数变化时
++ * 下发一次，周期性的 0x3B 由 pen_heartbeat_ms 维护。
++ *
++ * 默认关闭，保证纯手指场景不发送任何笔命令。
++ */
++static unsigned int pen_enable;
++module_param_cb(pen_enable, &nvt_pen_uint_ops, &pen_enable, 0644);
++MODULE_PARM_DESC(pen_enable, "HPP3.0 主动笔协议：0 关闭，1 使能");
++
++/*
++ * 诊断参数：直接下发一条 6 字节固件命令，格式为
++ * "cmd sub arg0 arg1"（十六进制）。用于在没有用户态工具的情况下做
++ * 厂商命令 A/B 实验；写入后立即在进程上下文发送并回读 stamp。
++ */
++static char pen_raw[32];
++/*
++ * module_param_cb 通过 union 的首个成员 void *arg 保存该指针，因此
++ * 这里按内核惯例不加 const，避免初始化时丢弃限定符。
++ */
++static struct kparam_string pen_raw_string = {
++	.maxlen = sizeof(pen_raw),
++	.string = pen_raw,
++};
++
++static int nvt_pen_raw_set(const char *val, const struct kernel_param *kp)
++{
++	struct nvt_data *ts;
++	unsigned int cmd, sub, arg0, arg1;
++	int ret;
++
++	ret = sscanf(val, "%x %x %x %x", &cmd, &sub, &arg0, &arg1);
++	if (ret != 4 || (cmd | sub | arg0 | arg1) > 0xff)
++		return -EINVAL;
++
++	strscpy(pen_raw, val, sizeof(pen_raw));
++
++	mutex_lock(&nvt_cmd_lock);
++	ts = nvt_cmd_ctx;
++	if (!ts) {
++		mutex_unlock(&nvt_cmd_lock);
++		return -ENODEV;
++	}
++
++	/*
++	 * 固件命令寄存器与 stamp 序号只有一条通道，pen_cmd_work 也在
++	 * 使用；并发下发会互相覆盖序号与载荷。与初始化、挂起共用
++	 * power_lock，锁内重新确认 AFE 状态，避免在固件下载期间访问
++	 * 命令寄存器。
++	 */
++	mutex_lock(&ts->power_lock);
++	if (!ts->panel_on || !ts->afe_ready)
++		ret = -EAGAIN;
++	else
++		ret = nvt_send_fw_cmd(ts, cmd, sub, arg0, arg1);
++	mutex_unlock(&ts->power_lock);
++
++	dev_info(&ts->spi->dev, "pen raw %02x %02x %02x %02x: %d\n",
++		 cmd, sub, arg0, arg1, ret);
++	mutex_unlock(&nvt_cmd_lock);
++	return ret;
++}
++
++static const struct kernel_param_ops nvt_pen_raw_ops = {
++	.set = nvt_pen_raw_set,
++	.get = param_get_string,
++};
++module_param_cb(pen_raw, &nvt_pen_raw_ops, &pen_raw_string, 0644);
++MODULE_PARM_DESC(pen_raw, "诊断：下发固件命令，格式 cmd sub arg0 arg1（十六进制）");
++
++/*
++ * AFE 心跳。0x3B(0x02,0) 让固件输出带 a5 5a 5a a5 同步字的笔扫描帧。
++ * 参数为发送间隔毫秒，0 关闭。命令在 workqueue 中下发，不占用中断
++ * 线程。
++ */
++static unsigned int pen_heartbeat_ms;
++module_param_cb(pen_heartbeat_ms, &nvt_pen_uint_ops, &pen_heartbeat_ms, 0644);
++MODULE_PARM_DESC(pen_heartbeat_ms, "笔扫描心跳间隔，毫秒，0 关闭");
++
++/*
++ * 笔帧原始导出。只导出识别为笔扫描的帧，避免手指帧刷屏；连续标定
++ * 采集时用 dump_pen_stride 降低导出频率。
++ */
++static unsigned int dump_pen_count;
++module_param(dump_pen_count, uint, 0644);
++MODULE_PARM_DESC(dump_pen_count, "输出接下来 N 帧笔扫描原始数据");
++
++static unsigned int dump_pen_stride = 1;
++module_param(dump_pen_stride, uint, 0644);
++MODULE_PARM_DESC(dump_pen_stride, "笔帧导出的抽帧间隔");
++
++static unsigned int pen_dump_seq;
++
++/*
++ * 实际读取长度。手指电容帧必须覆盖全部节点，完整笔扫描帧为
++ * NVT_FRAME_MAX_LEN 字节。参数写入超出范围时按区间收紧，避免节点
++ * 解算读越缓冲区。
++ */
++static unsigned int nvt_frame_read_len(void)
++{
++	unsigned int len = READ_ONCE(frame_len);
++
++	if (len < NVT_FRAME_LEN)
++		len = NVT_FRAME_LEN;
++	if (len > NVT_FRAME_MAX_LEN)
++		len = NVT_FRAME_MAX_LEN;
++
++	return len;
++}
++
++int nvt_page_write(struct spi_device *spi, u32 addr)
++{
++	u8 tx[3] = {
++		NVT_PAGE_WRITE,
++		(addr >> 15) & 0x7F,
++		(addr >> 7) & 0xFF,
++	};
++
++	return spi_write(spi, tx, sizeof(tx));
++}
++
++int nvt_write(struct spi_device *spi, u32 addr, u8 val)
++{
++	u8 tx[2] = {
++		(addr & 0x7F) | 0x80,
++		val,
++	};
++	int ret;
++
++	ret = nvt_page_write(spi, addr);
++	if (ret)
++		return ret;
++
++	return spi_write(spi, tx, sizeof(tx));
++}
++
++/* 读命令返回的数据前 2 字节为总线哑字节，有效数据从 buf[2] 开始。 */
++int nvt_read(struct spi_device *spi, u32 addr, u8 *buf, size_t len)
++{
++	struct spi_transfer xfer = {
++		.rx_buf = buf,
++		.len = len,
++	};
++	struct spi_message msg;
++	u8 *tx;
++	int ret;
++
++	tx = kzalloc(len, GFP_KERNEL);
++	if (!tx)
++		return -ENOMEM;
++
++	tx[0] = addr & 0x7F;
++	ret = nvt_page_write(spi, addr);
++	if (ret)
++		goto out;
++
++	xfer.tx_buf = tx;
++	spi_message_init(&msg);
++	spi_message_add_tail(&xfer, &msg);
++	ret = spi_sync(spi, &msg);
++
++out:
++	kfree(tx);
++	return ret;
++}
++
++int nvt_write_buf(struct spi_device *spi, u32 addr,
++		  const u8 *data, size_t len)
++{
++	u8 *tx;
++	int ret;
++
++	ret = nvt_page_write(spi, addr);
++	if (ret)
++		return ret;
++
++	tx = kmalloc(len + 1, GFP_KERNEL);
++	if (!tx)
++		return -ENOMEM;
++	tx[0] = (addr & 0x7F) | 0x80;
++	memcpy(tx + 1, data, len);
++	ret = spi_write(spi, tx, len + 1);
++	kfree(tx);
++
++	return ret;
++}
++
++int nvt_write_u24(struct spi_device *spi, u32 addr, u32 val)
++{
++	u8 buf[3] = { val & 0xFF, (val >> 8) & 0xFF, (val >> 16) & 0xFF };
++
++	return nvt_write_buf(spi, addr, buf, sizeof(buf));
++}
++
++int nvt_write_u32(struct spi_device *spi, u32 addr, u32 val)
++{
++	u8 buf[4] = { val & 0xFF, (val >> 8) & 0xFF,
++		      (val >> 16) & 0xFF, (val >> 24) & 0xFF };
++
++	return nvt_write_buf(spi, addr, buf, sizeof(buf));
++}
++
++/*
++ * 下发一条 6 字节固件命令并回读 stamp 确认。厂商实现维护 0..15 的
++ * 序号，写入后轮询 0x2FE77，回读等于写入值表示命令已处理。
++ *
++ * 命令通道只有一条，调用者必须持有 power_lock，保证序号、载荷与
++ * 回读不会和其他命令序列或固件下载交错。函数内的 msleep 也只在
++ * 进程上下文发生，中断线程不调用这里。
++ */
++int nvt_send_fw_cmd(struct nvt_data *ts, u8 cmd, u8 subcmd,
++		    u8 arg0, u8 arg1)
++{
++	u8 payload[6];
++	u8 rbuf[3];
++	u8 stamp = ts->pen_stamp;
++	unsigned int i;
++	int ret;
++
++	payload[0] = cmd;
++	payload[1] = subcmd;
++	payload[2] = arg0;
++	payload[3] = arg1;
++	payload[4] = stamp;
++	payload[5] = (u8)(~(cmd + subcmd + arg0 + arg1 + stamp)) + 1;
++
++	ret = nvt_write_buf(ts->spi, NVT_REG_CMD, payload, sizeof(payload));
++	if (ret)
++		return ret;
++
++	for (i = 0; i < NVT_FW_CMD_RETRIES; i++) {
++		mdelay(1);
++		ret = nvt_read(ts->spi, NVT_REG_FW_STAMP, rbuf, sizeof(rbuf));
++		if (ret)
++			return ret;
++		if (rbuf[2] == stamp) {
++			ts->pen_stamp = (stamp + 1) & 0x0f;
++			/* 厂商要求在命令被接收后等待 50 ms 再切换扫描状态 */
++			msleep(50);
++			return 0;
++		}
++	}
++
++	dev_warn_ratelimited(&ts->spi->dev,
++			     "pen cmd %02x %02x %02x %02x stamp %02x: readback %02x\n",
++			     cmd, subcmd, arg0, arg1, stamp, rbuf[2]);
++	return -ETIMEDOUT;
++}
++
++/*
++ * 单次 0x20 读取整帧。发送缓冲区在 probe 中初始化一次，只有首字节
++ * 需要置为命令，其余保持 0；接收缓冲区由本次传输覆盖。
++ */
++int nvt_read_frame(struct nvt_data *ts)
++{
++	struct spi_transfer xfer = {
++		.tx_buf = ts->tx_buf,
++		.rx_buf = ts->rx_buf,
++		.len = nvt_frame_read_len(),
++	};
++	struct spi_message msg;
++
++	spi_message_init(&msg);
++	spi_message_add_tail(&xfer, &msg);
++
++	return spi_sync(ts->spi, &msg);
++}
++
++/* 中断使能状态只在持 power_lock 的路径中变化。 */
++static void nvt_irq_disable(struct nvt_data *ts)
++{
++	if (!ts->irq_enabled)
++		return;
++
++	disable_irq(ts->spi->irq);
++	ts->irq_enabled = false;
++}
++
++static void nvt_irq_enable(struct nvt_data *ts)
++{
++	if (ts->irq_enabled)
++		return;
++
++	enable_irq(ts->spi->irq);
++	ts->irq_enabled = true;
++}
++
++/*
++ * 固件下载完成后轮询一帧。IC 刚启动时可以读回 SRAM 内容，这里以
++ * nvt_frame_valid() 判定 AFE 是否真正开始输出电容帧。轮询期间中断
++ * 处于关闭状态，不会与中断线程争用 rx_buf。
++ */
++static int nvt_afe_wait_ready(struct nvt_data *ts)
++{
++	unsigned int i;
++	int ret;
++
++	for (i = 0; i < NVT_AFE_POLL_TRIES; i++) {
++		ret = nvt_read_frame(ts);
++		if (ret)
++			return ret;
++
++		/*
++		 * 笔在场时 AFE 直接输出笔扫描帧，它的节点分布与手指帧
++		 * 不同，nvt_frame_valid() 会判为无效；两种帧都表示 AFE
++		 * 已就绪。
++		 */
++		if (nvt_frame_valid(ts->rx_buf) ||
++		    nvt_pen_frame(ts->rx_buf, nvt_frame_read_len()))
++			return 0;
++
++		msleep(NVT_AFE_POLL_MS);
++	}
++
++	return -ETIMEDOUT;
++}
++
++/*
++ * 面板关闭或驱动解绑时停止硬件。先关闭中断并把 panel_on 置为
++ * false，确保中断线程不再排队恢复工作；随后在锁外取消工作队列，
++ * 避免与正在等待 power_lock 的工作互相等待。取消完成后再抬起
++ * 触点并拉低复位脚。
++ */
++static void nvt_stop_hardware(struct nvt_data *ts)
++{
++	mutex_lock(&ts->power_lock);
++	nvt_irq_disable(ts);
++	ts->panel_on = false;
++	WRITE_ONCE(ts->reinit_pending, false);
++	mutex_unlock(&ts->power_lock);
++
++	cancel_delayed_work_sync(&ts->resume_work);
++
++	mutex_lock(&ts->power_lock);
++	nvt_release_contacts(ts);
++	nvt_release_pen(ts);
++	ts->afe_ready = false;
++	ts->bad_frames = 0;
++	ts->dead_frames = 0;
++	ts->bad_since = 0;
++	gpiod_set_value_cansleep(ts->reset_gpio, 0);
++	mutex_unlock(&ts->power_lock);
++}
++
++/*
++ * 面板亮起后重新初始化。固件下载与 AFE 等待都在工作队列中执行，
++ * 不阻塞面板使能路径。每次面板周期最多尝试 NVT_INIT_RETRIES 次。
++ */
++static void nvt_resume_work(struct work_struct *work)
++{
++	struct nvt_data *ts = container_of(work, struct nvt_data,
++					   resume_work.work);
++	bool pen_cmd_restart = false;
++	int ret;
++
++	mutex_lock(&ts->power_lock);
++
++	if (!ts->panel_on)
++		goto out;
++
++	/*
++	 * 中断持续失败时可能已经安排重载，随后又有有效帧到达并把
++	 * afe_ready 置回 true；此时只需清除标记。
++	 */
++	if (ts->afe_ready) {
++		WRITE_ONCE(ts->reinit_pending, false);
++		goto out;
++	}
++
++	nvt_irq_disable(ts);
++
++	if (ts->init_retries >= NVT_INIT_RETRIES) {
++		dev_err(&ts->spi->dev,
++			"AFE init failed %u times, giving up until next panel cycle\n",
++			ts->init_retries);
++		goto out;
++	}
++
++	ts->init_retries++;
++	ret = nvt_hw_init(ts);
++	if (!ret)
++		ret = nvt_afe_wait_ready(ts);
++
++	if (!ret) {
++		ts->afe_ready = true;
++		ts->bad_frames = 0;
++		ts->dead_frames = 0;
++		ts->bad_since = 0;
++		WRITE_ONCE(ts->reinit_pending, false);
++		/* 固件复位后恢复默认扫描配置，笔配置需要重新下发 */
++		ts->pen_enable_applied = 0;
++		ts->pen_status_applied = 0xFF;
++		ts->pen_heartbeat_until = 0;
++		nvt_irq_enable(ts);
++		dev_info(&ts->spi->dev, "AFE ready (attempt %u)\n",
++			 ts->init_retries);
++		ts->init_retries = 0;
++		/* 固件复位清空了笔配置，重新激活下发工作项 */
++		pen_cmd_restart = true;
++		goto out;
++	}
++
++	dev_warn(&ts->spi->dev, "AFE init attempt %u failed: %d\n",
++		 ts->init_retries, ret);
++
++	if (ts->init_retries < NVT_INIT_RETRIES)
++		schedule_delayed_work(&ts->resume_work,
++				      msecs_to_jiffies(NVT_INIT_RETRY_MS));
++
++out:
++	mutex_unlock(&ts->power_lock);
++	if (pen_cmd_restart)
++		schedule_delayed_work(&ts->pen_cmd_work, 0);
++}
++
++/*
++ * 中断持续读到无效帧时安排一次重载。这里只置标记并排队，由恢复
++ * 工作同步关闭中断后重新初始化，避免在中断线程中直接 disable_irq。
++ */
++static void nvt_schedule_reinit(struct nvt_data *ts)
++{
++	if (READ_ONCE(ts->reinit_pending))
++		return;
++
++	WRITE_ONCE(ts->reinit_pending, true);
++	schedule_delayed_work(&ts->resume_work, 0);
++}
++
++/*
++ * 下发 HPP3.0 使能或关闭序列。先写 C2 BB 00 00 清除旧状态，再连发两次
++ * C2 BB 01 00 切换到 HPP3.0；关闭时只写第一条。
++ *
++ * 厂商命令流中另有 2A BB 00 00、3B BB 02 00 与 1D 02 00 00。把这段尾部
++ * 并入使能序列后，AFE 停在 40 00 状态并停止输出带同步字的笔帧，因此
++ * 驱动只发送最小必要序列。
++ */
++static int nvt_pen_set_hpp3(struct nvt_data *ts, bool enable)
++{
++	int ret;
++
++	ret = nvt_send_fw_cmd(ts, NVT_FW_CMD_STYLUS_STATUS,
++			      NVT_FW_HANDSHAKE, NVT_STYLUS_CMD_DISABLE, 0x00);
++	if (ret)
++		return ret;
++	if (!enable)
++		return 0;
++
++	ret = nvt_send_fw_cmd(ts, NVT_FW_CMD_STYLUS_STATUS,
++			      NVT_FW_HANDSHAKE, NVT_STYLUS_CMD_ENABLE, 0x00);
++	if (ret)
++		return ret;
++
++	return nvt_send_fw_cmd(ts, NVT_FW_CMD_STYLUS_STATUS,
++			       NVT_FW_HANDSHAKE, NVT_STYLUS_CMD_ENABLE, 0x00);
++}
++
++/*
++ * 按参数把笔扫描配置下发给固件。中断线程只负责读帧，命令寄存器
++ * 访问与 stamp 轮询放在 workqueue；参数未变化时不访问硬件。
++ *
++ * 整个过程持有 power_lock：一方面与固件下载、挂起串行化，另一方面
++ * 与 pen_raw 诊断写入共用同一条命令通道。参数全部应用且没有心跳时
++ * 工作项停止自调度，由参数写入或 AFE 就绪重新激活。
++ */
++#define NVT_PEN_CMD_POLL_MS	200
++
++static void nvt_pen_cmd_work(struct work_struct *work)
++{
++	struct nvt_data *ts = container_of(work, struct nvt_data,
++					   pen_cmd_work.work);
++	unsigned int enable, status, heartbeat_ms;
++	bool reschedule = false;
++	int ret;
++
++	mutex_lock(&ts->power_lock);
++
++	/*
++	 * 面板关屏时触摸 IC 掉电，配置无法下发。停止轮询，等下次
++	 * AFE 就绪或参数写入时重新排队。
++	 */
++	if (!ts->panel_on || !ts->afe_ready)
++		goto out;
++
++	enable = READ_ONCE(pen_enable);
++	status = READ_ONCE(pen_status);
++	heartbeat_ms = READ_ONCE(pen_heartbeat_ms);
++
++	if (enable <= 1 && enable != ts->pen_enable_applied) {
++		ret = nvt_pen_set_hpp3(ts, enable == 1);
++		dev_info(&ts->spi->dev, "pen hpp3.0 %s: %d\n",
++			 enable ? "enable" : "disable", ret);
++		if (!ret) {
++			ts->pen_enable_applied = enable;
++			/* 协议切换后固件重新扫描，连接状态需要重新下发 */
++			ts->pen_status_applied = 0xFF;
++		}
++	}
++
++	if (status <= 2 && status != ts->pen_status_applied) {
++		ret = nvt_send_fw_cmd(ts, NVT_FW_CMD_STYLUS_STATUS,
++				      NVT_FW_HANDSHAKE,
++				      NVT_STYLUS_CMD_STATUS, status);
++		dev_info(&ts->spi->dev, "pen status %u: %d\n", status, ret);
++		if (!ret)
++			ts->pen_status_applied = status;
++	}
++
++	if (heartbeat_ms &&
++	    time_after_eq(jiffies, ts->pen_heartbeat_until)) {
++		ret = nvt_send_fw_cmd(ts, NVT_FW_CMD_KEEPALIVE,
++				      NVT_FW_HANDSHAKE, 0x02, 0x00);
++		if (!ret)
++			ts->pen_heartbeat_until = jiffies +
++						  msecs_to_jiffies(heartbeat_ms);
++	}
++
++	/*
++	 * 仅在有未下发的配置或需要维持心跳时续期。命令同步执行，成功
++	 * 后对应条件不再成立；全部应用完毕时工作项停止，空闲场景不再
++	 * 周期性唤醒队列。
++	 */
++	reschedule = (enable <= 1 && enable != ts->pen_enable_applied) ||
++		     (status <= 2 && status != ts->pen_status_applied) ||
++		     heartbeat_ms != 0;
++
++out:
++	mutex_unlock(&ts->power_lock);
++	if (reschedule)
++		schedule_delayed_work(&ts->pen_cmd_work,
++				      msecs_to_jiffies(NVT_PEN_CMD_POLL_MS));
++}
++
++/*
++ * 有效帧到达后的状态维护。手指帧与笔扫描帧都会走到这里：清除连续
++ * 失效计数，并在 AFE 尚未就绪时恢复中断状态。中断关闭期间不可能
++ * 与固件下载并发，因此这里不需要 power_lock。
++ */
++static void nvt_frame_ok(struct nvt_data *ts)
++{
++	ts->bad_frames = 0;
++	ts->dead_frames = 0;
++	ts->bad_since = 0;
++
++	if (ts->afe_ready)
++		return;
++
++	dev_info(&ts->spi->dev, "AFE frame ready\n");
++	ts->afe_ready = true;
++	ts->init_retries = 0;
++}
++
++static irqreturn_t nvt_irq(int irq, void *data)
++{
++	struct nvt_data *ts = data;
++	unsigned int len;
++	int ret;
++
++	if (READ_ONCE(ts->reinit_pending))
++		return IRQ_HANDLED;
++
++	ret = nvt_read_frame(ts);
++	if (ret) {
++		dev_err_ratelimited(&ts->spi->dev, "frame read failed: %d\n",
++				    ret);
++		goto bad;
++	}
++
++	len = nvt_frame_read_len();
++
++	/*
++	 * 原始导出放在有效性判定之前：笔扫描帧与手指电容帧的布局不同，
++	 * 按手指规则判定会整帧判为无效，先导出才能看到笔模式下的真实内容。
++	 */
++	if (dump_raw) {
++		dump_raw--;
++		print_hex_dump(KERN_INFO, "nvt-frame: ", DUMP_PREFIX_OFFSET,
++			       16, 1, ts->rx_buf, len, false);
++	}
++
++	/*
++	 * 笔扫描帧的节点分布与手指帧完全不同，先按状态字与同步字识别，
++	 * 避免误判为无效帧而反复重载 AFE。笔在场时固件停止输出手指
++	 * 扫描，因此同时抬起未完成的手指触点。
++	 */
++	if (nvt_pen_frame(ts->rx_buf, len)) {
++		unsigned int remaining = READ_ONCE(dump_pen_count);
++		unsigned int stride = READ_ONCE(dump_pen_stride);
++
++		pen_sync_count++;
++
++		/*
++		 * 只导出笔扫描帧，避免手指帧刷屏；抽帧间隔用于连续标定
++		 * 采集时降低日志量。
++		 */
++		if (remaining && !(pen_dump_seq++ % max(stride, 1u))) {
++			WRITE_ONCE(dump_pen_count, remaining - 1);
++			print_hex_dump(KERN_INFO, "nvt-pen-frame: ",
++				       DUMP_PREFIX_OFFSET, 16, 1,
++				       ts->rx_buf, len, false);
++		}
++
++		nvt_frame_ok(ts);
++		nvt_process_pen_frame(ts, len);
++		if (ts->touch_active)
++			nvt_release_contacts(ts);
++		return IRQ_HANDLED;
++	}
++
++	/*
++	 * 手指帧与笔帧可能交替出现，只有连续超过保持时间没有笔帧时
++	 * 才抬起悬浮状态，避免在交替帧之间反复进入与离开。
++	 */
++	if (ts->pen_active &&
++	    time_after(jiffies, ts->pen_last +
++		       msecs_to_jiffies(NVT_PEN_RELEASE_MS)))
++		nvt_release_pen(ts);
++
++	if (!nvt_frame_valid(ts->rx_buf))
++		goto bad;
++
++	nvt_frame_ok(ts);
++
++	/*
++	 * 笔在场时仍会穿插手指电容帧。此时不上报手指触点，避免手掌
++	 * 与笔帧交替造成触点反复建立和释放；笔离开超过保持时间后
++	 * 上面的检查已经抬起 pen_active，触摸自动恢复。
++	 */
++	if (ts->pen_active) {
++		if (ts->touch_active)
++			nvt_release_contacts(ts);
++		return IRQ_HANDLED;
++	}
++
++	nvt_process_frame(ts);
++	return IRQ_HANDLED;
++
++bad:
++	dev_warn_ratelimited(&ts->spi->dev, "invalid frame: %*phN\n",
++			     8, ts->rx_buf);
++	if (dump_frames) {
++		dump_frames--;
++		nvt_dump_frame(ts);
++	}
++	ts->bad_frames++;
++	/*
++	 * 固件更新帧缓冲时，个别读取会短暂回落为 SRAM 内容。连续多帧
++	 * 失败才判定 AFE 丢失，避免单帧抖动抬起触点。
++	 */
++	if (ts->afe_ready && ts->bad_frames >= NVT_AFE_LOST_FRAMES) {
++		dev_warn_ratelimited(&ts->spi->dev,
++				     "AFE frame unavailable, releasing touch\n");
++		nvt_release_contacts(ts);
++		ts->afe_ready = false;
++	}
++
++	/*
++	 * 状态字仍然合法说明 AFE 正在扫描，只是节点整体偏离基线。这种
++	 * 情况出现在面板上电后的启动校准阶段，实测持续约 4 秒后自行
++	 * 恢复；期间重新下载固件只会把等待时间延长到 7 秒，因此只在
++	 * 长时间不恢复时才重新初始化。
++	 */
++	if (nvt_status_valid(ts->rx_buf)) {
++		ts->dead_frames = 0;
++		if (!ts->bad_since) {
++			ts->bad_since = jiffies;
++		} else if (time_after(jiffies, ts->bad_since +
++				      msecs_to_jiffies(NVT_SETTLE_MAX_MS))) {
++			ts->bad_since = jiffies;
++			nvt_schedule_reinit(ts);
++		}
++	} else {
++		ts->bad_since = 0;
++		if (++ts->dead_frames >= NVT_BAD_FRAME_LIMIT) {
++			ts->dead_frames = 0;
++			nvt_schedule_reinit(ts);
++		}
++	}
++
++	return IRQ_HANDLED;
++}
++
++/* 面板通知回调：亮屏后排队初始化，关屏时同步停止硬件。 */
++static int nvt_panel_resume(struct drm_panel_follower *follower)
++{
++	struct nvt_data *ts = container_of(follower, struct nvt_data, follower);
++
++	mutex_lock(&ts->power_lock);
++	ts->panel_on = true;
++	ts->init_retries = 0;
++	ts->bad_frames = 0;
++	ts->dead_frames = 0;
++	ts->bad_since = 0;
++	WRITE_ONCE(ts->reinit_pending, false);
++	mutex_unlock(&ts->power_lock);
++
++	schedule_delayed_work(&ts->resume_work, 0);
++	return 0;
++}
++
++static int nvt_panel_suspend(struct drm_panel_follower *follower)
++{
++	struct nvt_data *ts = container_of(follower, struct nvt_data, follower);
++
++	nvt_stop_hardware(ts);
++	return 0;
++}
++
++static const struct drm_panel_follower_funcs nvt_panel_follower_funcs = {
++	.panel_enabled = nvt_panel_resume,
++	.panel_disabling = nvt_panel_suspend,
++	.panel_unpreparing = nvt_panel_suspend,
++};
++
++static int nvt_probe(struct spi_device *spi)
++{
++	struct nvt_data *ts;
++	struct input_dev *input, *pen;
++	int error;
++
++	ts = devm_kzalloc(&spi->dev, sizeof(*ts), GFP_KERNEL);
++	if (!ts)
++		return -ENOMEM;
++
++	ts->spi = spi;
++	mutex_init(&ts->power_lock);
++	INIT_DELAYED_WORK(&ts->resume_work, nvt_resume_work);
++	INIT_DELAYED_WORK(&ts->pen_cmd_work, nvt_pen_cmd_work);
++	ts->pen_enable_applied = 0;
++	ts->pen_status_applied = 0xFF;
++
++	ts->tx_buf = devm_kzalloc(&spi->dev, NVT_FRAME_MAX_LEN, GFP_KERNEL);
++	ts->rx_buf = devm_kzalloc(&spi->dev, NVT_FRAME_MAX_LEN, GFP_KERNEL);
++	if (!ts->tx_buf || !ts->rx_buf)
++		return -ENOMEM;
++
++	/* 发送缓冲区只需要首字节命令，其余保持 0 */
++	ts->tx_buf[0] = NVT_CMD_GET_FRAME;
++
++	ts->reset_gpio = devm_gpiod_get(&spi->dev, "reset", GPIOD_OUT_LOW);
++	if (IS_ERR(ts->reset_gpio))
++		return dev_err_probe(&spi->dev, PTR_ERR(ts->reset_gpio),
++				     "reset gpio\n");
++
++	ts->x_max = NVT_DEFAULT_WIDTH;
++	ts->y_max = NVT_DEFAULT_HEIGHT;
++	device_property_read_u32(&spi->dev, "touchscreen-size-x", &ts->x_max);
++	device_property_read_u32(&spi->dev, "touchscreen-size-y", &ts->y_max);
++	if (ts->x_max < 2 || ts->y_max < 2)
++		return dev_err_probe(&spi->dev, -EINVAL,
++				     "invalid touchscreen size %ux%u\n",
++				     ts->x_max, ts->y_max);
++
++	nvt_read_calibration(ts);
++
++	if (spi->irq <= 0)
++		return dev_err_probe(&spi->dev, -EINVAL, "missing interrupt\n");
++
++	input = devm_input_allocate_device(&spi->dev);
++	if (!input)
++		return -ENOMEM;
++
++	input->name = "Novatek N9Z Touchscreen";
++	input->id.bustype = BUS_SPI;
++	input->id.vendor = 0x0603;
++	input->id.product = 0x9A09;
++	input_set_abs_params(input, ABS_MT_POSITION_X, 0, ts->x_max - 1, 0, 0);
++	input_set_abs_params(input, ABS_MT_POSITION_Y, 0, ts->y_max - 1, 0, 0);
++	input_set_abs_params(input, ABS_MT_PRESSURE, 0, 255, 0, 0);
++	input_set_abs_params(input, ABS_MT_TOUCH_MAJOR, 0, 255, 0, 0);
++
++	error = input_mt_init_slots(input, NVT_MAX_TOUCH,
++				    INPUT_MT_DIRECT | INPUT_MT_DROP_UNUSED);
++	if (error)
++		return dev_err_probe(&spi->dev, error, "init mt slots\n");
++
++	error = input_register_device(input);
++	if (error)
++		return dev_err_probe(&spi->dev, error, "register input\n");
++
++	/*
++	 * 笔悬浮设备只上报坐标与 BTN_TOOL_PEN。压力、接触与按键来自
++	 * 笔的蓝牙 HID 报文，在合并层接入；这里先用 INPUT_PROP_DIRECT
++	 * 让合成器按平板笔处理。
++	 */
++	pen = devm_input_allocate_device(&spi->dev);
++	if (!pen)
++		return -ENOMEM;
++
++	pen->name = "Novatek N9Z Stylus";
++	pen->id.bustype = BUS_SPI;
++	pen->id.vendor = 0x0603;
++	pen->id.product = 0x9A0A;
++	input_set_abs_params(pen, ABS_X, 0, ts->x_max - 1, 0, 0);
++	input_set_abs_params(pen, ABS_Y, 0, ts->y_max - 1, 0, 0);
++	input_set_capability(pen, EV_KEY, BTN_TOOL_PEN);
++	__set_bit(INPUT_PROP_DIRECT, pen->propbit);
++
++	error = input_register_device(pen);
++	if (error)
++		return dev_err_probe(&spi->dev, error, "register pen input\n");
++
++	ts->pen_input = pen;
++	ts->input = input;
++	spi_set_drvdata(spi, ts);
++
++	/*
++	 * IRQF_NO_AUTOEN 让中断在面板亮起、AFE 就绪之前保持关闭。IC
++	 * 停在 bootloader 时中断线为低电平，打开中断只会造成无效请求。
++	 */
++	error = devm_request_threaded_irq(&spi->dev, spi->irq, NULL, nvt_irq,
++					  IRQF_ONESHOT | IRQF_TRIGGER_FALLING |
++					  IRQF_NO_AUTOEN, "nvt-n9z", ts);
++	if (error)
++		return dev_err_probe(&spi->dev, error, "request irq\n");
++
++	ts->irq_enabled = false;
++	ts->follower.funcs = &nvt_panel_follower_funcs;
++
++	error = devm_drm_panel_add_follower(&spi->dev, &ts->follower);
++	if (error == -ENODEV) {
++		/*
++		 * 设备树没有 panel 引用时退回独立初始化，兼容其他挂载
++		 * 方式；此时无法跟随开关屏，需要保证 probe 时面板已上电。
++		 */
++		dev_warn(&spi->dev, "no panel link, initializing immediately\n");
++		mutex_lock(&ts->power_lock);
++		ts->panel_on = true;
++		ts->init_retries = 0;
++		mutex_unlock(&ts->power_lock);
++		schedule_delayed_work(&ts->resume_work, 0);
++	} else if (error) {
++		return dev_err_probe(&spi->dev, error, "add panel follower\n");
++	}
++
++	/*
++	 * 先登记上下文再排队工作项。参数写入通过 nvt_cmd_ctx 找到设备并
++	 * 重新激活工作项，登记过晚会让并发写入找不到设备、命令延迟到
++	 * 下一次参数变化才下发。
++	 */
++	mutex_lock(&nvt_cmd_lock);
++	nvt_cmd_ctx = ts;
++	mutex_unlock(&nvt_cmd_lock);
++
++	/* 参数可能在模块加载时已设置，立即尝试一次；空闲时自动停止 */
++	schedule_delayed_work(&ts->pen_cmd_work, 0);
++
++	dev_info(&spi->dev, "Novatek N9Z ready, %dx%d nodes\n",
++		 NVT_COLS, NVT_ROWS);
++	return 0;
++}
++
++static void nvt_remove(struct spi_device *spi)
++{
++	struct nvt_data *ts = spi_get_drvdata(spi);
++
++	/*
++	 * 等待在途的参数写入结束之后再清空指针，此后新写入直接返回
++	 * -ENODEV。devm 在 remove() 返回后释放 ts，此时已无写入方持有
++	 * 该指针。
++	 */
++	mutex_lock(&nvt_cmd_lock);
++	nvt_cmd_ctx = NULL;
++	mutex_unlock(&nvt_cmd_lock);
++
++	cancel_delayed_work_sync(&ts->pen_cmd_work);
++	nvt_stop_hardware(ts);
++}
++
++static const struct of_device_id nvt_of_match[] = {
++	{ .compatible = "novatek,n9z-spi" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, nvt_of_match);
++
++static const struct spi_device_id nvt_spi_ids[] = {
++	{ .name = "n9z-spi" },
++	{ }
++};
++MODULE_DEVICE_TABLE(spi, nvt_spi_ids);
++
++static struct spi_driver nvt_driver = {
++	.driver = {
++		.name = "novatek-n9z",
++		.of_match_table = nvt_of_match,
++	},
++	.probe = nvt_probe,
++	.remove = nvt_remove,
++	.id_table = nvt_spi_ids,
++};
++module_spi_driver(nvt_driver);
++
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("Novatek N9Z series SPI touchscreen driver");
+--- /dev/null
++++ b/drivers/input/touchscreen/novatek-n9z-fw.c
+@@ -0,0 +1,301 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Novatek N9Z 系列固件解析与下载。
++ *
++ * 固件由 ILM、DLM、三段覆盖段与两块 Header 信息段组成。每次下载
++ * 先把 IC 切入 bootloader，写入 SRAM 段参数，再按 0x13FD 字节分块
++ * 写入固件数据，最后通过命令区启动固件。下载序列与厂商 AFE HAL
++ * 的 nvt_download_firmware_hw_crc 一致。
++ */
++
++#include <linux/delay.h>
++#include <linux/device.h>
++#include <linux/firmware.h>
++#include <linux/gpio/consumer.h>
++#include <linux/math.h>
++#include <linux/slab.h>
++#include <linux/spi/spi.h>
++#include <linux/string.h>
++#include <linux/unaligned.h>
++
++#include "novatek-n9z.h"
++
++static u32 nvt_rd32(const u8 *p)
++{
++	return p[0] | (p[1] << 8) | (p[2] << 16) | ((u32)p[3] << 24);
++}
++
++/*
++ * 固件头部由 ILM、DLM、三段覆盖段与两块 Header 信息段组成。结束标记
++ * NVT 或 MOD 位于文件尾部，以 0x1000 为步长回退查找，用于限定有效
++ * 数据范围。第二块 Header 信息段是否有效由固件版本两字节之和判定。
++ */
++static int nvt_parse_fw(struct device *dev, const struct firmware *fw,
++			struct nvt_fw_seg *segs)
++{
++	size_t pos = fw->size;
++	size_t end = 0;
++	int i;
++
++	/*
++	 * 头部字段一直用到 0x1FC，先排除过小的镜像，避免读越界。
++	 * 结束标记从文件尾部按 0x1000 回退查找。
++	 */
++	if (fw->size < 0x200) {
++		dev_err(dev, "firmware too small: %zu bytes\n", fw->size);
++		return -EINVAL;
++	}
++
++	for (i = 0; i < 0x31; i++) {
++		if (pos < 3)
++			break;
++		if (!memcmp(fw->data + pos - 3, "NVT", 3) ||
++		    !memcmp(fw->data + pos - 3, "MOD", 3)) {
++			end = pos;
++			break;
++		}
++		/* 最后一段可能短于 0x1000，避免 size_t 下溢 */
++		if (pos <= 0x1000)
++			break;
++		pos -= 0x1000;
++	}
++	if (!end || end > fw->size) {
++		dev_err(dev, "firmware has no NVT/MOD trailer\n");
++		return -EINVAL;
++	}
++	if (nvt_rd32(fw->data) >= end) {
++		dev_err(dev, "invalid firmware header\n");
++		return -EINVAL;
++	}
++
++	memset(segs, 0, sizeof(*segs) * NVT_FW_SEG_MAX);
++	segs[0].bin_off = nvt_rd32(fw->data + 0x00);
++	segs[0].sram = nvt_rd32(fw->data + 0x04);
++	segs[0].size = nvt_rd32(fw->data + 0x08);
++	segs[0].crc = nvt_rd32(fw->data + 0x18);
++
++	segs[1].bin_off = nvt_rd32(fw->data + 0x0C);
++	segs[1].sram = nvt_rd32(fw->data + 0x10);
++	segs[1].size = nvt_rd32(fw->data + 0x14);
++	segs[1].crc = nvt_rd32(fw->data + 0x1C);
++
++	for (i = 2; i < 5; i++) {
++		const u8 *p = fw->data + 0x30 + (i - 2) * 0x10;
++
++		segs[i].sram = nvt_rd32(p);
++		segs[i].size = nvt_rd32(p + 4);
++		segs[i].bin_off = nvt_rd32(p + 8);
++	}
++
++	segs[14].sram = nvt_rd32(fw->data + 0xF0);
++	segs[14].size = nvt_rd32(fw->data + 0xF4);
++	segs[14].bin_off = nvt_rd32(fw->data + 0xF8);
++
++	if (fw->size >= 0x1000 &&
++	    (u8)(fw->data[fw->size - 0x1000] +
++		 fw->data[fw->size - 0xFFF]) == 0xFF) {
++		segs[15].sram = nvt_rd32(fw->data + 0x1F0);
++		segs[15].size = nvt_rd32(fw->data + 0x1F4);
++		segs[15].bin_off = nvt_rd32(fw->data + 0x1F8);
++	}
++
++	for (i = 0; i < NVT_FW_SEG_MAX; i++) {
++		if (!segs[i].size)
++			continue;
++		/*
++		 * 每段按 size + 1 字节写入，让长度成为 32 位字的整数倍，
++		 * 与 bootloader 按字校验 CRC 的行为一致。
++		 */
++		if ((u64)segs[i].bin_off + segs[i].size + 1 > end) {
++			dev_err(dev, "segment %d out of firmware range\n", i);
++			return -EINVAL;
++		}
++	}
++
++	return 0;
++}
++
++static int nvt_wait_status(struct spi_device *spi, u32 addr, u8 lo, u8 hi,
++			   unsigned int retries, unsigned int delay_ms)
++{
++	u8 buf[8] = { 0 };
++	int i, ret;
++
++	for (i = 0; i < retries; i++) {
++		memset(buf, 0, sizeof(buf));
++		ret = nvt_read(spi, addr, buf, sizeof(buf));
++		if (ret)
++			return ret;
++		if (buf[2] >= lo && buf[2] <= hi)
++			return 0;
++		msleep(delay_ms);
++	}
++
++	return -ETIMEDOUT;
++}
++
++static int nvt_download_firmware(struct nvt_data *ts)
++{
++	struct spi_device *spi = ts->spi;
++	const struct firmware *fw;
++	struct nvt_fw_seg segs[NVT_FW_SEG_MAX];
++	unsigned int i;
++	int ret;
++
++	ret = request_firmware(&fw, "novatek/NT36523_THP1300.bin", &spi->dev);
++	if (ret) {
++		dev_err(&spi->dev, "cannot request firmware: %d\n", ret);
++		return ret;
++	}
++
++	if (fw->size > NVT_FW_MAX_SIZE) {
++		ret = -EINVAL;
++		goto out;
++	}
++
++	ret = nvt_parse_fw(&spi->dev, fw, segs);
++	if (ret)
++		goto out;
++
++	ret = nvt_write(spi, NVT_SW_RESET_ADDR, NVT_BOOTLOADER_ENTER);
++	if (ret)
++		goto out;
++	usleep_range(5000, 20000);
++
++	ret = nvt_write_u24(spi, 0x3F128, segs[0].sram);
++	if (ret)
++		goto out;
++	ret = nvt_write_u24(spi, 0x3F118, segs[0].size);
++	if (ret)
++		goto out;
++	ret = nvt_write_u32(spi, 0x3F100, segs[0].crc);
++	if (ret)
++		goto out;
++	ret = nvt_write_u24(spi, 0x3F12C, segs[1].sram);
++	if (ret)
++		goto out;
++	ret = nvt_write_u24(spi, 0x3F130, segs[1].size);
++	if (ret)
++		goto out;
++	ret = nvt_write_u32(spi, 0x3F104, segs[1].crc);
++	if (ret)
++		goto out;
++
++	/*
++	 * TX 自动拷贝位在 bootloader 模式切换时被清除，必须在参数
++	 * 写入后打开。
++	 */
++	ret = nvt_write(spi, NVT_REG_TX_AUTO_COPY, NVT_BOOTLOADER_ENTER);
++	if (ret)
++		goto out;
++
++	for (i = 0; i < NVT_FW_SEG_MAX; i++) {
++		u32 addr = segs[i].sram;
++		u32 off = 0;
++		size_t left;
++
++		if (!segs[i].size)
++			continue;
++
++		left = (size_t)segs[i].size + 1;
++		while (left) {
++			/*
++			 * 芯片在 TX 自动拷贝模式下自动递增 SRAM 地址，
++			 * 单次传输按 0x13FD 字节分块，块间不改页寄存器。
++			 */
++			size_t chunk = min_t(size_t, left, NVT_FW_TX_BLOCK);
++
++			ret = nvt_write_buf(spi, addr,
++					    fw->data + segs[i].bin_off + off,
++					    chunk);
++			if (ret)
++				goto out;
++			addr += chunk;
++			off += chunk;
++			left -= chunk;
++		}
++	}
++
++	/* 轮询 DMA 状态，首个有效字节清零表示 SRAM 传输完成 */
++	for (i = 0; i < 200; i++) {
++		u8 buf[8] = { 0 };
++
++		ret = nvt_read(spi, NVT_REG_FW_DMA_INFO, buf, 3);
++		if (ret)
++			goto out;
++		if (!buf[2])
++			break;
++		usleep_range(4000, 8000);
++	}
++	if (i == 200) {
++		ret = -ETIMEDOUT;
++		goto out;
++	}
++
++	{
++		u8 buf[8] = { 0 };
++
++		ret = nvt_read(spi, NVT_REG_BLD_CRC_EN, buf, 3);
++		if (ret)
++			goto out;
++		ret = nvt_write(spi, NVT_REG_BLD_CRC_EN, buf[2] | 0x80);
++		if (ret)
++			goto out;
++	}
++
++	ret = nvt_write(spi, NVT_REG_FW_STATUS, 0);
++	if (ret)
++		goto out;
++	ret = nvt_write(spi, NVT_REG_CMD, NVT_FW_START_CMD);
++	if (ret)
++		goto out;
++
++	{
++		u8 buf[8] = { 0 };
++
++		ret = nvt_read(spi, NVT_REG_BOOT_READY, buf, 3);
++		if (ret)
++			goto out;
++		ret = nvt_write(spi, NVT_REG_BOOT_READY, buf[2] | 0x01);
++		if (ret)
++			goto out;
++	}
++
++	usleep_range(5000, 20000);
++	ret = nvt_wait_status(spi, NVT_REG_FW_STATUS, 0xA0, 0xAF, 200, 10);
++	if (ret)
++		dev_err(&spi->dev, "firmware did not reach running state\n");
++
++out:
++	release_firmware(fw);
++	return ret;
++}
++
++/*
++ * 复位 IC 并下载固件。面板上电后由恢复工作调用；复位脚低电平期间
++ * 发送软复位回 idle，随后释放复位脚并下载固件。这一顺序在侦察阶段
++ * 验证过，能让 IC 稳定回到应用态。
++ */
++int nvt_hw_init(struct nvt_data *ts)
++{
++	struct spi_device *spi = ts->spi;
++	u8 trim[8] = { 0 };
++	int ret;
++
++	gpiod_set_value_cansleep(ts->reset_gpio, 0);
++	msleep(20);
++	ret = nvt_write(spi, NVT_SW_RESET_ADDR, NVT_SW_RESET_IDLE);
++	if (ret)
++		return ret;
++	gpiod_set_value_cansleep(ts->reset_gpio, 1);
++	msleep(100);
++
++	ret = nvt_read(spi, 0x3F004, trim, sizeof(trim));
++	if (ret)
++		return ret;
++	if (trim[2] != 0x0A)
++		dev_warn(&spi->dev, "unexpected trim id: %*phN\n",
++			 (int)sizeof(trim), trim);
++
++	return nvt_download_firmware(ts);
++}
+--- /dev/null
++++ b/drivers/input/touchscreen/novatek-n9z-afe.c
+@@ -0,0 +1,748 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Novatek N9Z 系列 AFE 帧解算与输入上报。
++ *
++ * 每个 AFE 帧包含 1598 个电容节点，按 32 列 × 50 行排列。驱动逐节点
++ * 相对基线求差，按阈值划分连通区域，用信号强度加权质心得到触点
++ * 位置，再换算成面板像素坐标并通过多点触控接口上报。
++ *
++ * 帧前 4 字节状态字不属于节点流。早期实现把它当作节点 0、1，导致所有
++ * 坐标整体偏移约两列，表现为触摸区域偏向右下；这里从帧偏移 6 开始
++ * 读取节点，节点位置即为物理列行。
++ */
++
++#include <linux/bitmap.h>
++#include <linux/device.h>
++#include <linux/input.h>
++#include <linux/input/mt.h>
++#include <linux/jiffies.h>
++#include <linux/math.h>
++#include <linux/math64.h>
++#include <linux/module.h>
++#include <linux/property.h>
++#include <linux/spi/spi.h>
++#include <linux/unaligned.h>
++
++#include "novatek-n9z.h"
++
++static unsigned int threshold = 0x400;
++module_param(threshold, uint, 0644);
++MODULE_PARM_DESC(threshold, "触点判定阈值，节点相对基线的偏移量");
++
++static bool swap_xy;
++module_param(swap_xy, bool, 0644);
++MODULE_PARM_DESC(swap_xy, "交换行列轴");
++
++static bool invert_x;
++module_param(invert_x, bool, 0644);
++MODULE_PARM_DESC(invert_x, "反转 X 轴");
++
++static bool invert_y;
++module_param(invert_y, bool, 0644);
++MODULE_PARM_DESC(invert_y, "反转 Y 轴");
++
++/*
++ * 手掌与握持抑制。整掌按在面板上时固件会把它拆成多个小区域，
++ * 单个面积与手指接近，因此用“同时触点数量”作为主要判据。
++ */
++static unsigned int palm_area = 10;
++module_param(palm_area, uint, 0644);
++MODULE_PARM_DESC(palm_area, "单个区域达到该节点数即判为手掌，0 关闭");
++
++static unsigned int palm_edge_area = 20;
++module_param(palm_edge_area, uint, 0644);
++MODULE_PARM_DESC(palm_edge_area, "位于边缘附近时判为手掌的节点数，0 关闭");
++
++static unsigned int palm_edge_margin = 4;
++module_param(palm_edge_margin, uint, 0644);
++MODULE_PARM_DESC(palm_edge_margin, "边缘判定的行列节点距离");
++
++static unsigned int palm_max_contacts = 5;
++module_param(palm_max_contacts, uint, 0644);
++MODULE_PARM_DESC(palm_max_contacts, "同时触点超过该数量时整帧丢弃，0 关闭");
++
++/*
++ * 触摸右边缘时固件会在第 0 列产生一个单节点鬼影，与真实触点同一行。
++ * 该区域位于显示区之外，按面积与列号直接丢弃。
++ */
++static unsigned int edge_ghost_area = 6;
++module_param(edge_ghost_area, uint, 0644);
++MODULE_PARM_DESC(edge_ghost_area, "第 0 列鬼影触点的最大节点数，0 关闭");
++
++/*
++ * 状态字是否表明 AFE 正在输出电容帧。固件处于 bootloader 或 AFE 任务
++ * 尚未启动时，读命令由 SRAM 通路应答，状态字为 40 00 00 00 一类数据，
++ * 过不了校验和。
++ */
++bool nvt_status_valid(const u8 *buf)
++{
++	/*
++	 * 前 2 字节为 SPI 哑字节，随后是 4 字节状态字。byte2 的 bit6
++	 * 是 AFE 帧标志，其余位随扫描状态变化；手指按下时实测首字节
++	 * 从 0x40 变为 0x44，不能按固定值比较。
++	 */
++	if (buf[0] != 0xff || buf[1] != 0xff || !(buf[2] & 0x40))
++		return false;
++
++	/* 状态字校验：byte2 的 bit6 为帧类型标志，四字节求和低 8 位为 0 */
++	return (u8)((buf[2] & 0xBF) + buf[3] + buf[4] + buf[5]) == 0;
++}
++
++/*
++ * 判定一次 0x20 读取的数据能否直接用于解算。状态字有效但节点整体
++ * 偏离基线时，IC 正处于启动校准阶段，暂态在数秒内自行结束。
++ */
++bool nvt_frame_valid(const u8 *buf)
++{
++	unsigned int i, near = 0;
++
++	if (!nvt_status_valid(buf))
++		return false;
++
++	for (i = 0; i < NVT_FRAME_NODES; i++) {
++		s16 delta = (s16)(get_unaligned_le16(buf +
++						     NVT_FRAME_NODE_OFFSET +
++						     i * 2) -
++				  NVT_NODE_BASELINE);
++
++		if (delta >= -NVT_AFE_WINDOW && delta <= NVT_AFE_WINDOW)
++			near++;
++	}
++
++	return near * 100 >= NVT_FRAME_NODES * NVT_AFE_VALID_PCT;
++}
++
++/*
++ * 笔扫描帧判定。状态字校验通过只说明 AFE 正在输出帧，手指电容帧与
++ * 笔扫描帧都会通过；笔帧在节点流开头带 a5 5a 5a a5 同步字，手指帧
++ * 不带。读取长度不足时无法检查同步字，按手指帧处理。
++ *
++ * 早期实现用状态字第 5 字节等于 0x06 判定，手指帧与笔帧该字节相同，
++ * 导致所有帧进入笔路径、手指触摸整体失效，不得沿用。
++ */
++bool nvt_pen_frame(const u8 *buf, unsigned int len)
++{
++	/* 先确认长度覆盖状态字与同步字，再读取缓冲区 */
++	if (len < NVT_FRAME_NODE_OFFSET + NVT_PEN_SYNC_LEN)
++		return false;
++
++	if (!nvt_status_valid(buf))
++		return false;
++
++	return buf[NVT_FRAME_NODE_OFFSET] == NVT_PEN_SYNC0 &&
++	       buf[NVT_FRAME_NODE_OFFSET + 1] == NVT_PEN_SYNC1 &&
++	       buf[NVT_FRAME_NODE_OFFSET + 2] == NVT_PEN_SYNC1 &&
++	       buf[NVT_FRAME_NODE_OFFSET + 3] == NVT_PEN_SYNC0;
++}
++
++/* 笔帧节点按节点编号读取，节点 0 位于帧偏移 12。 */
++static u16 nvt_pen_node(const u8 *buf, unsigned int node)
++{
++	return get_unaligned_le16(buf + NVT_PEN_NODE_OFFSET + node * 2);
++}
++
++/*
++ * 线峰值细分。线号 × 1024 + 512 作为槽中心，用相邻两线的峰值插值，
++ * 返回 1/16 线号单位的 q16，避免内核浮点运算。
++ */
++static s64 nvt_pen_q16(const u16 *vals, unsigned int count)
++{
++	unsigned int i, best = 0;
++	s64 q16;
++
++	for (i = 1; i < count; i++)
++		if (vals[i] > vals[best])
++			best = i;
++
++	q16 = ((s64)best * 1024 + 512) << 4;
++	if (best > 0 && best + 1 < count) {
++		unsigned int peak = vals[best];
++		unsigned int left = vals[best - 1];
++		unsigned int right = vals[best + 1];
++		unsigned int lo = min(left, right);
++		unsigned int den = peak - lo;
++
++		if (den) {
++			s64 step16 = ((s64)(max(left, right) - lo) << 14) /
++				     den;
++
++			q16 += right >= left ? step16 / 2 : -step16 / 2;
++		}
++	}
++
++	return q16;
++}
++
++/*
++ * 在 4 个相位中选择幅度最大的一个。节点值本身就是正增量，振幅取
++ * 相位内最大值，与厂商 final_model.py 的选择方式一致。
++ */
++static bool nvt_pen_y_track(const u8 *buf, unsigned int base,
++			    s64 *q16, unsigned int *amp)
++{
++	u16 vals[NVT_PEN_Y_SLOTS];
++	unsigned int phase, best_phase = 0, best_amp = 0, i;
++
++	for (phase = 0; phase < NVT_PEN_Y_PHASES; phase++) {
++		unsigned int peak = 0;
++
++		for (i = 0; i < NVT_PEN_Y_SLOTS; i++) {
++			u16 v = nvt_pen_node(buf, base + phase +
++					     i * NVT_PEN_Y_STRIDE);
++
++			if (v > peak)
++				peak = v;
++		}
++		if (peak > best_amp) {
++			best_amp = peak;
++			best_phase = phase;
++		}
++	}
++
++	if (!best_amp)
++		return false;
++
++	for (i = 0; i < NVT_PEN_Y_SLOTS; i++)
++		vals[i] = nvt_pen_node(buf, base + best_phase +
++				       i * NVT_PEN_Y_STRIDE);
++
++	*q16 = nvt_pen_q16(vals, NVT_PEN_Y_SLOTS);
++	*amp = best_amp;
++	return true;
++}
++
++/*
++ * 由 q16 换算面板像素。系数来自 HarmonyOS 侧 1599 帧真值拟合：
++ * X raw = 0.390453·q + 1205.46，Y raw = 0.408203·q − 297.45，
++ * 面板像素为 raw / 8。常量整体放大 128000000 倍做整数除法。
++ *
++ * X 窗口起点比厂商标定脚本早 3 个节点，同一个物理线号的 q 大 3072，
++ * 截距相应减去 0.390453 × 3072，得到 5.96。
++ */
++static int nvt_pen_x_px(s64 q16, u32 max)
++{
++	s64 px = (390453LL * q16 + 95814144LL) / 128000000LL;
++
++	return clamp_val(px, 0, max - 1);
++}
++
++static int nvt_pen_y_px(s64 q16, u32 max)
++{
++	s64 px = (408203LL * q16 - 4759200000LL) / 128000000LL;
++
++	return clamp_val(px, 0, max - 1);
++}
++
++/*
++ * 解算一帧笔扫描数据并上报悬浮坐标。笔帧与手指帧在中断中二选一，
++ * 这里只做坐标与 BTN_TOOL_PEN，压力与按键由蓝牙链路在合并层提供。
++ */
++bool nvt_process_pen_frame(struct nvt_data *ts, unsigned int len)
++{
++	const u8 *buf = ts->rx_buf;
++	u16 xvals[NVT_PEN_X_LINES];
++	unsigned int i, amp0, amp1;
++	s64 xq, yq0, yq1, yq;
++	int x, y;
++
++	if (len < NVT_PEN_FRAME_LEN || !ts->pen_input)
++		return false;
++
++	for (i = 0; i < NVT_PEN_X_LINES; i++)
++		xvals[i] = nvt_pen_node(buf, NVT_PEN_X_OFF + i);
++	xq = nvt_pen_q16(xvals, NVT_PEN_X_LINES);
++
++	if (!nvt_pen_y_track(buf, NVT_PEN_Y_BASE0, &yq0, &amp0) ||
++	    !nvt_pen_y_track(buf, NVT_PEN_Y_BASE1, &yq1, &amp1))
++		return false;
++
++	/* 两组 Y 线数据按幅度加权融合 */
++	if (amp0 + amp1)
++		yq = div_s64(yq0 * amp0 + yq1 * amp1, amp0 + amp1);
++	else
++		yq = yq0;
++
++	x = nvt_pen_x_px(xq, ts->x_max);
++	y = nvt_pen_y_px(yq, ts->y_max);
++
++	/*
++	 * 笔快速离开时上行信号衰减，峰值可能跳到噪声线上，出现单帧
++	 * 数百像素的假跳变。以 130 Hz 以上的帧率，真实笔尖单帧不可能
++	 * 移动 300 像素；超过门限时保留上一个有效坐标，等待信号恢复。
++	 *
++	 * 跳变帧不刷新 pen_last：噪声帧持续到达时保持时间仍会耗尽，
++	 * 由调用方抬起悬浮状态，避免旧坐标长期滞留。
++	 */
++	if (ts->pen_active &&
++	    (abs(x - ts->pen_x) > NVT_PEN_JUMP_LIMIT ||
++	     abs(y - ts->pen_y) > NVT_PEN_JUMP_LIMIT))
++		return true;
++
++	/*
++	 * 悬停期间坐标通常只在小范围内抖动，重复坐标不必刷新；离开
++	 * 后重新进入时必须重新上报 BTN_TOOL_PEN。
++	 */
++	if (!ts->pen_active || x != ts->pen_x || y != ts->pen_y) {
++		input_report_key(ts->pen_input, BTN_TOOL_PEN, 1);
++		input_report_abs(ts->pen_input, ABS_X, x);
++		input_report_abs(ts->pen_input, ABS_Y, y);
++		input_sync(ts->pen_input);
++		ts->pen_x = x;
++		ts->pen_y = y;
++		ts->pen_active = true;
++	}
++
++	ts->pen_last = jiffies;
++	return true;
++}
++
++/* 笔离开后抬起悬浮状态。 */
++void nvt_release_pen(struct nvt_data *ts)
++{
++	if (!ts->pen_active || !ts->pen_input)
++		return;
++
++	input_report_key(ts->pen_input, BTN_TOOL_PEN, 0);
++	input_sync(ts->pen_input);
++	ts->pen_active = false;
++}
++
++/*
++ * 诊断输出：统计当前缓冲区里一帧相对基线的分布，用于判断异常帧究竟是
++ * SRAM 回落数据还是整体直流偏移。通过 dump_frames 参数按需开启。
++ */
++void nvt_dump_frame(const struct nvt_data *ts)
++{
++	const u8 *buf = ts->rx_buf;
++	unsigned int near = 0, below = 0, above = 0;
++	s64 sum = 0;
++	int min = INT_MAX, max = INT_MIN;
++	unsigned int i;
++
++	for (i = 0; i < NVT_FRAME_NODES; i++) {
++		s16 d = (s16)(get_unaligned_le16(buf + NVT_FRAME_NODE_OFFSET +
++						 i * 2) - NVT_NODE_BASELINE);
++
++		sum += d;
++		if (d < min)
++			min = d;
++		if (d > max)
++			max = d;
++		if (d < -NVT_AFE_WINDOW)
++			below++;
++		else if (d > NVT_AFE_WINDOW)
++			above++;
++		else
++			near++;
++	}
++
++	dev_info(&ts->spi->dev,
++		 "frame %02x%02x%02x%02x%02x%02x near=%u below=%u above=%u min=%d max=%d mean=%lld\n",
++		 buf[0], buf[1], buf[2], buf[3], buf[4], buf[5],
++		 near, below, above, min, max, div_s64(sum, NVT_FRAME_NODES));
++
++	dev_info(&ts->spi->dev, "nodes %04x %04x %04x %04x %04x %04x %04x %04x\n",
++		 get_unaligned_le16(buf + NVT_FRAME_NODE_OFFSET),
++		 get_unaligned_le16(buf + NVT_FRAME_NODE_OFFSET + 2),
++		 get_unaligned_le16(buf + NVT_FRAME_NODE_OFFSET + 4),
++		 get_unaligned_le16(buf + NVT_FRAME_NODE_OFFSET + 6),
++		 get_unaligned_le16(buf + NVT_FRAME_NODE_OFFSET + 8),
++		 get_unaligned_le16(buf + NVT_FRAME_NODE_OFFSET + 10),
++		 get_unaligned_le16(buf + NVT_FRAME_NODE_OFFSET + 12),
++		 get_unaligned_le16(buf + NVT_FRAME_NODE_OFFSET + 14));
++}
++
++/*
++ * 固件在触摸右边缘时会在第 0 列生成一个与真实触点同一行的小区域。
++ * 第 0 列同时也是真实左边缘所在列，因此不能无条件丢弃；只有同一行
++ * 右侧存在强节点时才判定为鬼影。
++ */
++static bool nvt_edge_ghost(const struct nvt_data *ts, int row_node)
++{
++	int row, col;
++
++	for (row = max(row_node - 2, 0);
++	     row <= min(row_node + 2, NVT_ROWS - 1); row++) {
++		for (col = NVT_COLS - 4; col < NVT_COLS; col++) {
++			int idx = row * NVT_COLS + col;
++
++			if (idx >= NVT_FRAME_NODES)
++				continue;
++			if (ts->delta[idx] > (int)threshold)
++				return true;
++		}
++	}
++
++	return false;
++}
++
++/*
++ * 连通区域内部 8 邻域扩张。每个区域用信号强度加权计算质心，质心以
++ * 1/16 节点为单位，便于跟踪时比较小幅移动。帧尾两个位置没有节点，
++ * 邻居索引越过 NVT_FRAME_NODES 时直接跳过。
++ */
++static int nvt_scan_contacts(struct nvt_data *ts, struct nvt_contact *out)
++{
++	int found = 0;
++	int i;
++
++	bitmap_zero(ts->visited, NVT_FRAME_NODES);
++
++	for (i = 0; i < NVT_FRAME_NODES; i++) {
++		s64 sum_w = 0, sum_x = 0, sum_y = 0;
++		int head = 0, tail = 0;
++		int peak = 0;
++		int area, row_c, col_c, row_node, col_node, edge;
++
++		if (test_bit(i, ts->visited))
++			continue;
++		if (ts->delta[i] <= (int)threshold)
++			continue;
++
++		ts->stack[tail++] = i;
++		set_bit(i, ts->visited);
++
++		while (head < tail) {
++			int idx = ts->stack[head++];
++			int row = idx / NVT_COLS;
++			int col = idx % NVT_COLS;
++			int d = ts->delta[idx];
++
++			sum_w += d;
++			sum_x += (s64)col * d * 16;
++			sum_y += (s64)row * d * 16;
++			if (d > peak)
++				peak = d;
++
++			for (int dr = -1; dr <= 1; dr++) {
++				for (int dc = -1; dc <= 1; dc++) {
++					int nr = row + dr;
++					int nc = col + dc;
++					int nidx;
++
++					if (nr < 0 || nr >= NVT_ROWS ||
++					    nc < 0 || nc >= NVT_COLS)
++						continue;
++					nidx = nr * NVT_COLS + nc;
++					if (nidx >= NVT_FRAME_NODES)
++						continue;
++					if (test_bit(nidx, ts->visited))
++						continue;
++					if (ts->delta[nidx] <= (int)threshold)
++						continue;
++					set_bit(nidx, ts->visited);
++					ts->stack[tail++] = nidx;
++				}
++			}
++		}
++
++		if (found >= NVT_MAX_TOUCH)
++			continue;
++
++		area = tail;
++		row_c = DIV_ROUND_CLOSEST(sum_y, sum_w);
++		col_c = DIV_ROUND_CLOSEST(sum_x, sum_w);
++		row_node = row_c >> 4;
++		col_node = col_c >> 4;
++		edge = min(min(col_node, NVT_COLS - 1 - col_node),
++			   min(row_node, NVT_ROWS - 1 - row_node));
++
++		/* 右边缘触摸产生的第 0 列鬼影，仅在同一行右侧有触点时丢弃 */
++		if (col_node == 0 && area <= (int)edge_ghost_area &&
++		    nvt_edge_ghost(ts, row_node))
++			continue;
++
++		/* 大面积触点：整掌或大面积接触，同时启动碎片抑制窗口 */
++		if (palm_area && area >= (int)palm_area) {
++			ts->palm_blob_seen = true;
++			continue;
++		}
++
++		/* 边缘附近的中等面积触点：握持手掌 */
++		if (palm_edge_area && area >= (int)palm_edge_area &&
++		    edge <= (int)palm_edge_margin)
++			continue;
++
++		out[found].row = row_c;
++		out[found].col = col_c;
++		out[found].area = area;
++		out[found].pressure = min(peak / 16, 255);
++		out[found].major = min(tail * 8, 255);
++		found++;
++	}
++
++	return found;
++}
++
++/*
++ * 分段线性校准：把驱动按等分网格算出的 raw 像素映射到面板像素。
++ * 传感器与显示区的边界不完全重合，节点只覆盖部分边缘，分段映射
++ * 可以在保持内部精度的同时把首末节点延伸到显示边缘。节点由设备树
++ * 按实测结果给出。
++ */
++static u32 nvt_calibrate(u32 v, const u16 *raw, const u16 *map,
++			 unsigned int n, u32 max)
++{
++	s64 out;
++	unsigned int i;
++
++	if (n < 2)
++		return min(v, max);
++
++	if (v <= raw[0]) {
++		out = (s64)map[0] +
++		      div_s64((s64)((s32)map[1] - map[0]) *
++			      ((s64)v - raw[0]),
++			      (s32)raw[1] - raw[0]);
++	} else if (v >= raw[n - 1]) {
++		out = (s64)map[n - 1] +
++		      div_s64((s64)((s32)map[n - 1] - map[n - 2]) *
++			      ((s64)v - raw[n - 1]),
++			      (s32)raw[n - 1] - raw[n - 2]);
++	} else {
++		out = map[0];
++		for (i = 0; i + 1 < n; i++) {
++			if (v <= raw[i + 1]) {
++				out = (s64)map[i] +
++				      div_s64((s64)((s32)map[i + 1] -
++						    map[i]) *
++					      ((s64)v - raw[i]),
++					      (s32)raw[i + 1] - raw[i]);
++				break;
++			}
++		}
++	}
++
++	if (out < 0)
++		out = 0;
++	if (out > max)
++		out = max;
++	return out;
++}
++
++static void nvt_map_coords(struct nvt_data *ts, struct nvt_contact *c)
++{
++	u64 row = c->row;
++	u64 col = c->col;
++	u32 x, y;
++
++	if (!swap_xy) {
++		x = div64_u64(col * ts->x_max, 16ULL * (NVT_COLS - 1));
++		y = div64_u64(row * ts->y_max, 16ULL * (NVT_ROWS - 1));
++		x = nvt_calibrate(x, ts->cal_x_raw, ts->cal_x_map,
++				  ts->ncal_x, ts->x_max - 1);
++		y = nvt_calibrate(y, ts->cal_y_raw, ts->cal_y_map,
++				  ts->ncal_y, ts->y_max - 1);
++	} else {
++		/* 校准节点按默认轴序给出，swap_xy 时不应用 */
++		x = div64_u64(row * ts->x_max, 16ULL * (NVT_ROWS - 1));
++		y = div64_u64(col * ts->y_max, 16ULL * (NVT_COLS - 1));
++	}
++
++	/* swap_xy 分支不经过校准，先把边界收紧到 input 允许的范围 */
++	if (x >= ts->x_max)
++		x = ts->x_max - 1;
++	if (y >= ts->y_max)
++		y = ts->y_max - 1;
++
++	if (invert_x)
++		x = ts->x_max - 1 - x;
++	if (invert_y)
++		y = ts->y_max - 1 - y;
++
++	c->x = x;
++	c->y = y;
++}
++
++static void nvt_report_contacts(struct nvt_data *ts, struct nvt_contact *cur,
++				int count)
++{
++	bool taken[NVT_MAX_TOUCH] = { };
++	int slot_of[NVT_MAX_TOUCH] = { };
++	int i, j;
++
++	for (i = 0; i < count; i++) {
++		int best = -1, best_dist = INT_MAX;
++
++		slot_of[i] = -1;
++		for (j = 0; j < NVT_MAX_TOUCH; j++) {
++			int dist;
++
++			if (!ts->prev[j].used || taken[j])
++				continue;
++			dist = abs(ts->prev[j].row - cur[i].row) +
++			       abs(ts->prev[j].col - cur[i].col);
++			if (dist < best_dist) {
++				best_dist = dist;
++				best = j;
++			}
++		}
++
++		if (best >= 0 && best_dist <= NVT_TRACK_DIST * 16) {
++			slot_of[i] = best;
++			taken[best] = true;
++			cur[i].id = ts->prev[best].id;
++		}
++	}
++
++	for (j = 0; j < NVT_MAX_TOUCH; j++) {
++		if (ts->prev[j].used && !taken[j]) {
++			input_mt_slot(ts->input, j);
++			input_mt_report_slot_state(ts->input, MT_TOOL_FINGER, false);
++			ts->prev[j].used = false;
++		}
++	}
++
++	for (i = 0; i < count; i++) {
++		if (slot_of[i] >= 0)
++			continue;
++		for (j = 0; j < NVT_MAX_TOUCH; j++) {
++			if (ts->prev[j].used || taken[j])
++				continue;
++			slot_of[i] = j;
++			taken[j] = true;
++			cur[i].id = ++ts->next_id;
++			break;
++		}
++	}
++
++	for (i = 0; i < count; i++) {
++		j = slot_of[i];
++		if (j < 0)
++			continue;
++
++		input_mt_slot(ts->input, j);
++		input_mt_report_slot_state(ts->input, MT_TOOL_FINGER, true);
++		input_report_abs(ts->input, ABS_MT_POSITION_X, cur[i].x);
++		input_report_abs(ts->input, ABS_MT_POSITION_Y, cur[i].y);
++		input_report_abs(ts->input, ABS_MT_PRESSURE, cur[i].pressure);
++		input_report_abs(ts->input, ABS_MT_TOUCH_MAJOR, cur[i].major);
++
++		ts->prev[j] = cur[i];
++		ts->prev[j].used = true;
++	}
++
++	input_mt_sync_frame(ts->input);
++	input_sync(ts->input);
++}
++
++void nvt_process_frame(struct nvt_data *ts)
++{
++	struct nvt_contact contacts[NVT_MAX_TOUCH] = { };
++	const u8 *p = ts->rx_buf + NVT_FRAME_NODE_OFFSET;
++	int count, i;
++
++	for (i = 0; i < NVT_FRAME_NODES; i++)
++		ts->delta[i] = (s16)(get_unaligned_le16(p + i * 2) -
++				     NVT_NODE_BASELINE);
++
++	/* 帧尾两个位置没有对应节点，保持为 0 */
++	ts->delta[NVT_FRAME_NODES] = 0;
++	ts->delta[NVT_FRAME_NODES + 1] = 0;
++
++	ts->palm_blob_seen = false;
++	count = nvt_scan_contacts(ts, contacts);
++
++	/*
++	 * 整掌会先形成一个较大的区域，随后碎裂成多个与手指面积相近
++	 * 的小区域。大块出现后的一小段时间内丢弃所有触点，避免碎片
++	 * 逐个被当成轻触上报。
++	 */
++	if (ts->palm_blob_seen) {
++		ts->palm_lock_until = jiffies +
++				      msecs_to_jiffies(NVT_PALM_LOCK_MS);
++		count = 0;
++	} else if (time_before(jiffies, ts->palm_lock_until)) {
++		count = 0;
++	}
++
++	/*
++	 * 触点数量异常多同样按手掌处理，并抑制随后的碎片。
++	 */
++	if (palm_max_contacts && count > (int)palm_max_contacts) {
++		dev_dbg_ratelimited(&ts->spi->dev,
++				    "palm rejected: %d contacts\n", count);
++		ts->palm_lock_until = jiffies +
++				      msecs_to_jiffies(NVT_PALM_LOCK_MS);
++		count = 0;
++	}
++
++	/* 静置时固件仍持续中断，没有触点变化时不再产生空帧事件 */
++	if (!count && !ts->touch_active)
++		return;
++	ts->touch_active = count > 0;
++
++	for (i = 0; i < count; i++)
++		nvt_map_coords(ts, &contacts[i]);
++
++	nvt_report_contacts(ts, contacts, count);
++}
++
++/* AFE 失效时主动抬起所有触点槽位，避免残留按压状态 */
++void nvt_release_contacts(struct nvt_data *ts)
++{
++	bool active = false;
++	int i;
++
++	for (i = 0; i < NVT_MAX_TOUCH; i++) {
++		if (!ts->prev[i].used)
++			continue;
++		input_mt_slot(ts->input, i);
++		input_mt_report_slot_state(ts->input, MT_TOOL_FINGER, false);
++		ts->prev[i].used = false;
++		active = true;
++	}
++
++	if (!active)
++		return;
++
++	input_mt_sync_frame(ts->input);
++	input_sync(ts->input);
++	ts->touch_active = false;
++}
++
++/*
++ * 解析一条分段线性校准属性。格式为成对的
++ * <raw 坐标 面板坐标 ...>，raw 必须严格递增；属性缺失、长度
++ * 非法或 raw 乱序时保持 n = 0，由调用方回退到等分映射。
++ */
++static void nvt_parse_calibration(const struct device *dev, const char *prop,
++				  u16 *raw, u16 *map, unsigned int *n)
++{
++	u32 vals[NVT_CAL_MAX * 2];
++	int count, i;
++
++	*n = 0;
++
++	/* 设备树 cell 为 32 位，读取后按 u16 坐标范围校验 */
++	count = device_property_count_u32(dev, prop);
++	if (count < 4 || count > NVT_CAL_MAX * 2 || (count & 1))
++		return;
++	if (device_property_read_u32_array(dev, prop, vals, count))
++		return;
++
++	for (i = 0; i < count / 2; i++) {
++		if (vals[2 * i] > 0xffff || vals[2 * i + 1] > 0xffff)
++			break;
++		if (i && vals[2 * i] <= vals[2 * i - 2])
++			break;
++		raw[i] = vals[2 * i];
++		map[i] = vals[2 * i + 1];
++	}
++
++	if (i >= 2)
++		*n = i;
++}
++
++void nvt_read_calibration(struct nvt_data *ts)
++{
++	const struct device *dev = &ts->spi->dev;
++
++	nvt_parse_calibration(dev, "novatek,x-calibration",
++			      ts->cal_x_raw, ts->cal_x_map, &ts->ncal_x);
++	nvt_parse_calibration(dev, "novatek,y-calibration",
++			      ts->cal_y_raw, ts->cal_y_map, &ts->ncal_y);
++
++	dev_info(dev, "calibration points: x=%u y=%u\n",
++		 ts->ncal_x, ts->ncal_y);
++}
