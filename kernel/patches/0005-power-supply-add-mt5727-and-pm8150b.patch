@@ -1,0 +1,2380 @@
+From: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
+Subject: [PATCH] power: supply: add MT5727 transmitter and PM8150B battery
+
+Applied to Linux 7.3.1.
+
+Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
+
+--- a/drivers/power/supply/Kconfig
++++ b/drivers/power/supply/Kconfig
+@@ -103,6 +103,18 @@
+ 	  This driver can be built as a module. If so, the module will be
+ 	  called adp5061.
+ 
++config CHARGER_MT5727
++	tristate "MediaTek MT5727 wireless power transmitter"
++	depends on I2C
++	depends on OF
++	help
++	  Say Y here to enable the MT5727 wireless power transmitter used
++	  on the Huawei MatePad 11 to charge the magnetic keyboard and the
++	  M-Pencil through separate coils.
++
++	  This driver can be built as a module. If so, the module will be
++	  called mt5727.
++
+ config BATTERY_ACT8945A
+ 	tristate "Active-semi ACT8945A charger driver"
+ 	depends on MFD_ACT8945A || COMPILE_TEST
+@@ -217,6 +229,15 @@
+ 	  which is used on modern Qualcomm platforms to provide battery and
+ 	  power supply information.
+ 
++config BATTERY_PM8150B
++	tristate "Qualcomm PM8150B battery and charger"
++	depends on MFD_SPMI_PMIC && IIO
++	help
++	  Say Y here to expose the battery and charger inside the Qualcomm
++	  PM8150B PMIC. The driver reads the SMB5 charger state, the FG gen4
++	  monotonic state of charge, the RRADC battery temperature and the
++	  VADC battery voltage.
++
+ config BATTERY_OLPC
+ 	tristate "One Laptop Per Child battery"
+ 	depends on OLPC_EC
+--- a/drivers/power/supply/Makefile
++++ b/drivers/power/supply/Makefile
+@@ -21,6 +21,7 @@
+ 
+ obj-$(CONFIG_BATTERY_88PM860X)	+= 88pm860x_battery.o
+ obj-$(CONFIG_CHARGER_ADP5061)	+= adp5061.o
++obj-$(CONFIG_CHARGER_MT5727)	+= mt5727.o
+ obj-$(CONFIG_BATTERY_ACT8945A)	+= act8945a_charger.o
+ obj-$(CONFIG_BATTERY_AXP20X)	+= axp20x_battery.o
+ obj-$(CONFIG_CHARGER_AXP20X)	+= axp20x_ac_power.o
+@@ -36,6 +37,7 @@
+ obj-$(CONFIG_BATTERY_HUAWEI_GAOKUN)	+= huawei-gaokun-battery.o
+ obj-$(CONFIG_BATTERY_LEGO_EV3)	+= lego_ev3_battery.o
+ obj-$(CONFIG_BATTERY_LENOVO_YOGA_C630) += lenovo_yoga_c630_battery.o
++obj-$(CONFIG_BATTERY_PM8150B)	+= pm8150b_battery.o
+ obj-$(CONFIG_BATTERY_PMU)	+= pmu_battery.o
+ obj-$(CONFIG_BATTERY_QCOM_BATTMGR)	+= qcom_battmgr.o
+ obj-$(CONFIG_BATTERY_OLPC)	+= olpc_battery.o
+--- /dev/null
++++ b/Documentation/devicetree/bindings/power/supply/mediatek,mt5727.yaml
+@@ -0,0 +1,156 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/power/supply/mediatek,mt5727.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: MediaTek MT5727 wireless power transmitter
++
++description: |
++  The MT5727 is a wireless power transmitter controller used to charge the
++  stylus and the detachable keyboard of a tablet. It drives one of two
++  coils, selected by external switches, and reports receiver presence and
++  foreign object detection through an interrupt line.
++
++  The chip is powered by an external boost converter and needs an enable
++  signal. Both control lines are described as GPIOs because the board
++  wires them directly to the SoC.
++
++maintainers:
++  - CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
++
++properties:
++  compatible:
++    const: mediatek,mt5727
++
++  reg:
++    maxItems: 1
++
++  interrupts:
++    maxItems: 1
++
++  enable-gpios:
++    maxItems: 1
++    description: GPIO that enables the transmitter chip (active low).
++
++  boost-gpios:
++    maxItems: 1
++    description: GPIO that enables the 5 V boost converter supplying the chip.
++
++  pen-en-gpios:
++    maxItems: 1
++    description: GPIO that selects the stylus coil.
++
++  keyboard-en-gpios:
++    maxItems: 1
++    description: GPIO that selects the keyboard coil.
++
++  int-gpios:
++    maxItems: 1
++    description: |
++      GPIO connected to the interrupt line, used to sample the line level
++      in addition to the interrupt itself.
++
++  keyboard-hall-gpios:
++    maxItems: 1
++    description: Hall sensor GPIO that goes low when the keyboard is attached.
++
++  pen-hall-gpios:
++    maxItems: 1
++    description: Hall sensor GPIO that goes low when the stylus is attached.
++
++  mediatek,ping-freq-khz:
++    $ref: /schemas/types.yaml#/definitions/uint32
++    minimum: 100
++    maximum: 150
++    default: 130
++    description: Ping phase operating frequency in kHz.
++
++  mediatek,ping-interval-ms:
++    minimum: 10
++    maximum: 1000
++    default: 120
++    description: Interval between ping phases in milliseconds.
++
++  mediatek,ping-ocp-ma:
++    $ref: /schemas/types.yaml#/definitions/uint32
++    minimum: 100
++    maximum: 3000
++    default: 900
++    description: Ping phase over-current protection threshold in mA.
++
++  mediatek,min-fop-khz:
++    $ref: /schemas/types.yaml#/definitions/uint32
++    minimum: 113
++    maximum: 145
++    default: 120
++    description: Lower bound of the operating frequency range in kHz.
++
++  mediatek,max-fop-khz:
++    $ref: /schemas/types.yaml#/definitions/uint32
++    minimum: 113
++    maximum: 145
++    default: 145
++    description: |
++      Upper bound of the operating frequency range in kHz. Shall be greater
++      than or equal to mediatek,min-fop-khz.
++
++  mediatek,fod-threshold:
++    $ref: /schemas/types.yaml#/definitions/uint32
++    maximum: 65535
++    default: 2700
++    description: Foreign object detection threshold in chip-specific units.
++
++  mediatek,fod-count:
++    $ref: /schemas/types.yaml#/definitions/uint32
++    maximum: 100
++    default: 3
++    description: Number of consecutive detections before reporting a foreign object.
++
++required:
++  - compatible
++  - reg
++  - interrupts
++  - enable-gpios
++  - boost-gpios
++  - pen-en-gpios
++  - keyboard-en-gpios
++  - int-gpios
++
++additionalProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/gpio/gpio.h>
++    #include <dt-bindings/interrupt-controller/irq.h>
++
++    i2c {
++        #address-cells = <1>;
++        #size-cells = <0>;
++
++        wireless-tx@2b {
++            compatible = "mediatek,mt5727";
++            reg = <0x2b>;
++
++            interrupt-parent = <&tlmm>;
++            interrupts = <129 IRQ_TYPE_EDGE_FALLING>;
++
++            enable-gpios = <&tlmm 92 GPIO_ACTIVE_LOW>;
++            boost-gpios = <&tlmm 50 GPIO_ACTIVE_HIGH>;
++            pen-en-gpios = <&tlmm 117 GPIO_ACTIVE_HIGH>;
++            keyboard-en-gpios = <&tlmm 155 GPIO_ACTIVE_HIGH>;
++            int-gpios = <&tlmm 129 GPIO_ACTIVE_LOW>;
++            keyboard-hall-gpios = <&tlmm 121 GPIO_ACTIVE_LOW>;
++            pen-hall-gpios = <&tlmm 23 GPIO_ACTIVE_LOW>;
++
++            mediatek,ping-freq-khz = <130>;
++            mediatek,ping-interval-ms = <120>;
++            mediatek,ping-ocp-ma = <900>;
++            mediatek,min-fop-khz = <120>;
++            mediatek,max-fop-khz = <145>;
++            mediatek,fod-threshold = <2700>;
++            mediatek,fod-count = <3>;
++        };
++    };
++
++...
+--- /dev/null
++++ b/Documentation/devicetree/bindings/power/supply/qcom,pm8150b-battery.yaml
+@@ -0,0 +1,63 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++# Copyright (c) 2026 CoWave Fall
++$id: http://devicetree.org/schemas/power/supply/qcom,pm8150b-battery.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Qualcomm PM8150B battery and charger
++
++description: |
++  The PM8150B PMIC integrates an SMB5 switched-mode charger and a gen4 fuel
++  gauge. Both blocks share one register map and expose battery voltage,
++  current, capacity and charge status. The driver accesses the sub-blocks
++  at fixed offsets from the node base address, so the node only needs to
++  describe the battery voltage ADC channel.
++
++maintainers:
++  - CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
++
++allOf:
++  - $ref: power-supply.yaml#
++
++properties:
++  compatible:
++    const: qcom,pm8150b-battery
++
++  reg:
++    maxItems: 1
++
++  io-channels:
++    maxItems: 1
++    description: Battery voltage sense channel from the PMIC ADC.
++
++  io-channel-names:
++    const: vbat
++
++  monitored-battery: true
++
++required:
++  - compatible
++  - reg
++  - io-channels
++  - io-channel-names
++
++additionalProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/iio/qcom,spmi-vadc.h>
++
++    pmic {
++        #address-cells = <1>;
++        #size-cells = <0>;
++
++        battery@1000 {
++            compatible = "qcom,pm8150b-battery";
++            reg = <0x1000>;
++            io-channels = <&pm8150b_adc ADC5_VBAT_SNS>;
++            io-channel-names = "vbat";
++        };
++    };
++
++...
+--- /dev/null
++++ b/drivers/power/supply/mt5727.c
+@@ -0,0 +1,1360 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MediaTek MT5727 wireless power transmitter.
++ *
++ * The Huawei MatePad 11 (DBY-W09) carries an MT5727 used as a small
++ * wireless power transmitter.  A single power stage feeds two coils
++ * through an analog switch: one coil charges the magnetic keyboard, the
++ * other one the M-Pencil.  The accessories talk Bluetooth for data, so
++ * this driver only has to keep the receiver side powered.
++ *
++ * The chip runs the Qi transmitter state machine in its own firmware.
++ * The driver configures the power limits, ping parameters and FOD
++ * thresholds, starts and stops the transmitter, and answers the Huawei
++ * proprietary FSK messages the receiver needs for the handshake.
++ *
++ * Register layout and programming sequence are taken from Huawei's
++ * GPL-2.0 mt5727 driver
++ * (drivers/hwpower/cc_hardware_ic/wireless_charge_ic/mt5727).
++ */
++
++#include <linux/bitops.h>
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/i2c.h>
++#include <linux/interrupt.h>
++#include <linux/jiffies.h>
++#include <linux/kobject.h>
++#include <linux/limits.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/slab.h>
++#include <linux/sysfs.h>
++#include <linux/workqueue.h>
++
++#define MT5727_HW_CHIP_ID		0x5728
++#define MT5727_CHIP_ID			0x5727
++
++/* 芯片信息区：0x0000..0x000d */
++#define MT5727_REG_CHIP_INFO		0x0000
++#define MT5727_CHIP_INFO_LEN		14
++
++#define MT5727_REG_OP_MODE		0x0005
++#define MT5727_OP_MODE_TX		BIT(2)
++#define MT5727_REG_HW_CHIP_ID		0x5a50
++
++/* TX 命令寄存器，32 位，每一位对应一条命令 */
++#define MT5727_REG_TX_CMD		0x0008
++#define MT5727_CMD_OVP			BIT(7)
++#define MT5727_CMD_OCP			BIT(8)
++#define MT5727_CMD_RST_SYS		BIT(4)
++#define MT5727_CMD_SEND_MSG		BIT(6)
++#define MT5727_CMD_START_TX		BIT(12)
++#define MT5727_CMD_STOP_TX		BIT(13)
++
++#define MT5727_REG_TX_IRQ_EN		0x0010
++#define MT5727_REG_TX_IRQ		0x0014
++#define MT5727_REG_TX_IRQ_CLR		0x0018
++#define MT5727_REG_TX_IRQ_CLR_CTRL	0x0070
++
++/* 中断状态位 */
++#define MT5727_IRQ_SS_PKT		BIT(0)
++#define MT5727_IRQ_ID_PKT		BIT(1)
++#define MT5727_IRQ_CFG_PKT		BIT(2)
++#define MT5727_IRQ_DETECT_RX		BIT(3)
++#define MT5727_IRQ_OCP			BIT(4)
++#define MT5727_IRQ_FOD			BIT(5)
++#define MT5727_IRQ_REMOVE_POWER		BIT(6)
++#define MT5727_IRQ_POWER_TRANS		BIT(8)
++#define MT5727_IRQ_OVP			BIT(10)
++#define MT5727_IRQ_PP_PKT		BIT(11)
++#define MT5727_IRQ_EPT_PKT		BIT(15)
++#define MT5727_IRQ_CEP_TIMEOUT		BIT(18)
++#define MT5727_IRQ_PING_OCP		BIT(22)
++#define MT5727_IRQ_PING_OVP		BIT(23)
++
++/* 接收端 ASK 报文与发往接收端的 FSK 报文 */
++#define MT5727_REG_RX_PKT		0x0020
++#define MT5727_RX_PKT_LEN		6
++#define MT5727_REG_TX_MSG_HDR		0x0036
++#define MT5727_REG_TX_MSG_CMD		0x0037
++#define MT5727_REG_TX_MSG_DATA		0x0038
++
++/* 发射参数 */
++#define MT5727_REG_TX_MAX_FOP		0x004c
++#define MT5727_REG_TX_MIN_FOP		0x004e
++#define MT5727_REG_TX_PING_FREQ		0x0050
++#define MT5727_REG_TX_PING_OCP		0x0052
++#define MT5727_REG_TX_OCP		0x0054
++#define MT5727_REG_TX_OVP		0x0058
++#define MT5727_REG_TX_PLOSS_CNT		0x006c
++#define MT5727_REG_TX_OP_FREQ		0x006e
++#define MT5727_REG_TX_VRECT		0x008a
++#define MT5727_REG_TX_IIN		0x008e
++#define MT5727_REG_TX_VIN		0x0090
++#define MT5727_REG_TX_PLOSS_TH0		0x0094
++#define MT5727_REG_TX_PING_INTERVAL	0x00a6
++#define MT5727_REG_TX_FSK_DEPTH		0x00a9
++#define MT5727_REG_TX_EPT_SRC		0x00b0
++
++/* 发射配置默认值，与厂商设备树一致 */
++#define MT5727_TX_OCP_MA		2000
++#define MT5727_TX_OVP_MV		20000
++#define MT5727_TX_PING_OCP_MA		900
++#define MT5727_TX_FOD_TH		2700
++#define MT5727_TX_FOD_CNT		3
++#define MT5727_TX_PING_FREQ_KHZ		130
++#define MT5727_TX_PING_INTERVAL_MS	120
++#define MT5727_TX_MIN_FOP_KHZ		120
++#define MT5727_TX_MAX_FOP_KHZ		145
++#define MT5727_TX_FSK_DEPTH_VAL		130
++#define MT5727_TX_IRQ_EN_VAL		0x00ceefff
++
++/* AC 工作频率与周期计数值的换算，周期单位 4 Hz */
++#define MT5727_OSCF2P(f)		(80000 / (f) - 2)
++#define MT5727_OSCP2F(p)		(80000 / (p) + 2)
++
++/* EPT 来源位 */
++#define MT5727_EPT_CEP_TIMEOUT		BIT(8)
++#define MT5727_EPT_LVP			BIT(12)
++#define MT5727_EPT_OTP			BIT(14)
++#define MT5727_EPT_LCP			BIT(15)
++#define MT5727_EPT_CFG			BIT(16)
++#define MT5727_EPT_PING_OVP		BIT(17)
++
++/* 华为私有 Qi 报文 */
++#define MT5727_ASK_HDR_1BYTE		0x18
++#define MT5727_ASK_HDR_2BYTE		0x28
++#define MT5727_ASK_HDR_3BYTE		0x38
++#define MT5727_ASK_HDR_5BYTE		0x58
++#define MT5727_CMD_ACK			0xff
++#define MT5727_CMD_ACK_HEADER		0x1e
++#define MT5727_CMD_GET_TX_VERSION	0x05
++#define MT5727_CMD_SET_TX_VIN		0x0a
++#define MT5727_CMD_RX_EVT		0x1a
++#define MT5727_CMD_GET_TX_ID		0x3b
++#define MT5727_CMD_GET_TX_CAP		0x41
++#define MT5727_CMD_CHRG_STATE		0x43
++#define MT5727_CMD_RX_PMAX		0x55
++#define MT5727_CMD_BT_MAC1		0x52
++#define MT5727_CMD_BT_MAC2		0x53
++#define MT5727_CMD_BT_MODEL		0x54
++#define MT5727_HANDSHAKE_ID		0x8866
++#define MT5727_CHRG_STATE_DONE		BIT(1)
++
++#define MT5727_I2C_RETRIES		3
++#define MT5727_MONITOR_MS		2000
++#define MT5727_PING_TIMEOUT_MS		30000
++#define MT5727_PING_RETRY_MS		7000
++#define MT5727_RESET_WAIT_MS		150
++
++enum mt5727_coil {
++	MT5727_COIL_PEN,
++	MT5727_COIL_KEYBOARD,
++};
++
++struct mt5727 {
++	struct i2c_client *client;
++	struct mutex lock;		/* 保护全部寄存器访问与状态 */
++	struct gpio_desc *gpio_enable;
++	struct gpio_desc *gpio_boost;
++	struct gpio_desc *gpio_pen_en;
++	struct gpio_desc *gpio_kb_en;
++	struct gpio_desc *gpio_hall_kb;
++	struct gpio_desc *gpio_hall_pen;
++	struct gpio_desc *gpio_int;
++	int irq;
++	int hall_kb_irq;
++	int hall_pen_irq;
++	bool irq_enabled;
++
++	struct work_struct irq_work;
++	struct delayed_work hall_work;
++	struct delayed_work monitor_work;
++
++	bool powered;
++	bool tx_on;
++	bool auto_enabled;
++	bool handshake_done;
++	bool rx_present;
++	bool vin_reported;
++
++	enum mt5727_coil coil;
++	unsigned long start_jiffies;
++	bool retried;
++	int mode_errors;
++
++	u16 chip_id;
++	u16 hw_id;
++	u16 fw_major;
++	u16 fw_minor;
++	u16 vin;
++	u16 iin;
++	u16 vrect;
++	u16 fop_period;
++	u8 mode;
++	u32 ept;
++
++	u16 ping_freq_khz;
++	u16 ping_interval_ms;
++	u16 ping_ocp_ma;
++	u16 min_fop_khz;
++	u16 max_fop_khz;
++	u16 fod_th;
++	u16 fod_cnt;
++};
++
++static int mt5727_read_block(struct mt5727 *mt, u16 reg, u8 *buf, u16 len)
++{
++	struct i2c_client *client = mt->client;
++	u8 addr[2] = { reg >> 8, reg & 0xff };
++	struct i2c_msg msgs[2] = {
++		{
++			.addr = client->addr,
++			.flags = 0,
++			.len = sizeof(addr),
++			.buf = addr,
++		}, {
++			.addr = client->addr,
++			.flags = I2C_M_RD,
++			.len = len,
++			.buf = buf,
++		},
++	};
++	int ret;
++	int i;
++
++	for (i = 0; i < MT5727_I2C_RETRIES; i++) {
++		ret = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
++		if (ret == ARRAY_SIZE(msgs))
++			return 0;
++		usleep_range(10000, 12000);
++	}
++
++	return ret < 0 ? ret : -EIO;
++}
++
++static int mt5727_write_block(struct mt5727 *mt, u16 reg,
++			      const u8 *data, u16 len)
++{
++	struct i2c_client *client = mt->client;
++	u8 buf[2 + 128];
++	int ret;
++	int i;
++
++	if (len > 128)
++		return -EINVAL;
++
++	buf[0] = reg >> 8;
++	buf[1] = reg & 0xff;
++	memcpy(&buf[2], data, len);
++
++	for (i = 0; i < MT5727_I2C_RETRIES; i++) {
++		ret = i2c_master_send(client, buf, len + 2);
++		if (ret == len + 2)
++			return 0;
++		usleep_range(10000, 12000);
++	}
++
++	return ret < 0 ? ret : -EIO;
++}
++
++static int mt5727_write_byte(struct mt5727 *mt, u16 reg, u8 val)
++{
++	return mt5727_write_block(mt, reg, &val, 1);
++}
++
++static int mt5727_read_word(struct mt5727 *mt, u16 reg, u16 *val)
++{
++	u8 buf[2];
++	int ret;
++
++	ret = mt5727_read_block(mt, reg, buf, sizeof(buf));
++	if (ret)
++		return ret;
++
++	*val = buf[0] | (buf[1] << 8);
++	return 0;
++}
++
++static int mt5727_write_word(struct mt5727 *mt, u16 reg, u16 val)
++{
++	u8 buf[2] = { val & 0xff, val >> 8 };
++
++	return mt5727_write_block(mt, reg, buf, sizeof(buf));
++}
++
++static int mt5727_read_dword(struct mt5727 *mt, u16 reg, u32 *val)
++{
++	u8 buf[4];
++	int ret;
++
++	ret = mt5727_read_block(mt, reg, buf, sizeof(buf));
++	if (ret)
++		return ret;
++
++	*val = buf[0] | (buf[1] << 8) | (buf[2] << 16) |
++	       ((u32)buf[3] << 24);
++	return 0;
++}
++
++static int mt5727_write_dword(struct mt5727 *mt, u16 reg, u32 val)
++{
++	u8 buf[4] = { val & 0xff, val >> 8, val >> 16, val >> 24 };
++
++	return mt5727_write_block(mt, reg, buf, sizeof(buf));
++}
++
++static int mt5727_write_dword_mask(struct mt5727 *mt, u16 reg, u32 mask,
++				   u32 shift, u32 val)
++{
++	u32 old;
++	int ret;
++
++	ret = mt5727_read_dword(mt, reg, &old);
++	if (ret)
++		return ret;
++
++	old &= ~mask;
++	old |= (val << shift) & mask;
++
++	return mt5727_write_dword(mt, reg, old);
++}
++
++static int mt5727_power_on(struct mt5727 *mt)
++{
++	if (mt->powered)
++		return 0;
++
++	/* 芯片由 5 V 升压供电，使能脚只负责发射功率级 */
++	gpiod_set_value_cansleep(mt->gpio_boost, 1);
++	usleep_range(20000, 22000);
++	gpiod_set_value_cansleep(mt->gpio_enable, 1);
++	usleep_range(20000, 22000);
++
++	mt->powered = true;
++	return 0;
++}
++
++static void mt5727_power_off(struct mt5727 *mt)
++{
++	if (!mt->powered)
++		return;
++
++	gpiod_set_value_cansleep(mt->gpio_enable, 0);
++	usleep_range(5000, 6000);
++	gpiod_set_value_cansleep(mt->gpio_boost, 0);
++	mt->powered = false;
++}
++
++static void mt5727_select_coil(struct mt5727 *mt, enum mt5727_coil coil)
++{
++	if (coil == MT5727_COIL_PEN) {
++		gpiod_set_value_cansleep(mt->gpio_kb_en, 0);
++		gpiod_set_value_cansleep(mt->gpio_pen_en, 1);
++	} else {
++		gpiod_set_value_cansleep(mt->gpio_pen_en, 0);
++		gpiod_set_value_cansleep(mt->gpio_kb_en, 1);
++	}
++	usleep_range(1000, 2000);
++	mt->coil = coil;
++}
++
++static int mt5727_chip_reset(struct mt5727 *mt)
++{
++	int ret;
++
++	ret = mt5727_write_dword_mask(mt, MT5727_REG_TX_CMD,
++				      MT5727_CMD_RST_SYS, 4, 1);
++	if (ret)
++		return ret;
++
++	msleep(MT5727_RESET_WAIT_MS);
++	return 0;
++}
++
++static int mt5727_chip_info(struct mt5727 *mt)
++{
++	u8 info[MT5727_CHIP_INFO_LEN];
++	int ret;
++
++	ret = mt5727_read_block(mt, MT5727_REG_CHIP_INFO, info, sizeof(info));
++	if (ret)
++		return ret;
++
++	mt->chip_id = info[0] | (info[1] << 8);
++	mt->fw_minor = info[4] | (info[5] << 8);
++	mt->fw_major = info[6] | (info[7] << 8);
++	return 0;
++}
++
++static int mt5727_chip_init(struct mt5727 *mt)
++{
++	int ret;
++
++	ret = mt5727_write_word(mt, MT5727_REG_TX_OVP, MT5727_TX_OVP_MV);
++	if (ret)
++		return ret;
++	ret = mt5727_write_dword_mask(mt, MT5727_REG_TX_CMD,
++				      MT5727_CMD_OVP, 7, 1);
++	if (ret)
++		return ret;
++	ret = mt5727_write_word(mt, MT5727_REG_TX_OCP, MT5727_TX_OCP_MA);
++	if (ret)
++		return ret;
++	ret = mt5727_write_word(mt, MT5727_REG_TX_PING_OCP,
++				mt->ping_ocp_ma);
++	if (ret)
++		return ret;
++	ret = mt5727_write_dword_mask(mt, MT5727_REG_TX_CMD,
++				      MT5727_CMD_OCP, 8, 1);
++	if (ret)
++		return ret;
++	ret = mt5727_write_word(mt, MT5727_REG_TX_PLOSS_TH0, mt->fod_th);
++	if (ret)
++		return ret;
++	ret = mt5727_write_word(mt, MT5727_REG_TX_PLOSS_CNT, mt->fod_cnt);
++	if (ret)
++		return ret;
++	ret = mt5727_write_word(mt, MT5727_REG_TX_PING_FREQ,
++				MT5727_OSCF2P(mt->ping_freq_khz));
++	if (ret)
++		return ret;
++	ret = mt5727_write_word(mt, MT5727_REG_TX_MIN_FOP,
++				MT5727_OSCF2P(mt->min_fop_khz));
++	if (ret)
++		return ret;
++	ret = mt5727_write_word(mt, MT5727_REG_TX_MAX_FOP,
++				MT5727_OSCF2P(mt->max_fop_khz));
++	if (ret)
++		return ret;
++	ret = mt5727_write_word(mt, MT5727_REG_TX_PING_INTERVAL,
++				mt->ping_interval_ms);
++	if (ret)
++		return ret;
++	ret = mt5727_write_dword(mt, MT5727_REG_TX_IRQ_EN,
++				 MT5727_TX_IRQ_EN_VAL);
++	if (ret)
++		dev_err(&mt->client->dev, "chip init failed: %d\n", ret);
++
++	return ret;
++}
++
++static int mt5727_set_tx_mode(struct mt5727 *mt, bool enable)
++{
++	int ret;
++
++	if (enable) {
++		ret = mt5727_write_dword_mask(mt, MT5727_REG_TX_CMD,
++					      MT5727_CMD_START_TX, 12, 1);
++		if (ret)
++			return ret;
++		return mt5727_write_word(mt, MT5727_REG_TX_FSK_DEPTH,
++					 MT5727_TX_FSK_DEPTH_VAL);
++	}
++
++	return mt5727_write_dword_mask(mt, MT5727_REG_TX_CMD,
++				       MT5727_CMD_STOP_TX, 13, 1);
++}
++
++static int mt5727_clear_interrupt(struct mt5727 *mt, u32 intr)
++{
++	int ret;
++
++	ret = mt5727_write_dword(mt, MT5727_REG_TX_IRQ_CLR, intr);
++	if (ret)
++		return ret;
++
++	return mt5727_write_byte(mt, MT5727_REG_TX_IRQ_CLR_CTRL, 1);
++}
++
++static int mt5727_send_fsk(struct mt5727 *mt, u8 cmd,
++			   const u8 *data, int len)
++{
++	u8 header;
++	int ret;
++
++	if (len > 4)
++		return -EINVAL;
++
++	/* 报文头高 4 位是命令与数据的字节数，低 4 位固定 0xf */
++	header = (cmd == MT5727_CMD_ACK) ? MT5727_CMD_ACK_HEADER :
++		 (0x0f | ((len + 1) << 4));
++
++	ret = mt5727_write_byte(mt, MT5727_REG_TX_MSG_HDR, header);
++	if (ret)
++		return ret;
++	ret = mt5727_write_byte(mt, MT5727_REG_TX_MSG_CMD, cmd);
++	if (ret)
++		return ret;
++
++	if (len) {
++		ret = mt5727_write_block(mt, MT5727_REG_TX_MSG_DATA,
++					 data, len);
++		if (ret)
++			return ret;
++	}
++
++	return mt5727_write_dword_mask(mt, MT5727_REG_TX_CMD,
++				       MT5727_CMD_SEND_MSG, 6, 1);
++}
++
++static void mt5727_stop_locked(struct mt5727 *mt);
++
++static void mt5727_handle_ask_packet(struct mt5727 *mt)
++{
++	struct device *dev = &mt->client->dev;
++	u8 pkt[MT5727_RX_PKT_LEN];
++	u8 fw[4];
++	u16 tx_id;
++	int ret;
++
++	ret = mt5727_read_block(mt, MT5727_REG_RX_PKT, pkt, sizeof(pkt));
++	if (ret) {
++		dev_err_ratelimited(dev, "cannot read RX packet\n");
++		return;
++	}
++
++	mt->rx_present = true;
++	dev_dbg(dev, "RX packet %*ph\n", (int)sizeof(pkt), pkt);
++
++	switch (pkt[0]) {
++	case MT5727_ASK_HDR_1BYTE:
++		switch (pkt[1]) {
++		case MT5727_CMD_GET_TX_VERSION:
++			/* 固件版本按 major 低、高字节，minor 低、高字节回传 */
++			fw[0] = mt->fw_major & 0xff;
++			fw[1] = mt->fw_major >> 8;
++			fw[2] = mt->fw_minor & 0xff;
++			fw[3] = mt->fw_minor >> 8;
++			ret = mt5727_send_fsk(mt, pkt[1], fw, sizeof(fw));
++			if (ret)
++				dev_err_ratelimited(dev,
++						    "version reply failed: %d\n",
++						    ret);
++			break;
++		default:
++			goto unhandled;
++		}
++		break;
++
++	case MT5727_ASK_HDR_2BYTE:
++		switch (pkt[1]) {
++		case MT5727_CMD_RX_EVT:
++		case MT5727_CMD_RX_PMAX:
++			ret = mt5727_send_fsk(mt, MT5727_CMD_ACK, NULL, 0);
++			if (ret)
++				dev_err_ratelimited(dev, "ACK failed: %d\n", ret);
++			break;
++		case MT5727_CMD_CHRG_STATE:
++			ret = mt5727_send_fsk(mt, MT5727_CMD_ACK, NULL, 0);
++			if (ret)
++				dev_err_ratelimited(dev, "ACK failed: %d\n", ret);
++			if (pkt[2] & MT5727_CHRG_STATE_DONE) {
++				dev_info(dev, "receiver reports charge complete\n");
++				mt5727_stop_locked(mt);
++			}
++			break;
++		default:
++			goto unhandled;
++		}
++		break;
++
++	case MT5727_ASK_HDR_3BYTE:
++		switch (pkt[1]) {
++		case MT5727_CMD_GET_TX_ID:
++			tx_id = pkt[2] << 8 | pkt[3];
++			if (tx_id != MT5727_HANDSHAKE_ID)
++				break;
++			/* 接收端校验 0x8866 后回传相同的 ID 字节完成握手 */
++			ret = mt5727_send_fsk(mt, pkt[1], &pkt[2], 2);
++			if (ret) {
++				dev_err(dev, "handshake reply failed: %d\n", ret);
++				break;
++			}
++			mt->handshake_done = true;
++			dev_info(dev, "wireless accessory handshake done\n");
++			break;
++		case MT5727_CMD_SET_TX_VIN:
++			ret = mt5727_send_fsk(mt, MT5727_CMD_ACK, NULL, 0);
++			if (ret)
++				dev_err_ratelimited(dev, "ACK failed: %d\n", ret);
++			break;
++		default:
++			goto unhandled;
++		}
++		break;
++
++	case MT5727_ASK_HDR_5BYTE:
++		switch (pkt[1]) {
++		case MT5727_CMD_BT_MAC1:
++		case MT5727_CMD_BT_MAC2:
++		case MT5727_CMD_BT_MODEL:
++			ret = mt5727_send_fsk(mt, MT5727_CMD_ACK, NULL, 0);
++			if (ret)
++				dev_err_ratelimited(dev, "ACK failed: %d\n", ret);
++			break;
++		default:
++			goto unhandled;
++		}
++		break;
++
++	default:
++unhandled:
++		dev_info_ratelimited(dev, "unhandled RX packet %*ph\n",
++				     (int)sizeof(pkt), pkt);
++		break;
++	}
++}
++
++static void mt5727_handle_ept(struct mt5727 *mt)
++{
++	struct device *dev = &mt->client->dev;
++	u32 ept;
++	int ret;
++
++	ret = mt5727_read_dword(mt, MT5727_REG_TX_EPT_SRC, &ept);
++	if (ret) {
++		dev_err_ratelimited(dev, "cannot read EPT source\n");
++		return;
++	}
++
++	mt->ept = ept;
++	(void)mt5727_write_dword(mt, MT5727_REG_TX_EPT_SRC, 0);
++
++	if (ept & MT5727_EPT_CEP_TIMEOUT)
++		mt->rx_present = false;
++
++	if (ept & (MT5727_EPT_LVP | MT5727_EPT_OTP | MT5727_EPT_LCP |
++		   MT5727_EPT_PING_OVP)) {
++		dev_warn(dev, "transmitter fault 0x%08x, stop\n", ept);
++		mt5727_stop_locked(mt);
++	}
++}
++
++static void mt5727_handle_irq(struct mt5727 *mt, u32 intr)
++{
++	struct device *dev = &mt->client->dev;
++
++	(void)mt5727_clear_interrupt(mt, intr);
++
++	if (intr & (MT5727_IRQ_SS_PKT | MT5727_IRQ_ID_PKT |
++		    MT5727_IRQ_CFG_PKT | MT5727_IRQ_PP_PKT))
++		mt5727_handle_ask_packet(mt);
++
++	if (intr & (MT5727_IRQ_DETECT_RX | MT5727_IRQ_POWER_TRANS))
++		mt->rx_present = true;
++
++	if (intr & MT5727_IRQ_EPT_PKT)
++		mt5727_handle_ept(mt);
++
++	if (intr & MT5727_IRQ_REMOVE_POWER)
++		mt->rx_present = false;
++
++	if (intr & MT5727_IRQ_CEP_TIMEOUT) {
++		mt->rx_present = false;
++		dev_info(dev, "receiver stopped responding\n");
++	}
++
++	if (intr & (MT5727_IRQ_OCP | MT5727_IRQ_OVP)) {
++		dev_warn(dev, "transmitter fault, status 0x%08x\n", intr);
++		mt5727_stop_locked(mt);
++	}
++
++	if (intr & MT5727_IRQ_FOD)
++		dev_warn_ratelimited(dev, "foreign object detected\n");
++
++	if (intr & (MT5727_IRQ_PING_OCP | MT5727_IRQ_PING_OVP))
++		dev_warn_ratelimited(dev, "ping fault, status 0x%08x\n", intr);
++}
++
++static void mt5727_irq_work(struct work_struct *work)
++{
++	struct mt5727 *mt = container_of(work, struct mt5727, irq_work);
++	u32 intr;
++	int ret;
++
++	mutex_lock(&mt->lock);
++
++	if (!mt->tx_on)
++		goto out;
++
++	ret = mt5727_read_dword(mt, MT5727_REG_TX_IRQ, &intr);
++	if (!ret)
++		mt5727_handle_irq(mt, intr);
++
++	/* 处理期间可能又有事件，中断脚仍为低时把状态再取一次。
++	 * int 脚在设备树中为低有效，需要读取物理电平判断是否仍处于拉低状态。
++	 */
++	if (mt->tx_on && !gpiod_get_raw_value_cansleep(mt->gpio_int)) {
++		ret = mt5727_read_dword(mt, MT5727_REG_TX_IRQ, &intr);
++		if (!ret && intr)
++			mt5727_handle_irq(mt, intr);
++		else
++			(void)mt5727_clear_interrupt(mt, 0xffffffff);
++	}
++
++out:
++	if (mt->tx_on && !mt->irq_enabled) {
++		enable_irq(mt->irq);
++		mt->irq_enabled = true;
++	}
++	mutex_unlock(&mt->lock);
++}
++
++static irqreturn_t mt5727_interrupt(int irq, void *data)
++{
++	struct mt5727 *mt = data;
++
++	if (mt->irq_enabled) {
++		disable_irq_nosync(irq);
++		mt->irq_enabled = false;
++		schedule_work(&mt->irq_work);
++	}
++
++	return IRQ_HANDLED;
++}
++
++static int mt5727_start_locked(struct mt5727 *mt, enum mt5727_coil coil)
++{
++	struct device *dev = &mt->client->dev;
++	int ret;
++
++	if (mt->tx_on)
++		mt5727_stop_locked(mt);
++
++	mt5727_select_coil(mt, coil);
++
++	ret = mt5727_power_on(mt);
++	if (ret)
++		return ret;
++
++	ret = mt5727_chip_init(mt);
++	if (ret)
++		goto err_power;
++
++	ret = mt5727_set_tx_mode(mt, true);
++	if (ret)
++		goto err_power;
++
++	mt->tx_on = true;
++	mt->rx_present = false;
++	mt->handshake_done = false;
++	mt->vin_reported = false;
++	mt->retried = false;
++	mt->mode_errors = 0;
++	mt->start_jiffies = jiffies;
++
++	if (!mt->irq_enabled) {
++		enable_irq(mt->irq);
++		mt->irq_enabled = true;
++	}
++	mod_delayed_work(system_dfl_wq, &mt->monitor_work,
++			 msecs_to_jiffies(1000));
++
++	dev_info(dev, "transmitter started on %s coil\n",
++		 coil == MT5727_COIL_PEN ? "pen" : "keyboard");
++	return 0;
++
++err_power:
++	mt5727_power_off(mt);
++	return ret;
++}
++
++static void mt5727_stop_locked(struct mt5727 *mt)
++{
++	if (mt->irq_enabled) {
++		disable_irq_nosync(mt->irq);
++		mt->irq_enabled = false;
++	}
++
++	if (mt->tx_on) {
++		(void)mt5727_set_tx_mode(mt, false);
++		mt->tx_on = false;
++		mt->rx_present = false;
++		mt->handshake_done = false;
++		dev_info(&mt->client->dev, "transmitter stopped\n");
++	}
++
++	mt5727_power_off(mt);
++}
++
++static void mt5727_monitor_work(struct work_struct *work)
++{
++	struct mt5727 *mt = container_of(work, struct mt5727,
++					 monitor_work.work);
++	struct device *dev = &mt->client->dev;
++	unsigned long timeout;
++	u32 intr;
++	u16 mode;
++	int ret;
++
++	mutex_lock(&mt->lock);
++
++	if (!mt->tx_on)
++		goto out;
++
++	ret = mt5727_read_word(mt, MT5727_REG_OP_MODE, &mode);
++	if (!ret) {
++		mt->mode = mode;
++		if (!(mode & MT5727_OP_MODE_TX)) {
++			if (++mt->mode_errors >= 3) {
++				dev_warn(dev, "chip left TX mode, reinitializing\n");
++				if (!mt5727_chip_init(mt))
++					(void)mt5727_set_tx_mode(mt, true);
++				mt->mode_errors = 0;
++			}
++		} else {
++			mt->mode_errors = 0;
++		}
++	}
++
++	/* 中断处理是主要路径，这里补取一次遗留事件 */
++	ret = mt5727_read_dword(mt, MT5727_REG_TX_IRQ, &intr);
++	if (!ret && intr)
++		mt5727_handle_irq(mt, intr);
++
++	if (!mt->tx_on)
++		goto out;
++
++	(void)mt5727_read_word(mt, MT5727_REG_TX_IIN, &mt->iin);
++	(void)mt5727_read_word(mt, MT5727_REG_TX_VIN, &mt->vin);
++	(void)mt5727_read_word(mt, MT5727_REG_TX_VRECT, &mt->vrect);
++	(void)mt5727_read_word(mt, MT5727_REG_TX_OP_FREQ, &mt->fop_period);
++
++	if (!mt->vin_reported) {
++		dev_info(dev, "transmitter VIN %u mV\n", mt->vin);
++		mt->vin_reported = true;
++	}
++
++	/* 接收端迟迟不响应时，复位重试一次，再失败就关掉发射 */
++	timeout = mt->retried ? MT5727_PING_RETRY_MS : MT5727_PING_TIMEOUT_MS;
++	if (!mt->rx_present &&
++	    time_after(jiffies, mt->start_jiffies + msecs_to_jiffies(timeout))) {
++		if (!mt->retried) {
++			dev_info(dev, "no receiver response, resetting transmitter\n");
++			if (!mt5727_chip_reset(mt) && !mt5727_chip_init(mt))
++				(void)mt5727_set_tx_mode(mt, true);
++			mt->retried = true;
++			mt->start_jiffies = jiffies;
++		} else {
++			dev_warn(dev, "no receiver response, stopping transmitter\n");
++			mt5727_stop_locked(mt);
++		}
++	}
++
++out:
++	if (mt->tx_on)
++		mod_delayed_work(system_dfl_wq, &mt->monitor_work,
++				 msecs_to_jiffies(MT5727_MONITOR_MS));
++	mutex_unlock(&mt->lock);
++}
++
++/*
++ * 附件吸附并启动发射后发出 uevent，由 udev 拉起蓝牙上电服务。键盘与
++ * 手写笔的数据通道都走 Bluetooth，供电开始后这条通道需要就绪。
++ */
++static void mt5727_notify_accessory(struct mt5727 *mt, enum mt5727_coil coil)
++{
++	char *envp[] = {
++		"MT5727_EVENT=accessory_present",
++		coil == MT5727_COIL_KEYBOARD ? "MT5727_COIL=keyboard"
++					     : "MT5727_COIL=pen",
++		NULL,
++	};
++
++	kobject_uevent_env(&mt->client->dev.kobj, KOBJ_CHANGE, envp);
++}
++
++static void mt5727_hall_work(struct work_struct *work)
++{
++	struct mt5727 *mt = container_of(work, struct mt5727, hall_work.work);
++	enum mt5727_coil coil = MT5727_COIL_KEYBOARD;
++	bool notify = false;
++	bool kb;
++	bool pen;
++
++	mutex_lock(&mt->lock);
++
++	if (!mt->auto_enabled)
++		goto out;
++
++	/* GPIO 读取失败返回负值，不能按“在位”处理 */
++	kb = mt->gpio_hall_kb &&
++	     gpiod_get_value_cansleep(mt->gpio_hall_kb) > 0;
++	pen = mt->gpio_hall_pen &&
++	      gpiod_get_value_cansleep(mt->gpio_hall_pen) > 0;
++
++	if (!kb && !pen) {
++		if (mt->tx_on)
++			mt5727_stop_locked(mt);
++		goto out;
++	}
++
++	/* 键盘是主要用途；笔优先会令常驻的笔让键盘永远等不到供电 */
++	coil = kb ? MT5727_COIL_KEYBOARD : MT5727_COIL_PEN;
++
++	if (!mt->tx_on || mt->coil != coil) {
++		int ret;
++
++		dev_info(&mt->client->dev, "%s hall active\n",
++			 kb ? "keyboard" : "pen");
++		ret = mt5727_start_locked(mt, coil);
++		if (ret)
++			dev_err(&mt->client->dev,
++				"cannot start transmitter: %d\n", ret);
++		else
++			notify = true;
++	}
++
++out:
++	mutex_unlock(&mt->lock);
++
++	if (notify)
++		mt5727_notify_accessory(mt, coil);
++}
++
++static ssize_t tx_enable_show(struct device *dev,
++			      struct device_attribute *attr, char *buf)
++{
++	struct mt5727 *mt = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%d\n", mt->tx_on);
++}
++
++static ssize_t tx_enable_store(struct device *dev,
++			       struct device_attribute *attr,
++			       const char *buf, size_t count)
++{
++	struct mt5727 *mt = dev_get_drvdata(dev);
++	bool enable;
++	int ret;
++
++	ret = kstrtobool(buf, &enable);
++	if (ret)
++		return ret;
++
++	mutex_lock(&mt->lock);
++	if (enable)
++		ret = mt5727_start_locked(mt, mt->coil);
++	else
++		mt5727_stop_locked(mt);
++	mutex_unlock(&mt->lock);
++
++	return ret ? ret : count;
++}
++static DEVICE_ATTR_RW(tx_enable);
++
++static ssize_t tx_coil_show(struct device *dev,
++			    struct device_attribute *attr, char *buf)
++{
++	struct mt5727 *mt = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%s\n",
++			  mt->coil == MT5727_COIL_PEN ? "pen" : "keyboard");
++}
++
++static ssize_t tx_coil_store(struct device *dev,
++			     struct device_attribute *attr,
++			     const char *buf, size_t count)
++{
++	struct mt5727 *mt = dev_get_drvdata(dev);
++	enum mt5727_coil coil;
++	int ret = 0;
++
++	if (sysfs_streq(buf, "pen"))
++		coil = MT5727_COIL_PEN;
++	else if (sysfs_streq(buf, "keyboard"))
++		coil = MT5727_COIL_KEYBOARD;
++	else
++		return -EINVAL;
++
++	mutex_lock(&mt->lock);
++	if (mt->tx_on && mt->coil != coil) {
++		mt5727_stop_locked(mt);
++		ret = mt5727_start_locked(mt, coil);
++	} else {
++		mt->coil = coil;
++	}
++	mutex_unlock(&mt->lock);
++
++	return ret ? ret : count;
++}
++static DEVICE_ATTR_RW(tx_coil);
++
++static ssize_t tx_auto_show(struct device *dev,
++			    struct device_attribute *attr, char *buf)
++{
++	struct mt5727 *mt = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%d\n", mt->auto_enabled);
++}
++
++static ssize_t tx_auto_store(struct device *dev,
++			     struct device_attribute *attr,
++			     const char *buf, size_t count)
++{
++	struct mt5727 *mt = dev_get_drvdata(dev);
++	bool enable;
++	int ret;
++
++	ret = kstrtobool(buf, &enable);
++	if (ret)
++		return ret;
++
++	mutex_lock(&mt->lock);
++	mt->auto_enabled = enable;
++	if (enable)
++		mod_delayed_work(system_dfl_wq, &mt->hall_work,
++				 msecs_to_jiffies(0));
++	mutex_unlock(&mt->lock);
++
++	return count;
++}
++static DEVICE_ATTR_RW(tx_auto);
++
++static ssize_t tx_status_show(struct device *dev,
++			      struct device_attribute *attr, char *buf)
++{
++	struct mt5727 *mt = dev_get_drvdata(dev);
++	int kb = 0;
++	int pen = 0;
++	int len = 0;
++
++	mutex_lock(&mt->lock);
++	if (mt->gpio_hall_kb)
++		kb = gpiod_get_value_cansleep(mt->gpio_hall_kb);
++	if (mt->gpio_hall_pen)
++		pen = gpiod_get_value_cansleep(mt->gpio_hall_pen);
++	len += sysfs_emit_at(buf, len, "powered: %d\n", mt->powered);
++	len += sysfs_emit_at(buf, len, "tx_on: %d\n", mt->tx_on);
++	len += sysfs_emit_at(buf, len, "hall_keyboard: %d\n", kb > 0);
++	len += sysfs_emit_at(buf, len, "hall_pen: %d\n", pen > 0);
++	len += sysfs_emit_at(buf, len, "coil: %s\n",
++			     mt->coil == MT5727_COIL_PEN ? "pen" : "keyboard");
++	len += sysfs_emit_at(buf, len, "auto: %d\n", mt->auto_enabled);
++	len += sysfs_emit_at(buf, len, "mode: 0x%02x\n", mt->mode);
++	len += sysfs_emit_at(buf, len, "rx_present: %d\n", mt->rx_present);
++	len += sysfs_emit_at(buf, len, "handshake: %d\n", mt->handshake_done);
++	len += sysfs_emit_at(buf, len, "chip_id: 0x%04x\n", mt->chip_id);
++	len += sysfs_emit_at(buf, len, "hw_id: 0x%04x\n", mt->hw_id);
++	len += sysfs_emit_at(buf, len, "fw_major: %u\n", mt->fw_major);
++	len += sysfs_emit_at(buf, len, "fw_minor: %u\n", mt->fw_minor);
++	len += sysfs_emit_at(buf, len, "vin_mv: %u\n", mt->vin);
++	len += sysfs_emit_at(buf, len, "iin_ma: %u\n", mt->iin);
++	len += sysfs_emit_at(buf, len, "vrect_mv: %u\n", mt->vrect);
++	len += sysfs_emit_at(buf, len, "fop_period: %u\n", mt->fop_period);
++	len += sysfs_emit_at(buf, len, "ept: 0x%08x\n", mt->ept);
++	mutex_unlock(&mt->lock);
++
++	return len;
++}
++static DEVICE_ATTR_RO(tx_status);
++
++static struct attribute *mt5727_attrs[] = {
++	&dev_attr_tx_enable.attr,
++	&dev_attr_tx_coil.attr,
++	&dev_attr_tx_auto.attr,
++	&dev_attr_tx_status.attr,
++	NULL,
++};
++
++static const struct attribute_group mt5727_group = {
++	.attrs = mt5727_attrs,
++};
++
++/*
++ * 读取可选的 u16 属性。属性缺省时保留调用方设置的默认值，出现越界值
++ * 直接终止 probe，避免截断后写入宽度不符的寄存器字段。
++ */
++static int mt5727_prop_u16(struct device *dev, const char *name,
++			   u16 *value, u32 min, u32 max)
++{
++	u32 val;
++	int ret;
++
++	ret = device_property_read_u32(dev, name, &val);
++	if (ret)
++		return 0;
++
++	if (val < min || val > max) {
++		dev_err(dev, "invalid %s: %u, expected %u..%u\n",
++			name, val, min, max);
++		return -EINVAL;
++	}
++
++	*value = val;
++	return 0;
++}
++
++static int mt5727_parse_dt(struct mt5727 *mt)
++{
++	struct device *dev = &mt->client->dev;
++	int ret;
++
++	mt->ping_freq_khz = MT5727_TX_PING_FREQ_KHZ;
++	ret = mt5727_prop_u16(dev, "mediatek,ping-freq-khz",
++			      &mt->ping_freq_khz, 100, 150);
++	if (ret)
++		return ret;
++
++	mt->ping_interval_ms = MT5727_TX_PING_INTERVAL_MS;
++	ret = mt5727_prop_u16(dev, "mediatek,ping-interval-ms",
++			      &mt->ping_interval_ms, 10, 1000);
++	if (ret)
++		return ret;
++
++	mt->ping_ocp_ma = MT5727_TX_PING_OCP_MA;
++	ret = mt5727_prop_u16(dev, "mediatek,ping-ocp-ma",
++			      &mt->ping_ocp_ma, 100, 3000);
++	if (ret)
++		return ret;
++
++	mt->min_fop_khz = MT5727_TX_MIN_FOP_KHZ;
++	ret = mt5727_prop_u16(dev, "mediatek,min-fop-khz",
++			      &mt->min_fop_khz, 113, 145);
++	if (ret)
++		return ret;
++
++	mt->max_fop_khz = MT5727_TX_MAX_FOP_KHZ;
++	ret = mt5727_prop_u16(dev, "mediatek,max-fop-khz",
++			      &mt->max_fop_khz, mt->min_fop_khz, 145);
++	if (ret)
++		return ret;
++
++	mt->fod_th = MT5727_TX_FOD_TH;
++	ret = mt5727_prop_u16(dev, "mediatek,fod-threshold",
++			      &mt->fod_th, 0, U16_MAX);
++	if (ret)
++		return ret;
++
++	mt->fod_cnt = MT5727_TX_FOD_CNT;
++	ret = mt5727_prop_u16(dev, "mediatek,fod-count",
++			      &mt->fod_cnt, 0, 100);
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++static int mt5727_request_gpios(struct mt5727 *mt)
++{
++	struct device *dev = &mt->client->dev;
++
++	mt->gpio_enable = devm_gpiod_get(dev, "enable", GPIOD_OUT_LOW);
++	if (IS_ERR(mt->gpio_enable))
++		return dev_err_probe(dev, PTR_ERR(mt->gpio_enable),
++				     "cannot get enable GPIO\n");
++
++	mt->gpio_boost = devm_gpiod_get(dev, "boost", GPIOD_OUT_LOW);
++	if (IS_ERR(mt->gpio_boost))
++		return dev_err_probe(dev, PTR_ERR(mt->gpio_boost),
++				     "cannot get boost GPIO\n");
++
++	mt->gpio_pen_en = devm_gpiod_get(dev, "pen-en", GPIOD_OUT_LOW);
++	if (IS_ERR(mt->gpio_pen_en))
++		return dev_err_probe(dev, PTR_ERR(mt->gpio_pen_en),
++				     "cannot get pen coil GPIO\n");
++
++	mt->gpio_kb_en = devm_gpiod_get(dev, "keyboard-en", GPIOD_OUT_LOW);
++	if (IS_ERR(mt->gpio_kb_en))
++		return dev_err_probe(dev, PTR_ERR(mt->gpio_kb_en),
++				     "cannot get keyboard coil GPIO\n");
++
++	mt->gpio_int = devm_gpiod_get(dev, "int", GPIOD_IN);
++	if (IS_ERR(mt->gpio_int))
++		return dev_err_probe(dev, PTR_ERR(mt->gpio_int),
++				     "cannot get interrupt GPIO\n");
++
++	mt->gpio_hall_kb = devm_gpiod_get_optional(dev, "keyboard-hall",
++						   GPIOD_IN);
++	if (IS_ERR(mt->gpio_hall_kb))
++		return dev_err_probe(dev, PTR_ERR(mt->gpio_hall_kb),
++				     "cannot get keyboard hall GPIO\n");
++
++	mt->gpio_hall_pen = devm_gpiod_get_optional(dev, "pen-hall", GPIOD_IN);
++	if (IS_ERR(mt->gpio_hall_pen))
++		return dev_err_probe(dev, PTR_ERR(mt->gpio_hall_pen),
++				     "cannot get pen hall GPIO\n");
++
++	return 0;
++}
++
++static irqreturn_t mt5727_hall_isr(int irq, void *data);
++
++static int mt5727_request_hall_irq(struct mt5727 *mt,
++				   struct gpio_desc *gpio, const char *name,
++				   int *irq_out)
++{
++	struct device *dev = &mt->client->dev;
++	int irq;
++	int ret;
++
++	if (!gpio)
++		return 0;
++
++	irq = gpiod_to_irq(gpio);
++	if (irq < 0)
++		return irq;
++
++	ret = devm_request_irq(dev, irq, mt5727_hall_isr,
++			       IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING,
++			       name, mt);
++	if (ret)
++		return dev_err_probe(dev, ret, "cannot request %s IRQ\n", name);
++
++	*irq_out = irq;
++	return 0;
++}
++
++static irqreturn_t mt5727_hall_isr(int irq, void *data)
++{
++	struct mt5727 *mt = data;
++
++	mod_delayed_work(system_dfl_wq, &mt->hall_work, msecs_to_jiffies(100));
++	return IRQ_HANDLED;
++}
++
++static int mt5727_probe(struct i2c_client *client)
++{
++	struct device *dev = &client->dev;
++	struct mt5727 *mt;
++	u16 hw_id;
++	int ret;
++
++	mt = devm_kzalloc(dev, sizeof(*mt), GFP_KERNEL);
++	if (!mt)
++		return -ENOMEM;
++
++	mt->client = client;
++	mt->coil = MT5727_COIL_KEYBOARD;
++	i2c_set_clientdata(client, mt);
++	mutex_init(&mt->lock);
++	INIT_WORK(&mt->irq_work, mt5727_irq_work);
++	INIT_DELAYED_WORK(&mt->hall_work, mt5727_hall_work);
++	INIT_DELAYED_WORK(&mt->monitor_work, mt5727_monitor_work);
++
++	ret = mt5727_parse_dt(mt);
++	if (ret)
++		return ret;
++
++	ret = mt5727_request_gpios(mt);
++	if (ret)
++		return ret;
++
++	/* 读一次硬件 ID 与芯片信息，确认总线和供电都通 */
++	ret = mt5727_power_on(mt);
++	if (ret)
++		return ret;
++
++	ret = mt5727_read_word(mt, MT5727_REG_HW_CHIP_ID, &hw_id);
++	if (!ret)
++		ret = mt5727_chip_info(mt);
++	mt5727_power_off(mt);
++
++	if (ret)
++		return dev_err_probe(dev, ret, "cannot talk to the chip\n");
++
++	if (hw_id != MT5727_HW_CHIP_ID && hw_id != MT5727_CHIP_ID)
++		return dev_err_probe(dev, -ENODEV,
++				     "unexpected chip ID 0x%04x\n", hw_id);
++
++	mt->hw_id = hw_id;
++
++	if (client->irq <= 0)
++		return dev_err_probe(dev, -EINVAL,
++				     "missing interrupt line\n");
++
++	mt->irq = client->irq;
++	ret = devm_request_irq(dev, mt->irq, mt5727_interrupt,
++			       IRQF_TRIGGER_FALLING | IRQF_NO_AUTOEN,
++			       "mt5727", mt);
++	if (ret)
++		return dev_err_probe(dev, ret, "cannot request IRQ\n");
++
++	ret = mt5727_request_hall_irq(mt, mt->gpio_hall_kb,
++				      "mt5727-keyboard-hall",
++				      &mt->hall_kb_irq);
++	if (ret)
++		return ret;
++	ret = mt5727_request_hall_irq(mt, mt->gpio_hall_pen,
++				      "mt5727-pen-hall",
++				      &mt->hall_pen_irq);
++	if (ret)
++		return ret;
++
++	mt->auto_enabled = mt->gpio_hall_kb || mt->gpio_hall_pen;
++
++	ret = devm_device_add_group(dev, &mt5727_group);
++	if (ret)
++		return ret;
++
++	dev_info(dev,
++		 "MT5727 ready, chip 0x%04x, fw %u.%u\n",
++		 mt->chip_id, mt->fw_major, mt->fw_minor);
++
++	if (mt->auto_enabled)
++		mod_delayed_work(system_dfl_wq, &mt->hall_work,
++				 msecs_to_jiffies(200));
++
++	return 0;
++}
++
++/*
++ * 先注销 sysfs 属性，再清除自动启动标志并停止发射，最后同步取消全部工作项。
++ *
++ * sysfs 属性必须在清理工作项之前移除：tx_auto_store() 取得锁后会重新置位
++ * auto_enabled 并调度 hall_work。kernfs 的移除操作会等待正在执行的访问结束，
++ * 并阻止后续访问，因此之后不会再有新的工作项被调度。
++ *
++ * 停发射时使用的 disable_irq_nosync 不会等待正在执行的中断处理，随后补一次
++ * disable_irq() 才能确认中断处理已经结束；否则 ISR 可能在取消 irq_work 之后
++ * 重新调度它。
++ *
++ * hall_work 必须在 monitor_work 之前取消：hall_work 可以在停止发射之后重新
++ * 调用 mt5727_start_locked()，从而再次调度 monitor_work。若先取消
++ * monitor_work，重新调度的工作项会在 remove 返回、devres 释放资源之后运行。
++ */
++static void mt5727_remove(struct i2c_client *client)
++{
++	struct device *dev = &client->dev;
++	struct mt5727 *mt = i2c_get_clientdata(client);
++
++	device_remove_group(dev, &mt5727_group);
++
++	mutex_lock(&mt->lock);
++	mt->auto_enabled = false;
++	mt5727_stop_locked(mt);
++	mutex_unlock(&mt->lock);
++
++	disable_irq(mt->irq);
++
++	if (mt->hall_kb_irq > 0)
++		disable_irq(mt->hall_kb_irq);
++	if (mt->hall_pen_irq > 0)
++		disable_irq(mt->hall_pen_irq);
++
++	cancel_work_sync(&mt->irq_work);
++	cancel_delayed_work_sync(&mt->hall_work);
++	cancel_delayed_work_sync(&mt->monitor_work);
++}
++
++static const struct of_device_id mt5727_of_match[] = {
++	{ .compatible = "mediatek,mt5727" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, mt5727_of_match);
++
++static struct i2c_driver mt5727_driver = {
++	.driver = {
++		.name = "mt5727",
++		.of_match_table = mt5727_of_match,
++	},
++	.probe = mt5727_probe,
++	.remove = mt5727_remove,
++};
++module_i2c_driver(mt5727_driver);
++
++MODULE_DESCRIPTION("MediaTek MT5727 wireless power transmitter");
++MODULE_LICENSE("GPL");
+--- /dev/null
++++ b/drivers/power/supply/pm8150b_battery.c
+@@ -0,0 +1,727 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Qualcomm PM8150B 电池与充电器驱动。
++ *
++ * PM8150B 内含 SMB5 充电器、FG gen4 电量计与 RRADC。下行内核把这三部分
++ * 拆成 qpnp-smb5、qpnp-fg-gen4 与 fg-core，依赖 battery profile 解析、
++ * SDAM 与 IMA 访问；主线没有对应框架。本驱动只实现设备当前需要的最小
++ * 集合：SMB5 的充电状态与输入检测、FG 的硬件单调 SOC、RRADC 的电池
++ * 温度，以及 VADC 的电池电压。容量优先使用 FG 的单调 SOC，FG 未运行
++ * 时退回开路电压查表。
++ */
++
++#include <linux/bitops.h>
++#include <linux/bits.h>
++#include <linux/delay.h>
++#include <linux/iio/consumer.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/power_supply.h>
++#include <linux/regmap.h>
++#include <linux/slab.h>
++
++/* SMB5 子外设基址 */
++#define SMB5_CHGR_BASE		0x1000
++#define SMB5_DCDC_BASE		0x1100
++#define SMB5_USBIN_BASE		0x1300
++#define SMB5_DCIN_BASE		0x1400
++
++#define CHGR_STATUS_1		(SMB5_CHGR_BASE + 0x06)
++#define CHGR_STATUS_7		(SMB5_CHGR_BASE + 0x0d)
++#define CHGR_ENABLE_CMD		(SMB5_CHGR_BASE + 0x42)
++#define DCDC_POWER_PATH		(SMB5_DCDC_BASE + 0x0b)
++#define USBIN_INT_RT_STS	(SMB5_USBIN_BASE + 0x10)
++#define DCIN_INT_RT_STS		(SMB5_DCIN_BASE + 0x10)
++
++#define CHGR_STATUS_MASK	GENMASK(2, 0)
++#define CHGR_INHIBIT_CHARGE	0
++#define CHGR_PRE_CHARGE		2
++#define CHGR_FULLON_CHARGE	3
++#define CHGR_TAPER_CHARGE	4
++#define CHGR_TERMINATE_CHARGE	5
++#define CHGR_PAUSE_CHARGE	6
++#define CHGR_DISABLE_CHARGE	7
++
++#define USBIN_PLUGIN_BIT	BIT(4)
++#define DCIN_PLUGIN_BIT		BIT(4)
++#define USE_USBIN_BIT		BIT(4)
++#define USE_DCIN_BIT		BIT(3)
++#define CHG_ENABLE_BIT		BIT(0)
++
++#define BAT_TEMP_TOO_HOT_BIT	BIT(3)
++#define BAT_TEMP_TOO_COLD_BIT	BIT(2)
++
++/* FG gen4 子外设基址 */
++#define FG_SOC_BASE		0x4000
++#define FG_INFO_BASE		0x4100
++#define FG_RRADC_BASE		0x4200
++
++#define FG_SOC_INT_RT_STS	(FG_SOC_BASE + 0x10)
++#define FG_SOC_EN_CTL		(FG_SOC_BASE + 0x46)
++#define FG_SOC_MONOTONIC_LO	(FG_SOC_BASE + 0x09)
++#define FG_SOC_MONOTONIC_HI	(FG_SOC_BASE + 0x0a)
++#define FG_SOC_READY_BIT	BIT(1)
++#define FG_ALG_EN_BIT		BIT(7)
++
++#define FG_INFO_VBAT_LSB	(FG_INFO_BASE + 0xa0)
++#define FG_INFO_VBAT_MSB	(FG_INFO_BASE + 0xa1)
++#define FG_INFO_IBAT_LSB	(FG_INFO_BASE + 0xa2)
++#define FG_INFO_IBAT_MSB	(FG_INFO_BASE + 0xa3)
++#define FG_INFO_VBAT_CP_LSB	(FG_INFO_BASE + 0xa6)
++#define FG_INFO_VBAT_CP_MSB	(FG_INFO_BASE + 0xa7)
++#define FG_INFO_IBAT_CP_LSB	(FG_INFO_BASE + 0xa8)
++#define FG_INFO_IBAT_CP_MSB	(FG_INFO_BASE + 0xa9)
++
++/* 直接寄存器的换算系数与 FG 解码公式一致 */
++#define FG_VBAT_NUMR		122070
++#define FG_IBAT_NUMR		488281
++
++#define FG_RRADC_INT_RT_STS	(FG_RRADC_BASE + 0x10)
++#define RRADC_BATT_MISSING_BIT	BIT(0)
++
++/* FG gen4 的 IMA SRAM 访问寄存器 */
++#define FG_MEM_IF_BASE		0x4300
++#define FG_MEM_INTF_CFG		(FG_MEM_IF_BASE + 0x50)
++#define FG_MEM_ACCESS_REQ	BIT(7)
++#define FG_MEM_IACS_SLCT	BIT(5)
++#define FG_IMA_CTL		(FG_MEM_IF_BASE + 0x51)
++#define FG_IMA_CTL_MASK		GENMASK(7, 6)
++#define FG_IMA_OPR_STS		(FG_MEM_IF_BASE + 0x54)
++#define FG_IMA_IACS_RDY		BIT(1)
++#define FG_IMA_EXP_STS		(FG_MEM_IF_BASE + 0x55)
++#define FG_IMA_ADDR_LSB		(FG_MEM_IF_BASE + 0x61)
++#define FG_IMA_ADDR_MSB		(FG_MEM_IF_BASE + 0x62)
++#define FG_IMA_RD_DATA0		(FG_MEM_IF_BASE + 0x67)
++#define FG_IMA_RD_DATA1		(FG_MEM_IF_BASE + 0x68)
++
++/* FG SRAM 字地址 */
++#define FG_SRAM_BATT_TEMP	328
++
++#define FG_SOC_RAW_MAX		255
++
++/* 电池规格来自 vendor 设备树的 DesayAtl_7150mAH 描述 */
++#define BATT_NOMINAL_MV		3870
++#define BATT_MAX_MV		4400
++#define BATT_MIN_MV		3400
++#define BATT_CHARGE_FULL_UAH	7150000
++
++struct pm8150b_battery {
++	struct device *dev;
++	struct regmap *regmap;
++	struct iio_channel *vbat_chan;
++	struct power_supply *battery_psy;
++	struct power_supply *usb_psy;
++	struct mutex ima_lock;
++};
++
++/*
++ * 开路电压与荷电量的对应表，用于 FG 未运行时估算容量。
++ * 数据取 4.4 V 满压三元锂电池的典型静置曲线，精度只够支撑
++ * 桌面显示与低电量提醒。
++ */
++static const struct {
++	int voltage_uv;
++	int capacity;
++} pm8150b_voltage_curve[] = {
++	{ 4400000, 100 },
++	{ 4300000, 97 },
++	{ 4200000, 93 },
++	{ 4100000, 87 },
++	{ 4000000, 80 },
++	{ 3900000, 70 },
++	{ 3830000, 60 },
++	{ 3760000, 50 },
++	{ 3690000, 40 },
++	{ 3610000, 29 },
++	{ 3530000, 18 },
++	{ 3450000, 9 },
++	{ 3400000, 3 },
++	{ 3300000, 0 },
++};
++
++static int pm8150b_read(struct pm8150b_battery *batt, u32 reg, unsigned int *val)
++{
++	return regmap_read(batt->regmap, reg, val);
++}
++
++static int pm8150b_ima_wait_ready(struct pm8150b_battery *batt)
++{
++	unsigned int val;
++	int i, ret;
++
++	for (i = 0; i < 50; i++) {
++		ret = pm8150b_read(batt, FG_IMA_OPR_STS, &val);
++		if (ret)
++			return ret;
++		if (val & FG_IMA_IACS_RDY)
++			return 0;
++		usleep_range(3000, 3500);
++	}
++
++	return -ETIMEDOUT;
++}
++
++/*
++ * 读取 FG SRAM 的一个 16 位字。IMA 访问需要先申请总线，再设置地址，
++ * 等待硬件就绪后读取两个数据字节。整个过程用 ima_lock 串行化，避免
++ * 与控制算法或其他属性读取互相打断。
++ */
++static int pm8150b_ima_read_word(struct pm8150b_battery *batt, u16 word,
++				 u16 *value)
++{
++	unsigned int val, lo, hi;
++	int i, ret;
++
++	mutex_lock(&batt->ima_lock);
++
++	for (i = 0; i < 8; i++) {
++		ret = pm8150b_read(batt, FG_MEM_INTF_CFG, &val);
++		if (ret)
++			goto out;
++		if (!(val & FG_MEM_ACCESS_REQ))
++			break;
++		usleep_range(2000, 2500);
++	}
++	if (i == 8) {
++		ret = -EBUSY;
++		goto out;
++	}
++
++	ret = regmap_write(batt->regmap, FG_MEM_INTF_CFG,
++			   FG_MEM_ACCESS_REQ | FG_MEM_IACS_SLCT);
++	if (ret)
++		goto out;
++
++	ret = regmap_update_bits(batt->regmap, FG_IMA_CTL, FG_IMA_CTL_MASK, 0);
++	if (ret)
++		goto release;
++
++	ret = pm8150b_ima_wait_ready(batt);
++	if (ret)
++		goto release;
++
++	ret = regmap_write(batt->regmap, FG_IMA_ADDR_LSB, word & 0xff);
++	if (ret)
++		goto release;
++	ret = regmap_write(batt->regmap, FG_IMA_ADDR_MSB, word >> 8);
++	if (ret)
++		goto release;
++
++	ret = pm8150b_ima_wait_ready(batt);
++	if (ret)
++		goto release;
++
++	ret = pm8150b_read(batt, FG_IMA_RD_DATA0, &lo);
++	if (ret)
++		goto release;
++	ret = pm8150b_read(batt, FG_IMA_RD_DATA1, &hi);
++	if (ret)
++		goto release;
++
++	ret = pm8150b_read(batt, FG_IMA_EXP_STS, &val);
++	if (ret)
++		goto release;
++	if (val) {
++		dev_warn_ratelimited(batt->dev, "IMA read error: 0x%02x\n", val);
++		ret = -EIO;
++		goto release;
++	}
++
++	*value = lo | (hi << 8);
++	ret = 0;
++
++release:
++	regmap_write(batt->regmap, FG_MEM_INTF_CFG, 0);
++out:
++	mutex_unlock(&batt->ima_lock);
++	return ret;
++}
++
++/*
++ * FG 的电压与电流寄存器各有一份影子副本，两份读数一致才说明
++ * 硬件完成了本次更新。
++ */
++static int pm8150b_read_shadowed_u16(struct pm8150b_battery *batt,
++				     u32 lsb_reg, u32 msb_reg,
++				     u32 cp_lsb_reg, u32 cp_msb_reg,
++				     u16 *value)
++{
++	unsigned int lsb, msb, cp_lsb, cp_msb;
++	int i, ret;
++
++	for (i = 0; i < 3; i++) {
++		ret = pm8150b_read(batt, lsb_reg, &lsb);
++		if (ret)
++			return ret;
++		ret = pm8150b_read(batt, msb_reg, &msb);
++		if (ret)
++			return ret;
++		ret = pm8150b_read(batt, cp_lsb_reg, &cp_lsb);
++		if (ret)
++			return ret;
++		ret = pm8150b_read(batt, cp_msb_reg, &cp_msb);
++		if (ret)
++			return ret;
++
++		if (lsb == cp_lsb && msb == cp_msb) {
++			*value = (msb << 8) | lsb;
++			return 0;
++		}
++	}
++
++	return -EIO;
++}
++
++static int pm8150b_read_voltage_uv(struct pm8150b_battery *batt, int *voltage_uv)
++{
++	u16 raw;
++	int ret, val;
++
++	ret = pm8150b_read_shadowed_u16(batt, FG_INFO_VBAT_LSB,
++					FG_INFO_VBAT_MSB, FG_INFO_VBAT_CP_LSB,
++					FG_INFO_VBAT_CP_MSB, &raw);
++	if (!ret) {
++		*voltage_uv = div_u64((u64)raw * FG_VBAT_NUMR, 1000);
++		return 0;
++	}
++
++	ret = iio_read_channel_processed(batt->vbat_chan, &val);
++	if (ret < 0)
++		return ret;
++
++	*voltage_uv = val;
++	return 0;
++}
++
++static int pm8150b_read_current_ua(struct pm8150b_battery *batt, int *current_ua)
++{
++	u16 raw;
++	int ret;
++
++	ret = pm8150b_read_shadowed_u16(batt, FG_INFO_IBAT_LSB,
++					FG_INFO_IBAT_MSB, FG_INFO_IBAT_CP_LSB,
++					FG_INFO_IBAT_CP_MSB, &raw);
++	if (ret)
++		return ret;
++
++	*current_ua = div_s64((s64)(s16)raw * FG_IBAT_NUMR, 1000);
++	return 0;
++}
++
++static int pm8150b_voltage_to_capacity(int voltage_uv)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(pm8150b_voltage_curve); i++) {
++		if (voltage_uv >= pm8150b_voltage_curve[i].voltage_uv)
++			return pm8150b_voltage_curve[i].capacity;
++	}
++
++	return 0;
++}
++
++/*
++ * FG 的单调 SOC 保存在两个影子寄存器中，读到不一致时说明硬件
++ * 正在更新，需要重试。SOC_READY 与算法使能位共同决定该值是否可用。
++ */
++static int pm8150b_read_fg_soc(struct pm8150b_battery *batt, int *soc)
++{
++	unsigned int int_sts, en_ctl;
++	unsigned int lo, hi;
++	int i, ret;
++
++	ret = pm8150b_read(batt, FG_SOC_INT_RT_STS, &int_sts);
++	if (ret)
++		return ret;
++
++	ret = pm8150b_read(batt, FG_SOC_EN_CTL, &en_ctl);
++	if (ret)
++		return ret;
++
++	if (!(int_sts & FG_SOC_READY_BIT) && !(en_ctl & FG_ALG_EN_BIT))
++		return -ENODATA;
++
++	for (i = 0; i < 3; i++) {
++		ret = pm8150b_read(batt, FG_SOC_MONOTONIC_LO, &lo);
++		if (ret)
++			return ret;
++		ret = pm8150b_read(batt, FG_SOC_MONOTONIC_HI, &hi);
++		if (ret)
++			return ret;
++
++		if (lo == hi) {
++			*soc = DIV_ROUND_CLOSEST(lo * 100, FG_SOC_RAW_MAX);
++			return 0;
++		}
++	}
++
++	return -EIO;
++}
++
++static int pm8150b_read_capacity(struct pm8150b_battery *batt, int *capacity)
++{
++	int voltage_uv;
++	int soc;
++	int ret;
++
++	ret = pm8150b_read_fg_soc(batt, &soc);
++	if (!ret) {
++		*capacity = clamp(soc, 0, 100);
++		return 0;
++	}
++
++	ret = pm8150b_read_voltage_uv(batt, &voltage_uv);
++	if (ret)
++		return ret;
++
++	*capacity = pm8150b_voltage_to_capacity(voltage_uv);
++	return 0;
++}
++
++/*
++ * 电池温度只保存在 FG SRAM 的 BATT_TEMP 字中：10 位有符号数，
++ * 每个 LSB 代表 0.25 摄氏度。
++ */
++static int pm8150b_read_temperature(struct pm8150b_battery *batt, int *temp)
++{
++	u16 raw;
++	int ret;
++
++	ret = pm8150b_ima_read_word(batt, FG_SRAM_BATT_TEMP, &raw);
++	if (ret)
++		return ret;
++
++	*temp = sign_extend32(raw, 9) * 100 / 40;
++	return 0;
++}
++
++static int pm8150b_input_present(struct pm8150b_battery *batt, bool *present)
++{
++	unsigned int usbin, dcin, path;
++	int ret;
++
++	ret = pm8150b_read(batt, USBIN_INT_RT_STS, &usbin);
++	if (ret)
++		return ret;
++	ret = pm8150b_read(batt, DCIN_INT_RT_STS, &dcin);
++	if (ret)
++		return ret;
++	ret = pm8150b_read(batt, DCDC_POWER_PATH, &path);
++	if (ret)
++		return ret;
++
++	*present = (usbin & USBIN_PLUGIN_BIT) || (dcin & DCIN_PLUGIN_BIT) ||
++		   (path & (USE_USBIN_BIT | USE_DCIN_BIT));
++	return 0;
++}
++
++static int pm8150b_get_status(struct pm8150b_battery *batt)
++{
++	unsigned int chgr_status, chgr_enable;
++	int capacity;
++	bool input;
++	int ret;
++
++	ret = pm8150b_input_present(batt, &input);
++	if (ret)
++		return POWER_SUPPLY_STATUS_UNKNOWN;
++
++	ret = pm8150b_read(batt, CHGR_STATUS_1, &chgr_status);
++	if (ret)
++		return POWER_SUPPLY_STATUS_UNKNOWN;
++
++	ret = pm8150b_read(batt, CHGR_ENABLE_CMD, &chgr_enable);
++	if (ret)
++		return POWER_SUPPLY_STATUS_UNKNOWN;
++
++	if (!input)
++		return POWER_SUPPLY_STATUS_DISCHARGING;
++
++	if (!(chgr_enable & CHG_ENABLE_BIT))
++		return POWER_SUPPLY_STATUS_NOT_CHARGING;
++
++	switch (chgr_status & CHGR_STATUS_MASK) {
++	case CHGR_PRE_CHARGE:
++	case CHGR_FULLON_CHARGE:
++	case CHGR_TAPER_CHARGE:
++		return POWER_SUPPLY_STATUS_CHARGING;
++	case CHGR_INHIBIT_CHARGE:
++	case CHGR_TERMINATE_CHARGE:
++	case CHGR_PAUSE_CHARGE:
++	case CHGR_DISABLE_CHARGE:
++		/* 容量读取失败时无法区分满电，按未充电处理 */
++		if (pm8150b_read_capacity(batt, &capacity))
++			return POWER_SUPPLY_STATUS_NOT_CHARGING;
++		return capacity >= 99 ? POWER_SUPPLY_STATUS_FULL :
++					POWER_SUPPLY_STATUS_NOT_CHARGING;
++	default:
++		return POWER_SUPPLY_STATUS_NOT_CHARGING;
++	}
++}
++
++static int pm8150b_get_health(struct pm8150b_battery *batt)
++{
++	unsigned int status7;
++	int temp, ret;
++
++	ret = pm8150b_read_temperature(batt, &temp);
++	if (!ret) {
++		if (temp >= 600)
++			return POWER_SUPPLY_HEALTH_OVERHEAT;
++		if (temp <= -50)
++			return POWER_SUPPLY_HEALTH_COLD;
++		if (temp >= 450)
++			return POWER_SUPPLY_HEALTH_WARM;
++		if (temp <= 100)
++			return POWER_SUPPLY_HEALTH_COOL;
++	}
++
++	ret = pm8150b_read(batt, CHGR_STATUS_7, &status7);
++	if (ret)
++		return POWER_SUPPLY_HEALTH_UNKNOWN;
++
++	if (status7 & BAT_TEMP_TOO_HOT_BIT)
++		return POWER_SUPPLY_HEALTH_OVERHEAT;
++	if (status7 & BAT_TEMP_TOO_COLD_BIT)
++		return POWER_SUPPLY_HEALTH_COLD;
++
++	return POWER_SUPPLY_HEALTH_GOOD;
++}
++
++static int pm8150b_get_capacity_level(struct pm8150b_battery *batt, int capacity)
++{
++	if (capacity >= 95)
++		return POWER_SUPPLY_CAPACITY_LEVEL_FULL;
++	if (capacity >= 70)
++		return POWER_SUPPLY_CAPACITY_LEVEL_HIGH;
++	if (capacity >= 40)
++		return POWER_SUPPLY_CAPACITY_LEVEL_NORMAL;
++	if (capacity >= 15)
++		return POWER_SUPPLY_CAPACITY_LEVEL_LOW;
++	return POWER_SUPPLY_CAPACITY_LEVEL_CRITICAL;
++}
++
++static int pm8150b_battery_get_property(struct power_supply *psy,
++					enum power_supply_property psp,
++					union power_supply_propval *val)
++{
++	struct pm8150b_battery *batt = power_supply_get_drvdata(psy);
++	unsigned int reg;
++	int capacity, voltage_uv, current_ua, temp;
++	int ret;
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_STATUS:
++		val->intval = pm8150b_get_status(batt);
++		return 0;
++	case POWER_SUPPLY_PROP_PRESENT:
++		ret = pm8150b_read(batt, FG_RRADC_INT_RT_STS, &reg);
++		if (ret)
++			return ret;
++		val->intval = !(reg & RRADC_BATT_MISSING_BIT);
++		return 0;
++	case POWER_SUPPLY_PROP_TECHNOLOGY:
++		val->intval = POWER_SUPPLY_TECHNOLOGY_LION;
++		return 0;
++	case POWER_SUPPLY_PROP_CAPACITY:
++		ret = pm8150b_read_capacity(batt, &capacity);
++		if (ret)
++			return ret;
++		val->intval = capacity;
++		return 0;
++	case POWER_SUPPLY_PROP_CAPACITY_LEVEL:
++		ret = pm8150b_read_capacity(batt, &capacity);
++		if (ret)
++			return ret;
++		val->intval = pm8150b_get_capacity_level(batt, capacity);
++		return 0;
++	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
++		ret = pm8150b_read_voltage_uv(batt, &voltage_uv);
++		if (ret)
++			return ret;
++		val->intval = voltage_uv;
++		return 0;
++	case POWER_SUPPLY_PROP_CURRENT_NOW:
++		ret = pm8150b_read_current_ua(batt, &current_ua);
++		if (ret)
++			return ret;
++		val->intval = current_ua;
++		return 0;
++	case POWER_SUPPLY_PROP_POWER_NOW:
++		ret = pm8150b_read_current_ua(batt, &current_ua);
++		if (ret)
++			return ret;
++		ret = pm8150b_read_voltage_uv(batt, &voltage_uv);
++		if (ret)
++			return ret;
++		val->intval = div_s64((s64)current_ua * voltage_uv, 1000000);
++		return 0;
++	case POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN:
++		val->intval = BATT_MIN_MV * 1000;
++		return 0;
++	case POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN:
++		val->intval = BATT_MAX_MV * 1000;
++		return 0;
++	case POWER_SUPPLY_PROP_TEMP:
++		ret = pm8150b_read_temperature(batt, &temp);
++		if (ret)
++			return ret;
++		val->intval = temp;
++		return 0;
++	case POWER_SUPPLY_PROP_HEALTH:
++		val->intval = pm8150b_get_health(batt);
++		return 0;
++	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
++		val->intval = BATT_CHARGE_FULL_UAH;
++		return 0;
++	case POWER_SUPPLY_PROP_CHARGE_FULL:
++		val->intval = BATT_CHARGE_FULL_UAH;
++		return 0;
++	case POWER_SUPPLY_PROP_CHARGE_NOW:
++		ret = pm8150b_read_capacity(batt, &capacity);
++		if (ret)
++			return ret;
++		val->intval = DIV_ROUND_CLOSEST(BATT_CHARGE_FULL_UAH * capacity,
++						100);
++		return 0;
++	case POWER_SUPPLY_PROP_ENERGY_FULL_DESIGN:
++	case POWER_SUPPLY_PROP_ENERGY_FULL:
++		val->intval = DIV_ROUND_CLOSEST_ULL((u64)BATT_CHARGE_FULL_UAH *
++						    BATT_NOMINAL_MV, 1000);
++		return 0;
++	case POWER_SUPPLY_PROP_ENERGY_NOW:
++		ret = pm8150b_read_capacity(batt, &capacity);
++		if (ret)
++			return ret;
++		val->intval = DIV_ROUND_CLOSEST_ULL((u64)BATT_CHARGE_FULL_UAH *
++						    BATT_NOMINAL_MV * capacity,
++						    100000);
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++static int pm8150b_usb_get_property(struct power_supply *psy,
++				    enum power_supply_property psp,
++				    union power_supply_propval *val)
++{
++	struct pm8150b_battery *batt = power_supply_get_drvdata(psy);
++	bool input;
++	int ret;
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_ONLINE:
++	case POWER_SUPPLY_PROP_PRESENT:
++		ret = pm8150b_input_present(batt, &input);
++		if (ret)
++			return ret;
++		val->intval = input;
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++static enum power_supply_property pm8150b_battery_props[] = {
++	POWER_SUPPLY_PROP_STATUS,
++	POWER_SUPPLY_PROP_PRESENT,
++	POWER_SUPPLY_PROP_TECHNOLOGY,
++	POWER_SUPPLY_PROP_CAPACITY,
++	POWER_SUPPLY_PROP_CAPACITY_LEVEL,
++	POWER_SUPPLY_PROP_VOLTAGE_NOW,
++	POWER_SUPPLY_PROP_CURRENT_NOW,
++	POWER_SUPPLY_PROP_POWER_NOW,
++	POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN,
++	POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN,
++	POWER_SUPPLY_PROP_TEMP,
++	POWER_SUPPLY_PROP_HEALTH,
++	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
++	POWER_SUPPLY_PROP_CHARGE_FULL,
++	POWER_SUPPLY_PROP_CHARGE_NOW,
++	POWER_SUPPLY_PROP_ENERGY_FULL_DESIGN,
++	POWER_SUPPLY_PROP_ENERGY_FULL,
++	POWER_SUPPLY_PROP_ENERGY_NOW,
++};
++
++static enum power_supply_property pm8150b_usb_props[] = {
++	POWER_SUPPLY_PROP_ONLINE,
++	POWER_SUPPLY_PROP_PRESENT,
++};
++
++static const struct power_supply_desc pm8150b_battery_desc = {
++	.name			= "battery",
++	.type			= POWER_SUPPLY_TYPE_BATTERY,
++	.properties		= pm8150b_battery_props,
++	.num_properties		= ARRAY_SIZE(pm8150b_battery_props),
++	.get_property		= pm8150b_battery_get_property,
++};
++
++static const struct power_supply_desc pm8150b_usb_desc = {
++	.name			= "usb",
++	.type			= POWER_SUPPLY_TYPE_USB,
++	.properties		= pm8150b_usb_props,
++	.num_properties		= ARRAY_SIZE(pm8150b_usb_props),
++	.get_property		= pm8150b_usb_get_property,
++};
++
++static int pm8150b_battery_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct power_supply_config psy_cfg = { };
++	struct pm8150b_battery *batt;
++
++	batt = devm_kzalloc(dev, sizeof(*batt), GFP_KERNEL);
++	if (!batt)
++		return -ENOMEM;
++
++	batt->dev = dev;
++	mutex_init(&batt->ima_lock);
++	batt->regmap = dev_get_regmap(dev->parent, NULL);
++	if (!batt->regmap)
++		return dev_err_probe(dev, -ENODEV, "parent device has no regmap\n");
++
++	batt->vbat_chan = devm_iio_channel_get(dev, "vbat");
++	if (IS_ERR(batt->vbat_chan))
++		return dev_err_probe(dev, PTR_ERR(batt->vbat_chan),
++				     "cannot get vbat channel\n");
++
++	psy_cfg.drv_data = batt;
++	psy_cfg.fwnode = dev_fwnode(dev);
++
++	batt->battery_psy = devm_power_supply_register(dev, &pm8150b_battery_desc,
++						       &psy_cfg);
++	if (IS_ERR(batt->battery_psy))
++		return dev_err_probe(dev, PTR_ERR(batt->battery_psy),
++				     "failed to register battery power_supply\n");
++
++	batt->usb_psy = devm_power_supply_register(dev, &pm8150b_usb_desc,
++						   &psy_cfg);
++	if (IS_ERR(batt->usb_psy))
++		return dev_err_probe(dev, PTR_ERR(batt->usb_psy),
++				     "failed to register USB power_supply\n");
++
++	platform_set_drvdata(pdev, batt);
++	dev_info(dev, "PM8150B battery and charger registered\n");
++	return 0;
++}
++
++static const struct of_device_id pm8150b_battery_of_match[] = {
++	{ .compatible = "qcom,pm8150b-battery" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, pm8150b_battery_of_match);
++
++static struct platform_driver pm8150b_battery_driver = {
++	.probe = pm8150b_battery_probe,
++	.driver = {
++		.name = "pm8150b-battery",
++		.of_match_table = pm8150b_battery_of_match,
++	},
++};
++module_platform_driver(pm8150b_battery_driver);
++
++MODULE_DESCRIPTION("Qualcomm PM8150B battery and charger driver");
++MODULE_LICENSE("GPL");
