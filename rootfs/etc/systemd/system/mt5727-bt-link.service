@@ -1,0 +1,12 @@
+[Unit]
+Description=Power on Bluetooth for a magnetic accessory
+Documentation=file:///usr/local/libexec/mt5727-bt-link.sh
+Wants=bluetooth.service qca-bt-rebind.service
+After=bluetooth.service qca-bt-rebind.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/mt5727-bt-link.sh
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,2 @@
+# MT5727 检测到键盘或手写笔吸附并开始供电后，触发蓝牙上电服务
+ACTION=="change", SUBSYSTEM=="i2c", KERNEL=="3-002b", ENV{MT5727_EVENT}=="accessory_present", TAG+="systemd", ENV{SYSTEMD_WANTS}+="mt5727-bt-link.service"

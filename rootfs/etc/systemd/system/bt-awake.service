@@ -1,0 +1,14 @@
+[Unit]
+Description=Keep Bluetooth awake while a pen or keyboard is connected
+Documentation=file:///usr/local/libexec/bt-awake.py
+Wants=bluetooth.service
+After=bluetooth.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/libexec/bt-awake.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
