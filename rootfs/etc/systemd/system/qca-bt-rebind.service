@@ -1,0 +1,14 @@
+[Unit]
+Description=Rebind QCA6390 Bluetooth UART after the root filesystem is mounted
+After=local-fs.target
+ConditionPathExists=/sys/bus/serial/devices/serial0-0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# hci_qca 在根文件系统挂载前 probe，固件读取失败。根文件系统就绪后重绑
+# serial0-0，固件即可从 /lib/firmware 正常加载。
+ExecStart=/bin/sh -c 'echo serial0-0 > /sys/bus/serial/drivers/hci_uart_qca/unbind || true; sleep 1; echo serial0-0 > /sys/bus/serial/drivers/hci_uart_qca/bind'
+
+[Install]
+WantedBy=multi-user.target
