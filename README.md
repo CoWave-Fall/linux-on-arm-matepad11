@@ -15,6 +15,7 @@ U-Boot 写入 `recovery` 分区，Linux 从 microSD 启动，HarmonyOS
 | 触摸 | 可用 | 五点坐标、双指、手掌抑制、开关屏恢复 |
 | 背光 | 可用 | RT8555，10 位亮度 |
 | 电池与充电 | 可用 | PM8150B，容量、电压、电流、温度 |
+| WiFi | 可用 | QCA6391，ath11k，NetworkManager |
 
 ## 构建与安装
 

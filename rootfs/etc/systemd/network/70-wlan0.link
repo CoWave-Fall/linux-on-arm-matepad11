@@ -1,0 +1,8 @@
+# 将 ath11k 的无线接口固定命名为 wlan0。
+# 用 Type=wlan 匹配 DEVTYPE，避免依赖 PCI 路径；本机只有一个无线接口。
+[Match]
+Type=wlan
+Driver=ath11k_pci
+
+[Link]
+Name=wlan0
