@@ -1,0 +1,16 @@
+[Unit]
+Description=DBY-W09 SLPI (sensor DSP) firmware load
+# 固件放在 SD 卡根文件系统，内核在挂载根之前就会 probe，首次加载必然失败，
+# 因此在根文件系统就绪后重新绑定一次。
+After=local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'echo 5c00000.remoteproc > /sys/bus/platform/drivers/qcom_q6v5_pas/unbind'
+ExecStart=/bin/sh -c 'echo 5c00000.remoteproc > /sys/bus/platform/drivers/qcom_q6v5_pas/bind'
+ExecStartPost=/bin/sh -c 'for i in $(seq 1 20); do [ -e /dev/fastrpc-sdsp ] && exit 0; sleep 1; done; exit 1'
+
+[Install]
+WantedBy=multi-user.target

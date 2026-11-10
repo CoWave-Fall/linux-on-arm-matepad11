@@ -1,0 +1,179 @@
+From: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
+Subject: [PATCH] dby-w09: map the ODM sensor config and socinfo
+
+Map /odm/etc/sensors/config for the DBY-W09 and answer socinfo requests
+from /sys/devices/soc0 with a fallback to the firmware file tree.
+
+Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
+
+diff --git a/hexagonrpcd/rpcd.c b/hexagonrpcd/rpcd.c
+index 672c353..fa151fe 100644
+--- a/hexagonrpcd/rpcd.c
++++ b/hexagonrpcd/rpcd.c
+@@ -211,7 +211,7 @@ static void *start_reverse_tunnel(int fd, const char *device_dir, const char *ds
+ 	// Dynamic interfaces with no hardcoded handle
+ 	ifaces[1] = fastrpc_apps_std_init(root_dir);
+ 	ifaces[2] = fastrpc_apps_mem_init(fd);
+-	ifaces[3] = fastrpc_sns_registry_init();
++	ifaces[3] = fastrpc_sns_registry_init(device_dir);
+ 
+ 	ret = register_fastrpc_listener(fd);
+ 	if (ret)
+diff --git a/hexagonrpcd/rpcd_builder.c b/hexagonrpcd/rpcd_builder.c
+index 58a4fad..2c66fe3 100644
+--- a/hexagonrpcd/rpcd_builder.c
++++ b/hexagonrpcd/rpcd_builder.c
+@@ -166,7 +166,7 @@ struct hexagonfs_dirent *construct_root_dir(const char *prefix, const char *dsp)
+ {
+ 	char *acdbdata, *dsp_libs, *sns_cfg, *sns_reg, *sns_reg_config, *socinfo;
+ 	size_t n_prefix;
+-	struct hexagonfs_dirent *persist_dir, *vendor_dir;
++	struct hexagonfs_dirent *persist_dir, *vendor_dir, *odm_dir;
+ 
+ 	n_prefix = strlen(prefix);
+ 
+@@ -229,7 +229,19 @@ struct hexagonfs_dirent *construct_root_dir(const char *prefix, const char *dsp)
+ 				)
+ 			);
+ 
+-	return hfs_mkdir("/", 6,
++	/*
++	 * 本机 PD 还会按 /odm/etc/sensors/config 查配置目录，
++	 * 上游只映射了 /vendor 与 /system/vendor，这里补上 odm。
++	 */
++	odm_dir = hfs_mkdir("odm", 1,
++				hfs_mkdir("etc", 1,
++					hfs_mkdir("sensors", 1,
++						hfs_map_or_empty("config", sns_cfg)
++					)
++				)
++		  );
++
++	return hfs_mkdir("/", 7,
+ 			hfs_mkdir("mnt", 1,
+ 				hfs_mkdir("vendor", 1,
+ 					persist_dir
+@@ -251,6 +263,7 @@ struct hexagonfs_dirent *construct_root_dir(const char *prefix, const char *dsp)
+ 					)
+ 				)
+ 			),
+-			vendor_dir
++			vendor_dir,
++			odm_dir
+ 		);
+ }
+diff --git a/hexagonrpcd/sns_registry.c b/hexagonrpcd/sns_registry.c
+index 21c21da..8ccd11c 100644
+--- a/hexagonrpcd/sns_registry.c
++++ b/hexagonrpcd/sns_registry.c
+@@ -19,11 +19,13 @@
+  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+  */
+ 
++#include <fcntl.h>
+ #include <libhexagonrpc/error.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <unistd.h>
+ 
+ #include "interface/sns_registry.h"
+ #include "iobuffer.h"
+@@ -46,8 +48,8 @@ static const struct sns_registry_property sns_registry_properties[] = {
+ 	{ "ro.revision", "4" },
+ 	{ "ro.boot.hardware", "qcom" },
+ 	{ "ro.hardware", "qcom" },
+-	{ "ro.product.model", "SM-X800" },
+-	{ "ro.product.device", "gts8pwifi" },
++	{ "ro.product.model", "DBY-W09" },
++	{ "ro.product.device", "dby-w09" },
+ };
+ 
+ static const char *sns_registry_lookup(const char *name)
+@@ -62,6 +64,45 @@ static const char *sns_registry_lookup(const char *name)
+ 	return NULL;
+ }
+ 
++/* 文件树根目录，用于在内核 soc0 缺属性时回退到厂商提供的 socinfo */
++static char *sns_root;
++
++/*
++ * 本机 PD 按属性名逐个读取 socinfo（hw_platform、soc_id、revision 等），
++ * 这些值内核已经挂在 /sys/devices/soc0 下，直接读取比硬编码表格可靠。
++ * 返回写入的字节数，失败返回 -1。
++ */
++static ssize_t sns_registry_read_socinfo(const char *name, char *out, size_t size)
++{
++	char path[256];
++	ssize_t n;
++	int fd;
++
++	/* 先读内核的 soc0，主线没有的属性再退到文件树里的 socinfo 目录 */
++	if (snprintf(path, sizeof(path), "/sys/devices/soc0/%s", name) >= (int)sizeof(path))
++		return -1;
++
++	fd = open(path, O_RDONLY);
++	if (fd < 0 && sns_root != NULL) {
++		if (snprintf(path, sizeof(path), "%s/socinfo/%s", sns_root, name) >= (int)sizeof(path))
++			return -1;
++		fd = open(path, O_RDONLY);
++	}
++	if (fd < 0)
++		return -1;
++
++	n = read(fd, out, size - 1);
++	close(fd);
++	if (n < 0)
++		return -1;
++
++	while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r'))
++		n--;
++	out[n] = '\0';
++
++	return n;
++}
++
+ static uint32_t sns_registry_get_property(void *data,
+ 					  const struct fastrpc_io_buffer *inbufs,
+ 					  struct fastrpc_io_buffer *outbufs)
+@@ -85,6 +126,11 @@ static uint32_t sns_registry_get_property(void *data,
+ 
+ 	value = sns_registry_lookup(name);
+ 	if (value == NULL) {
++		if (sns_registry_read_socinfo(name, outbufs[0].p, outbufs[0].s) >= 0) {
++			printf("sns_registry_get_property(%s) -> %s (socinfo)\n",
++			       name, (char *)outbufs[0].p);
++			return 0;
++		}
+ 		fprintf(stderr, "sns_registry: unknown property %s, answering empty\n",
+ 			name);
+ 		return 0;
+@@ -104,10 +150,13 @@ static uint32_t sns_registry_get_property(void *data,
+ 	return 0;
+ }
+ 
+-struct fastrpc_interface *fastrpc_sns_registry_init(void)
++struct fastrpc_interface *fastrpc_sns_registry_init(const char *root)
+ {
+ 	struct fastrpc_interface *iface;
+ 
++	free(sns_root);
++	sns_root = root ? strdup(root) : NULL;
++
+ 	iface = malloc(sizeof(struct fastrpc_interface));
+ 	if (iface == NULL)
+ 		return NULL;
+diff --git a/hexagonrpcd/sns_registry.h b/hexagonrpcd/sns_registry.h
+index dd2f85f..b79be73 100644
+--- a/hexagonrpcd/sns_registry.h
++++ b/hexagonrpcd/sns_registry.h
+@@ -24,7 +24,7 @@
+ 
+ #include "listener.h"
+ 
+-struct fastrpc_interface *fastrpc_sns_registry_init(void);
++struct fastrpc_interface *fastrpc_sns_registry_init(const char *root);
+ void fastrpc_sns_registry_deinit(struct fastrpc_interface *iface);
+ 
+ #endif

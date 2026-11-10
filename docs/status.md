@@ -1,6 +1,6 @@
 # 支持情况与已知限制
 
-更新时间：2026-11-10 18:49 +8
+更新时间：2026-11-10 19:06 +8
 
 ## 验证环境
 
@@ -28,6 +28,9 @@
 | GPU | 可用 | GMU、zap shader、devfreq，Plasma 渲染 |
 | CPU 调频 | 可用 | 三个 freq domain，`schedutil` / `performance` / `powersave` |
 | 电池与充电 | 可用 | SMB5 状态、FG 容量、电压、电流、温度 |
+| 传感器 | 可用 | 加速度计、环境光、磁力计、指南针 |
+| 自动旋转 | 可用 | KWin 与 iio-sensor-proxy |
+| 自动亮度 | 可用 | KWin 读取环境光 |
 
 ## 已知限制
 

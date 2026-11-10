@@ -1,0 +1,20 @@
+[Unit]
+Description=DBY-W09 hexagonrpcd for SDSP (sensor DSP)
+# fastrpc 驱动在 SLPI 启动后才创建设备节点
+ConditionPathExists=/dev/fastrpc-sdsp
+After=dby-slpi-firmware.service
+Wants=dby-slpi-firmware.service
+
+[Service]
+# socinfo 不在根文件系统里，用符号链接指向内核的 soc0 节点
+ExecStartPre=/bin/sh -c 'ln -sfn /sys/devices/soc0 /usr/share/qcom/sm8250/HUAWEI/dby-w09/socinfo'
+ExecStart=/usr/bin/hexagonrpcd -f /dev/fastrpc-sdsp -d sdsp -s \
+	-R /usr/share/qcom/sm8250/HUAWEI/dby-w09
+# 设备节点出现时 udev 会先启动 iio-sensor-proxy，那时 SSC 还没就绪，它会自行退出；
+# 这里在文件服务就绪后重新拉起一次。
+ExecStartPost=-/usr/bin/systemctl restart iio-sensor-proxy.service
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

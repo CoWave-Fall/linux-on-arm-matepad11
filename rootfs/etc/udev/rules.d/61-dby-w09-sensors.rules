@@ -1,0 +1,6 @@
+# DBY-W09 传感器：iio-sensor-proxy 的上游规则只把 SDSP 声明为 light 与 compass，
+# 加速度计需要显式声明。
+#
+# 方向由固件上报的 placement 决定（见注册表 t1000_0_platform.placement），
+# 这里不再设置 ACCEL_MOUNT_MATRIX，避免与固件上报的方向叠加。
+SUBSYSTEM=="misc", KERNEL=="fastrpc-sdsp", ENV{IIO_SENSOR_PROXY_TYPE}+="ssc-accel"
