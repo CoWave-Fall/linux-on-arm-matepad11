@@ -1,0 +1,5 @@
+# 面板笔与笔的 HOGP 鼠标、键盘节点由 loa-pen 合并成单一平板设备。
+# libinput 忽略这些原始节点，避免出现重复平板设备与多余的 KEY_F20。
+SUBSYSTEM=="input", ATTRS{name}=="Novatek N9Z Stylus", ENV{LIBINPUT_IGNORE_DEVICE}="1"
+SUBSYSTEM=="input", ATTRS{name}=="HUAWEI M-Pencil 3 Mouse", ENV{LIBINPUT_IGNORE_DEVICE}="1"
+SUBSYSTEM=="input", ATTRS{name}=="HUAWEI M-Pencil 3 Keyboard", ENV{LIBINPUT_IGNORE_DEVICE}="1"

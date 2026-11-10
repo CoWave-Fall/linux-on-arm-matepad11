@@ -1,0 +1,13 @@
+[Unit]
+Description=DBY-W09 M-Pencil panel and HID merge
+Wants=bluetooth.service
+After=bluetooth.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/loa-pen
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

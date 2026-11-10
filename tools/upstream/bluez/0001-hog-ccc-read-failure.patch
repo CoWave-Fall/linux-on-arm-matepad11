@@ -1,0 +1,25 @@
+From: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
+Subject: [PATCH] hog: enable notifications when the CCC read fails
+
+Some HID devices reject reads of the CCC descriptor. Write the CCC value
+and keep the notification subscription so the uhid input device is created.
+
+Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
+
+--- a/profiles/input/hog-lib.c
++++ b/profiles/input/hog-lib.c
+@@ -400,6 +400,13 @@
+ 	struct report *report = req->user_data;
+
+ 	if (status != 0) {
+-		error("Error reading CCC value: %s", att_ecode2str(status));
++		/* 部分 HID 设备的 CCC 描述符拒绝读取，此时仍需写入以启用通知，
++		 * 否则报表订阅不会注册，uhid 输入设备也不会创建。
++		 */
++		error("Error reading CCC value: %s, enabling anyway",
++							att_ecode2str(status));
++		write_ccc(report->hog, report->hog->attrib, report->ccc_handle,
++									report);
++		status = 0;
+ 		goto remove;
+ 	}
