@@ -16,12 +16,14 @@ U-Boot 写入 `recovery` 分区，Linux 从 microSD 启动，HarmonyOS
 | 背光 | 可用 | RT8555，10 位亮度 |
 | 电池与充电 | 可用 | PM8150B，容量、电压、电流、温度 |
 | 电源模式 | 可用 | power-profiles-daemon 的 `qcom` 驱动 |
+| 按键 | 可用 | 短按开关屏、2.5 秒离开对话框、7 秒强制重启、组合键 |
 | WiFi | 可用 | QCA6391，ath11k，NetworkManager |
 | 蓝牙 | 可用 | QCA6391，磁吸键盘与 M-Pencil 3 |
 | GPU | 可用 | Adreno 650，Plasma 使用 freedreno 渲染 |
 | 传感器 | 可用 | 加速度计、环境光、磁力计、指南针 |
 | 自动旋转与自动亮度 | 可用 | KWin 读取 iio-sensor-proxy |
 | 环境色温 | 可用 | libssc CCT 补丁、会话 D-Bus 服务、KWin 效果 |
+| 震动 | 可用 | ERM 马达，FF_RUMBLE |
 | 触控笔 | 基本可用 | 面板坐标与蓝牙压力合并，压感与橡皮 |
 
 ## 构建与安装
