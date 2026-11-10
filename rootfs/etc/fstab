@@ -1,0 +1,3 @@
+# <file system> <dir> <type> <options> <dump> <pass>
+# 根文件系统由内核 root= 参数挂载，此条目与 U-Boot 的 bootargs 保持一致。
+PARTLABEL=archroot  /  f2fs  rw,relatime  0 0

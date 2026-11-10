@@ -1,0 +1,4 @@
+# 本地主机名解析，避免依赖网络
+127.0.0.1	localhost
+::1		localhost
+127.0.1.1	dby-w09.localdomain	dby-w09

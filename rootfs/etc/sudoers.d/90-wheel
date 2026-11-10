@@ -1,0 +1,2 @@
+# Arch 默认注释 wheel 组的 sudo 权限，这里显式启用。
+%wheel ALL=(ALL:ALL) ALL
