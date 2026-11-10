@@ -1,0 +1,10 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = power-profiles-daemon
+
+[Action]
+Description = 重建 power-profiles-daemon 的 qcom 驱动版本
+When = PostTransaction
+Exec = /usr/local/libexec/loa/ppd-qcom-rebuild.sh
