@@ -19,6 +19,8 @@ U-Boot 写入 `recovery` 分区，Linux 从 microSD 启动，HarmonyOS
 | 蓝牙 | 可用 | QCA6391，磁吸键盘与 M-Pencil 3 |
 | GPU | 可用 | Adreno 650，Plasma 使用 freedreno 渲染 |
 | 传感器 | 可用 | 加速度计、环境光、磁力计、指南针 |
+| 自动旋转与自动亮度 | 可用 | KWin 读取 iio-sensor-proxy |
+| 环境色温 | 可用 | libssc CCT 补丁、会话 D-Bus 服务、KWin 效果 |
 
 ## 构建与安装
 

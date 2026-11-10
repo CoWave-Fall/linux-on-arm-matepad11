@@ -1,0 +1,13 @@
+[Unit]
+Description=LoA ambient light color temperature service
+Documentation=file:///usr/local/libexec/loa-alsd
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/loa-alsd
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,17 @@
+{
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "CoWave Fall"
+            }
+        ],
+        "Category": "Appearance",
+        "Id": "ambientcolor",
+        "Description": "Adapt the display white point to the ambient color temperature",
+        "Description[zh_CN]": "按环境光色温调整屏幕白点",
+        "EnabledByDefault": false,
+        "License": "GPL-3.0-or-later",
+        "Name": "Ambient Color",
+        "Name[zh_CN]": "环境色温"
+    }
+}

@@ -1,0 +1,5 @@
+<RCC>
+  <qresource prefix="/effects/ambientcolor">
+    <file alias="shaders/ambientcolor.frag">shaders/ambientcolor.frag</file>
+  </qresource>
+</RCC>

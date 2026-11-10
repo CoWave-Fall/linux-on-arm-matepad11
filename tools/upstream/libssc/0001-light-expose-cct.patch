@@ -1,0 +1,207 @@
+From: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
+Subject: [PATCH] light: expose correlated color temperature
+
+Vendor firmware reports CCT as the second intensity value. Add a
+cct-measurement signal and getter so the ambient light service can use it.
+
+Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
+
+diff --git a/libssc.map b/libssc.map
+index d5a2ee2..a576d1d 100644
+--- a/libssc.map
++++ b/libssc.map
+@@ -36,6 +36,7 @@ LIBSSC_0.4.0 {
+ 		ssc_sensor_light_close;
+ 		ssc_sensor_light_close_finish;
+ 		ssc_sensor_light_close_sync;
++		ssc_sensor_light_get_cct;
+ 		ssc_sensor_magnetometer_new;
+ 		ssc_sensor_magnetometer_new_finish;
+ 		ssc_sensor_magnetometer_new_sync;
+diff --git a/src/libssc-cli.c b/src/libssc-cli.c
+index 5560862..b62499e 100644
+--- a/src/libssc-cli.c
++++ b/src/libssc-cli.c
+@@ -110,6 +110,12 @@ static void light_measurement (SSCSensorLight *sensor, gfloat intensity, gpointe
+ 	fflush(stdout);
+ }
+ 
++static void light_cct_measurement (SSCSensorLight *sensor, gfloat cct, gpointer user_data)
++{
++	g_printf ("Light sensor CCT: %f K\n", cct);
++	fflush(stdout);
++}
++
+ /*****************************************************************************/
+ 
+ static gboolean
+@@ -224,6 +230,10 @@ int main(int argc, char *argv[])
+ 			  	  "measurement",
+ 			  	  G_CALLBACK (light_measurement),
+ 			  	  NULL);
++		g_signal_connect (light,
++			  	  "cct-measurement",
++			  	  G_CALLBACK (light_cct_measurement),
++			  	  NULL);
+ 		if (!ssc_sensor_light_open_sync (light, NULL, &err)) {
+ 			g_printf ("Unable to open light sensor: %s\n", err ? err->message : "UNKNOWN");
+ 			return OPEN_FAIL_EXIT_CODE;
+diff --git a/src/libssc-sensor-light.c b/src/libssc-sensor-light.c
+index e0bd99a..8d45b87 100644
+--- a/src/libssc-sensor-light.c
++++ b/src/libssc-sensor-light.c
+@@ -24,12 +24,16 @@
+ 
+ enum {
+ 	SIGNAL_MEASUREMENT,
++	/* 厂商固件在 intensity 数组的第二项携带 CCT，单独发信号以免破坏
++	 * 既有 measurement 信号的参数列表。 */
++	SIGNAL_CCT_MEASUREMENT,
+ 	N_SIGNALS
+ };
+ static guint signals[N_SIGNALS];
+ 
+ typedef struct _SSCSensorLightPrivate {
+ 	guint report_id;
++	gfloat cct;
+ } SSCSensorLightPrivate;
+ 
+ G_DEFINE_TYPE_WITH_CODE (SSCSensorLight, ssc_sensor_light, SSC_TYPE_SENSOR,
+@@ -38,6 +42,7 @@ G_DEFINE_TYPE_WITH_CODE (SSCSensorLight, ssc_sensor_light, SSC_TYPE_SENSOR,
+ typedef struct {
+ 	SSCSensorLight *sensor;
+ 	gfloat intensity;
++	gfloat cct;
+ } SignalContext;
+ 
+ static void
+@@ -57,6 +62,17 @@ emit_signal (gpointer user_data) {
+ 	return G_SOURCE_REMOVE;
+ }
+ 
++static gboolean
++emit_cct_signal (gpointer user_data) {
++	SignalContext *ctx = user_data;
++	SSCSensorLightPrivate *priv = ssc_sensor_light_get_instance_private (ctx->sensor);
++
++	priv->cct = ctx->cct;
++	g_signal_emit (ctx->sensor, signals[SIGNAL_CCT_MEASUREMENT], 0, ctx->cct);
++
++	return G_SOURCE_REMOVE;
++}
++
+ static void
+ report_received (SSCClient *self, guint32 msg_id, guint64 uid_high, guint64 uid_low, GArray *buf, gpointer user_data)
+ {
+@@ -66,6 +82,7 @@ report_received (SSCClient *self, guint32 msg_id, guint64 uid_high, guint64 uid_
+ 	guint64 sensor_uid_low;
+ 	guint64 sensor_uid_high;
+ 	gfloat intensity;
++	gfloat cct;
+ 
+ 	g_object_get (sensor,
+ 		      SSC_SENSOR_UID_HIGH, &sensor_uid_high,
+@@ -80,7 +97,8 @@ report_received (SSCClient *self, guint32 msg_id, guint64 uid_high, guint64 uid_
+ 			return;
+ 		}
+ 
+-		/* Only report intensity in Lux, raw sensor values are ignored */
++		/* 第一项为照度（lux）；TCS3408 等带彩色通道的固件在第二项
++		 * 附带相关色温（K），其余项为厂商保留值。 */
+ 		if (msg->n_intensity >= 1) {
+ 			intensity = msg->intensity[0];
+ 
+@@ -93,6 +111,17 @@ report_received (SSCClient *self, guint32 msg_id, guint64 uid_high, guint64 uid_
+ 			}
+ 		}
+ 
++		if (msg->n_intensity >= 2) {
++			cct = msg->intensity[1];
++
++			if (cct > 0.0) {
++				ctx = g_slice_new0 (SignalContext);
++				ctx->sensor = sensor;
++				ctx->cct = cct;
++				g_idle_add_full (G_PRIORITY_DEFAULT_IDLE, emit_cct_signal, ctx, (GDestroyNotify)signal_context_free);
++			}
++		}
++
+ 		ssc_light_response__free_unpacked (msg, NULL);
+ 	}
+ }
+@@ -146,6 +175,26 @@ ssc_sensor_light_close (SSCSensorLight *self, GCancellable *cancellable, GAsyncR
+ 	SSC_SENSOR_CLASS (ssc_sensor_light_parent_class)->close (SSC_SENSOR (self), cancellable, (GAsyncReadyCallback)light_close_ready, task);
+ }
+ 
++/**
++ * ssc_sensor_light_get_cct:
++ * @self: a #SSCSensorLight
++ *
++ * 返回最近一次上报的相关色温，单位 K。传感器未上报 CCT 时返回 0。
++ *
++ * Returns: 颜色温度，单位 K
++ */
++gfloat
++ssc_sensor_light_get_cct (SSCSensorLight *self)
++{
++	SSCSensorLightPrivate *priv = NULL;
++
++	g_return_val_if_fail (SSC_IS_SENSOR_LIGHT (self), 0.0f);
++
++	priv = ssc_sensor_light_get_instance_private (self);
++
++	return priv->cct;
++}
++
+ gboolean
+ ssc_sensor_light_close_sync (SSCSensorLight *self, GCancellable *cancellable, GError **error)
+ {
+@@ -240,11 +289,21 @@ ssc_sensor_light_class_init (SSCSensorLightClass *klass)
+ 		0, NULL, NULL, NULL,
+ 		G_TYPE_NONE,
+ 		1, G_TYPE_FLOAT);
++
++	signals[SIGNAL_CCT_MEASUREMENT] = g_signal_new ("cct-measurement",
++		G_TYPE_FROM_CLASS (klass),
++		G_SIGNAL_RUN_FIRST,
++		0, NULL, NULL, NULL,
++		G_TYPE_NONE,
++		1, G_TYPE_FLOAT);
+ }
+ 
+ static void
+ ssc_sensor_light_init (SSCSensorLight *self)
+ {
++	SSCSensorLightPrivate *priv = ssc_sensor_light_get_instance_private (self);
++
++	priv->cct = 0.0f;
+ }
+ 
+ SSCSensorLight *
+diff --git a/src/libssc-sensor-light.h b/src/libssc-sensor-light.h
+index c83e0e1..d6e3cde 100644
+--- a/src/libssc-sensor-light.h
++++ b/src/libssc-sensor-light.h
+@@ -40,5 +40,6 @@ gboolean	 ssc_sensor_light_open_sync (SSCSensorLight *self, GCancellable *cancel
+ void		 ssc_sensor_light_close (SSCSensorLight *self, GCancellable *cancellable, GAsyncReadyCallback callback, gpointer user_data);
+ gboolean	 ssc_sensor_light_close_finish (SSCSensorLight *self, GAsyncResult *result, GError **error);
+ gboolean         ssc_sensor_light_close_sync (SSCSensorLight *self, GCancellable *cancellable, GError **error);
++gfloat		 ssc_sensor_light_get_cct (SSCSensorLight *self);
+ 
+ #endif /* _LIBSSC_SENSOR_LIGHT_H_ */
+diff --git a/src/meson.build b/src/meson.build
+index 5ea1dff..fe98153 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -92,7 +92,10 @@ pkg.generate(
+   requires: ['glib-2.0', 'gobject-2.0', 'gio-2.0', 'qmi-glib'],
+ )
+ 
+-if dependency('gobject-introspection-1.0', required: false).found()
++gir_dependency = dependency('gobject-introspection-1.0', required: false)
++# Arch 的 gobject-introspection-runtime 提供 pkg-config 文件但不带
++# g-ir-scanner，仅在扫描器可用时生成 GIR。
++if gir_dependency.found() and find_program('g-ir-scanner', required: false).found()
+   gnome = import('gnome')
+ 
+   gir_files = gnome.generate_gir(libssc,
