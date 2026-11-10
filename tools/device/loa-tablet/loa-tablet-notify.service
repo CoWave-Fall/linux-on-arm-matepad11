@@ -1,0 +1,14 @@
+[Unit]
+Description=LoA tablet attachment notifications
+Documentation=file:///usr/local/libexec/loa-tablet-notify
+After=plasma-workspace.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/libexec/loa-tablet-notify
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

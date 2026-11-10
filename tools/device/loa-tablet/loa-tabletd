@@ -1,0 +1,392 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""LoA 平板设置后端。
+
+Plasma 6.8 的 KWin 已经通过 iio-sensor-proxy 实现自动旋转与自动亮度，
+KScreen 的 kscreen-doctor 提供对应设置项（autoRotatePolicy 与
+autoBrightness 未写入帮助，但已由解析器实现）。本服务不重复实现传感器
+逻辑，只把 KScreen 的命令行接口封装成会话级 D-Bus 服务，供平板设置前端
+与后续的键盘模式、触屏模式功能共用。
+
+电源键组合动作存放在 /var/lib/loa/powerkey.conf，由 root 的
+dby-powerkeyd 读取并执行。文件由安装脚本创建为当前用户所有，前端通过
+本服务读写，避免引入 polkit 授权。
+
+服务名 org.loa.Tablet，对象路径 /org/loa/Tablet，接口 org.loa.Tablet1。
+"""
+
+import json
+import logging
+import os
+import re
+import subprocess
+import time
+
+from gi.repository import Gio, GLib
+
+logger = logging.getLogger("loa-tabletd")
+
+SERVICE_NAME = "org.loa.Tablet"
+OBJECT_PATH = "/org/loa/Tablet"
+INTERFACE_NAME = "org.loa.Tablet1"
+KEYBINDINGS_PATH = "/var/lib/loa/powerkey.conf"
+# 平板设置中的预设动作。GetKeyBindings 一并返回，前端按此识别预设，
+# 避免命令文本在多处各自维护后失去对应关系。
+PRESET_KEY_BINDINGS = {
+    "screenshot": "spectacle -b -f",
+    "powerMenu": (
+        "qdbus6 org.kde.LogoutPrompt /LogoutPrompt "
+        "org.kde.LogoutPrompt.promptAll"
+    ),
+}
+# 配置文件缺失时的默认绑定，与 dby-powerkeyd 的内置默认值一致。
+DEFAULT_KEY_BINDINGS = {
+    "comboVolumeDown": PRESET_KEY_BINDINGS["screenshot"],
+    "comboVolumeUp": "",
+}
+
+INTROSPECTION_XML = """
+<node>
+  <interface name="org.loa.Tablet1">
+    <method name="GetState">
+      <arg name="state" type="s" direction="out"/>
+    </method>
+    <method name="SetAutoRotate">
+      <arg name="enabled" type="b" direction="in"/>
+    </method>
+    <method name="SetAutoBrightness">
+      <arg name="enabled" type="b" direction="in"/>
+    </method>
+    <method name="Rotate">
+      <arg name="orientation" type="s" direction="in"/>
+    </method>
+    <method name="GetKeyBindings">
+      <arg name="bindings" type="s" direction="out"/>
+    </method>
+    <method name="SetKeyBindings">
+      <arg name="bindings" type="s" direction="in"/>
+    </method>
+  </interface>
+</node>
+"""
+
+# KScreen 的 Rotation 枚举，见 kscreen/output.h。
+ROTATION_NAMES = {
+    1: "normal",
+    2: "left",
+    4: "inverted",
+    8: "right",
+}
+# kscreen-doctor 的旋转取值与 KScreen 枚举名称不同。
+ROTATION_ACTIONS = {
+    "normal": "none",
+    "left": "left",
+    "inverted": "inverted",
+    "right": "right",
+}
+# iio-sensor-proxy 的方向名称对应显示需要旋转到的方位。横屏与竖屏已实测，
+# 其余方向沿用同一命名对应关系。
+SENSOR_ROTATIONS = {
+    "normal": "normal",
+    "left-up": "left",
+    "right-up": "right",
+    "bottom-up": "inverted",
+}
+# KScreen AutoRotatePolicy 枚举，1 在 KScreen 配置中写作 inTabletMode。
+POLICY_NAMES = {
+    "never": "never",
+    "inTabletMode": "automatic",
+    "always": "always",
+}
+
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+FIELD_RE = re.compile(r"^\s*([A-Za-z][A-Za-z ]*?):\s*(.+?)\s*$", re.MULTILINE)
+
+
+class TabletError(RuntimeError):
+    """kscreen-doctor 调用或状态解析失败。"""
+
+
+def run_kscreen(arguments):
+    """执行 kscreen-doctor 并返回标准输出，失败时抛出异常。"""
+    environment = dict(os.environ)
+    # 输出解析依赖英文字段名；C.UTF-8 同时满足 Qt 对 UTF-8 locale 的要求。
+    environment["LC_ALL"] = "C.UTF-8"
+    environment["LANG"] = "C.UTF-8"
+    try:
+        result = subprocess.run(
+            ["kscreen-doctor", *arguments],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise TabletError(f"kscreen-doctor 执行失败：{error}") from error
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip()
+        raise TabletError(f"kscreen-doctor 返回 {result.returncode}：{message}")
+    return result.stdout
+
+
+def parse_output_status(text):
+    """从 kscreen-doctor -o 的输出中取出主输出状态。
+
+    设备只有一个启用的内置面板；多输出时取第一个已启用且已连接的输出。
+    """
+    text = ANSI_ESCAPE.sub("", text)
+    for block in re.split(r"^Output:\s*", text, flags=re.MULTILINE)[1:]:
+        header = block.splitlines()[0] if block.splitlines() else ""
+        tokens = header.split()
+        if len(tokens) < 2:
+            continue
+        if not re.search(r"^\s*enabled\s*$", block, re.MULTILINE):
+            continue
+        if not re.search(r"^\s*connected\s*$", block, re.MULTILINE):
+            continue
+        fields = {match.group(1): match.group(2) for match in FIELD_RE.finditer(block)}
+        try:
+            rotation = ROTATION_NAMES[int(fields["Rotation"])]
+        except (KeyError, ValueError) as error:
+            raise TabletError(f"无法解析输出旋转：{fields!r}") from error
+        policy = POLICY_NAMES.get(fields.get("Auto Rotate Policy", ""), "unknown")
+        brightness_text = fields.get("Automatic brightness")
+        if brightness_text is None:
+            auto_brightness = None
+        elif "enabled" in brightness_text:
+            auto_brightness = True
+        elif "disabled" in brightness_text:
+            auto_brightness = False
+        else:
+            auto_brightness = None
+        scale = None
+        if "Scale" in fields:
+            try:
+                scale = float(fields["Scale"])
+            except ValueError:
+                pass
+        return {
+            "output": tokens[1],
+            "rotation": rotation,
+            "autoRotate": policy,
+            "autoBrightness": auto_brightness,
+            "scale": scale,
+        }
+    raise TabletError("没有找到已启用且已连接的输出")
+
+
+def get_state():
+    """读取当前显示状态，返回可直接序列化为 JSON 的字典。"""
+    return parse_output_status(run_kscreen(["-o"]))
+
+
+def read_sensor_orientation():
+    """读取 iio-sensor-proxy 的加速度计方向。"""
+    connection = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+    reply = connection.call_sync(
+        "net.hadess.SensorProxy",
+        "/net/hadess/SensorProxy",
+        "org.freedesktop.DBus.Properties",
+        "Get",
+        GLib.Variant("(ss)", ("net.hadess.SensorProxy", "AccelerometerOrientation")),
+        GLib.VariantType.new("(v)"),
+        Gio.DBusCallFlags.NONE,
+        2000,
+        None,
+    )
+    return reply.unpack()[0]
+
+
+def set_auto_rotate(enabled):
+    """切换自动旋转策略。
+
+    开启后 KWin 只会在方向变化事件到达时重新应用旋转；为了让当前姿态立即
+    生效，这里读取一次传感器方向并直接应用。传感器不可用时保留现有方向，
+    后续物理转动仍会由 KWin 处理。
+    """
+    state = get_state()
+    output = state["output"]
+    policy = "always" if enabled else "never"
+    run_kscreen([f"output.{output}.autoRotatePolicy.{policy}"])
+    if not enabled:
+        return
+    # 策略切换后 KWin 才会认领加速度计，稍等属性刷新。
+    time.sleep(0.4)
+    try:
+        orientation = read_sensor_orientation()
+    except GLib.Error:
+        logger.warning("读取加速度计方向失败，保留当前方向", exc_info=True)
+        return
+    rotation = SENSOR_ROTATIONS.get(orientation)
+    if rotation is None:
+        logger.warning("未知的加速度计方向 %s，保留当前方向", orientation)
+        return
+    logger.info("加速度计方向 %s，对应旋转 %s", orientation, rotation)
+    state = get_state()
+    if state["rotation"] != rotation:
+        run_kscreen([f"output.{output}.rotation.{ROTATION_ACTIONS[rotation]}"])
+
+
+def rotate(orientation):
+    """按指定方向旋转，并关闭自动旋转。"""
+    if orientation not in ROTATION_ACTIONS:
+        raise TabletError(f"未知方向 {orientation}")
+    state = get_state()
+    output = state["output"]
+    run_kscreen([f"output.{output}.autoRotatePolicy.never"])
+    run_kscreen([f"output.{output}.rotation.{ROTATION_ACTIONS[orientation]}"])
+
+
+def set_auto_brightness(enabled):
+    """切换自动亮度。"""
+    state = get_state()
+    if state["autoBrightness"] is None:
+        raise TabletError("当前输出不支持自动亮度")
+    action = "enable" if enabled else "disable"
+    run_kscreen([f"output.{state['output']}.autoBrightness.{action}"])
+
+
+def read_key_bindings():
+    """读取组合键配置。
+
+    配置文件缺失时返回默认绑定（电源+音量下截屏），与守护进程的内置
+    默认值一致；文件存在时按文件内容返回，空值表示不响应。
+    """
+    bindings = {"comboVolumeDown": "", "comboVolumeUp": ""}
+    try:
+        with open(KEYBINDINGS_PATH, encoding="utf-8") as file:
+            for line in file:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                if key == "combo_volume_down":
+                    bindings["comboVolumeDown"] = value.strip()
+                elif key == "combo_volume_up":
+                    bindings["comboVolumeUp"] = value.strip()
+    except FileNotFoundError:
+        return dict(DEFAULT_KEY_BINDINGS)
+    return bindings
+
+
+def get_key_bindings():
+    """返回当前绑定与预设命令，供前端识别预设动作。"""
+    bindings = read_key_bindings()
+    bindings["presets"] = dict(PRESET_KEY_BINDINGS)
+    return bindings
+
+
+def write_key_bindings(text):
+    """校验并保存组合键配置。
+
+    目录由安装脚本交给当前用户所有；格式是 key=value，命令原样保存，
+    由守护进程以会话用户的 shell 执行。先写临时文件再原子替换，守护
+    进程在组合键手势中不会读到截断或只写了一半的配置。
+    """
+    try:
+        bindings = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise TabletError(f"组合键配置不是有效 JSON：{error}") from error
+    if not isinstance(bindings, dict):
+        raise TabletError("组合键配置需要是 JSON 对象")
+
+    values = {}
+    for config_key, field in (
+        ("combo_volume_down", "comboVolumeDown"),
+        ("combo_volume_up", "comboVolumeUp"),
+    ):
+        value = bindings.get(field, "")
+        if not isinstance(value, str):
+            raise TabletError(f"{field} 需要是字符串")
+        if len(value) > 1000:
+            raise TabletError(f"{field} 超过 1000 字符")
+        if "\n" in value or "\r" in value:
+            raise TabletError(f"{field} 不能包含换行")
+        values[config_key] = value
+
+    content = "# 电源键组合动作，由平板设置写入。空值表示不响应。\n"
+    content += f"combo_volume_down={values['combo_volume_down']}\n"
+    content += f"combo_volume_up={values['combo_volume_up']}\n"
+    temporary_path = f"{KEYBINDINGS_PATH}.tmp"
+    try:
+        with open(temporary_path, "w", encoding="utf-8") as file:
+            file.write(content)
+        os.chmod(temporary_path, 0o644)
+        os.replace(temporary_path, KEYBINDINGS_PATH)
+    except OSError as error:
+        raise TabletError(f"写入 {KEYBINDINGS_PATH} 失败：{error}") from error
+
+
+def handle_method(_connection, _sender, _path, _interface, method, parameters, invocation):
+    """D-Bus 方法分发。异常转换为 D-Bus 错误回复。"""
+    try:
+        if method == "GetState":
+            invocation.return_value(GLib.Variant("(s)", (json.dumps(get_state()),)))
+        elif method == "SetAutoRotate":
+            (enabled,) = parameters.unpack()
+            set_auto_rotate(enabled)
+            invocation.return_value(None)
+        elif method == "SetAutoBrightness":
+            (enabled,) = parameters.unpack()
+            set_auto_brightness(enabled)
+            invocation.return_value(None)
+        elif method == "Rotate":
+            (orientation,) = parameters.unpack()
+            rotate(orientation)
+            invocation.return_value(None)
+        elif method == "GetKeyBindings":
+            invocation.return_value(
+                GLib.Variant("(s)", (json.dumps(get_key_bindings()),))
+            )
+        elif method == "SetKeyBindings":
+            (bindings,) = parameters.unpack()
+            write_key_bindings(bindings)
+            invocation.return_value(None)
+        else:
+            invocation.return_dbus_error(
+                f"{INTERFACE_NAME}.UnknownMethod", f"未知方法 {method}"
+            )
+    except Exception as error:
+        logger.exception("处理 %s 失败", method)
+        invocation.return_dbus_error(f"{INTERFACE_NAME}.Error", str(error))
+
+
+def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="loa-tabletd: %(levelname)s %(message)s",
+    )
+    if not os.environ.get("WAYLAND_DISPLAY"):
+        logger.error("缺少 WAYLAND_DISPLAY，无法在图形会话外运行")
+        return 1
+
+    node_info = Gio.DBusNodeInfo.new_for_xml(INTROSPECTION_XML)
+    interface_info = node_info.interfaces[0]
+
+    def on_bus_acquired(connection, _name):
+        connection.register_object(
+            OBJECT_PATH, interface_info, handle_method, None, None
+        )
+        logger.info("已导出 %s", INTERFACE_NAME)
+
+    def on_name_lost(_connection, _name):
+        logger.error("无法获得会话总线名称 %s", SERVICE_NAME)
+        loop.quit()
+
+    loop = GLib.MainLoop()
+    Gio.bus_own_name(
+        Gio.BusType.SESSION,
+        SERVICE_NAME,
+        Gio.BusNameOwnerFlags.NONE,
+        on_bus_acquired,
+        None,
+        on_name_lost,
+    )
+    loop.run()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,14 @@
+[Unit]
+Description=LoA tablet settings backend
+Documentation=file:///usr/local/libexec/loa-tabletd
+After=plasma-workspace.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/libexec/loa-tabletd
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,69 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# LoA 平板设置命令行入口，供桌面快捷方式与脚本调用。
+set -eu
+
+usage() {
+	cat >&2 <<'EOF'
+用法:
+  loa-tabletctl state
+  loa-tabletctl auto-rotate on|off
+  loa-tabletctl auto-brightness on|off
+  loa-tabletctl rotate normal|left|right|inverted
+  loa-tabletctl key-bindings
+  loa-tabletctl set-key-bindings <json>
+EOF
+	exit 2
+}
+
+call() {
+	method=$1
+	shift
+	gdbus call --session --dest org.loa.Tablet \
+		--object-path /org/loa/Tablet --method "org.loa.Tablet1.$method" "$@"
+}
+
+[ "$#" -ge 1 ] || usage
+command=$1
+shift
+
+case "$command" in
+state)
+	call GetState
+	;;
+auto-rotate)
+	[ "${1:-}" = on ] || [ "${1:-}" = off ] || usage
+	if [ "$1" = on ]; then
+		enabled=true
+	else
+		enabled=false
+	fi
+	call SetAutoRotate "$enabled"
+	;;
+auto-brightness)
+	[ "${1:-}" = on ] || [ "${1:-}" = off ] || usage
+	if [ "$1" = on ]; then
+		enabled=true
+	else
+		enabled=false
+	fi
+	call SetAutoBrightness "$enabled"
+	;;
+rotate)
+	case "${1:-}" in
+	normal | left | right | inverted) ;;
+	*) usage ;;
+	esac
+	call Rotate "$1"
+	;;
+key-bindings)
+	call GetKeyBindings
+	;;
+set-key-bindings)
+	[ "$#" -ge 1 ] || usage
+	call SetKeyBindings "$1"
+	;;
+*)
+	usage
+	;;
+esac

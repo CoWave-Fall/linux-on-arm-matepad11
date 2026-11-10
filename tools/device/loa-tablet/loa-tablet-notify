@@ -1,0 +1,188 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""磁吸附件状态通知服务。
+
+监听两类状态：
+- BlueZ 中磁吸键盘与 M-Pencil 的 Device1.Connected 属性；
+- MT5727 驱动导出的 hall_keyboard 与 hall_pen 字段。
+
+启动时读取一次基线，只在状态变化时发通知，登录时不会集中弹出。服务随
+图形会话启动，需要会话总线与通知服务。
+"""
+
+import logging
+import os
+import re
+
+from gi.repository import Gio, GLib
+
+logger = logging.getLogger("loa-tablet-notify")
+
+APP_NAME = "loa-tablet-notify"
+ICON_NAME = "bluetooth-active"
+TX_STATUS_PATH = (
+    "/sys/devices/platform/soc@0/9c0000.geniqup/98c000.i2c/i2c-3/3-002b/tx_status"
+)
+HID_UUID = "00001812-0000-1000-8000-00805f9b34fb"
+APPEARANCE_KEYBOARD = 0x03C1
+APPEARANCE_DIGITIZER = 0x03C7
+HALL_FIELDS = {
+    "hall_keyboard": "键盘",
+    "hall_pen": "触控笔",
+}
+HALL_RE = re.compile(r"^(hall_keyboard|hall_pen):\s*([01])$", re.MULTILINE)
+
+
+def device_label(properties):
+    """返回 BlueZ 设备的显示名称，其他设备返回 None。
+
+    键盘与笔按广播名称、Appearance 或 HID 服务 UUID 识别，避免依赖
+    不同机器之间各不相同的蓝牙地址。
+    """
+    name = str(properties.get("Name", ""))
+    appearance = int(properties.get("Appearance", 0))
+    uuids = [str(uuid).lower() for uuid in properties.get("UUIDs", [])]
+
+    if "pencil" in name.lower() or appearance == APPEARANCE_DIGITIZER:
+        return "触控笔"
+    if "keyboard" in name.lower() or appearance == APPEARANCE_KEYBOARD:
+        return "键盘"
+    if HID_UUID in uuids:
+        return "键盘"
+    return None
+
+
+def read_hall():
+    """读取磁吸到位状态。
+
+    文件或字段缺失时抛出异常，由 systemd 重启服务，避免带着错误的
+    基线发出通知。
+    """
+    with open(TX_STATUS_PATH, encoding="utf-8") as file:
+        text = file.read()
+    values = {name: value == "1" for name, value in HALL_RE.findall(text)}
+    missing = set(HALL_FIELDS) - set(values)
+    if missing:
+        raise RuntimeError(f"tx_status 缺少字段：{sorted(missing)}")
+    return values
+
+
+class Notifier:
+    """维护状态基线并发送桌面通知。"""
+
+    def __init__(self, system):
+        self.system = system
+        self.session = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        self.connected, self.labels = self.read_devices()
+        self.halls = read_hall()
+
+    def read_devices(self):
+        """返回已连接附件的对象路径与显示名称。"""
+        reply = self.system.call_sync(
+            "org.bluez",
+            "/",
+            "org.freedesktop.DBus.ObjectManager",
+            "GetManagedObjects",
+            None,
+            GLib.VariantType.new("(a{oa{sa{sv}}})"),
+            Gio.DBusCallFlags.NONE,
+            2000,
+            None,
+        )
+        objects = reply.unpack()[0]
+        connected = {}
+        labels = {}
+        for path, interfaces in objects.items():
+            properties = interfaces.get("org.bluez.Device1")
+            if properties is None:
+                continue
+            label = device_label(properties)
+            if label is None:
+                continue
+            labels[path] = label
+            connected[path] = bool(properties.get("Connected", False))
+        return connected, labels
+
+    def notify(self, title, body=""):
+        """通过会话总线发送通知。"""
+        try:
+            self.session.call_sync(
+                "org.freedesktop.Notifications",
+                "/org/freedesktop/Notifications",
+                "org.freedesktop.Notifications",
+                "Notify",
+                GLib.Variant(
+                    "(susssasa{sv}i)",
+                    (APP_NAME, 0, ICON_NAME, title, body, [], {}, -1),
+                ),
+                None,
+                Gio.DBusCallFlags.NONE,
+                2000,
+                None,
+            )
+            logger.info("通知：%s", title)
+        except GLib.Error:
+            logger.exception("发送通知失败：%s", title)
+
+    def on_properties_changed(
+        self, _connection, _sender, path, _interface, _signal, parameters
+    ):
+        """处理 BlueZ Device1 的属性变化。"""
+        interface, changed, _invalidated = parameters.unpack()
+        if interface != "org.bluez.Device1" or "Connected" not in changed:
+            return
+        name = self.labels.get(path)
+        if name is None:
+            return
+        connected = bool(changed["Connected"])
+        if self.connected.get(path) == connected:
+            return
+        self.connected[path] = connected
+        suffix = "已连接" if connected else "已断开"
+        self.notify(f"{name}{suffix}")
+
+    def poll_hall(self):
+        """轮询磁吸到位状态，返回 True 让 GLib 保留定时器。"""
+        current = read_hall()
+        for field, name in HALL_FIELDS.items():
+            if current[field] == self.halls[field]:
+                continue
+            suffix = "已吸附" if current[field] else "已取下"
+            self.notify(f"{name}{suffix}")
+        self.halls = current
+        return True
+
+
+def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="loa-tablet-notify: %(levelname)s %(message)s",
+    )
+    if not os.environ.get("WAYLAND_DISPLAY"):
+        logger.error("缺少 WAYLAND_DISPLAY，无法在图形会话外运行")
+        return 1
+
+    system = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+    notifier = Notifier(system)
+    # GLib 对 object_path 做精确匹配，订阅全部路径后在回调中按名称表过滤。
+    system.signal_subscribe(
+        "org.bluez",
+        "org.freedesktop.DBus.Properties",
+        "PropertiesChanged",
+        None,
+        "org.bluez.Device1",
+        Gio.DBusSignalFlags.NONE,
+        notifier.on_properties_changed,
+    )
+    GLib.timeout_add_seconds(1, notifier.poll_hall)
+    logger.info(
+        "开始监听：已连接 %s，吸附 %s",
+        sorted(notifier.labels.items()),
+        notifier.halls,
+    )
+    GLib.MainLoop().run()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

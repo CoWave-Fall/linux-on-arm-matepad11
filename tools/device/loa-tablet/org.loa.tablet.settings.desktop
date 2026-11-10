@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Tablet Settings
+Name[zh_CN]=平板设置
+Comment=Rotation, touch and keyboard settings for the LoA tablet
+Comment[zh_CN]=旋转、触屏与键盘设置
+Exec=/usr/local/bin/loa-tablet-settings
+Icon=preferences-desktop-tablet
+Terminal=false
+Categories=Qt;KDE;Settings;
+Keywords=tablet;rotation;touch;keyboard;brightness;
+Keywords[zh_CN]=平板;旋转;触屏;触摸;键盘;亮度;
+StartupNotify=true

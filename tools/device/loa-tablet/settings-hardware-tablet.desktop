@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Service
+X-KDE-System-Settings-Category=tablet
+X-KDE-System-Settings-Parent-Category=hardware
+X-KDE-Weight=15
+Icon=preferences-desktop-tablet
+
+Name=Tablet
+Name[zh_CN]=平板

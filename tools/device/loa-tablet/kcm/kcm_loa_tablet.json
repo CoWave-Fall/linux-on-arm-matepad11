@@ -1,0 +1,18 @@
+{
+    "KPlugin": {
+        "Id": "kcm_loa_tablet",
+        "Name": "Tablet Settings",
+        "Name[zh_CN]": "平板设置",
+        "Description": "Rotation, touch and keyboard settings for the LoA tablet",
+        "Description[zh_CN]": "旋转、触屏与键盘设置",
+        "Icon": "preferences-desktop-tablet",
+        "License": "GPL-3.0-or-later",
+        "ServiceTypes": [
+            "KCModule"
+        ]
+    },
+    "X-KDE-System-Settings-Parent-Category": "tablet",
+    "X-KDE-Weight": 10,
+    "X-KDE-Keywords": "tablet;rotation;touch;keyboard;brightness;",
+    "X-KDE-Keywords[zh_CN]": "平板;旋转;触屏;触摸;键盘;亮度;"
+}

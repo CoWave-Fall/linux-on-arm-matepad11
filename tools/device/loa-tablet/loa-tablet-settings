@@ -1,0 +1,5 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# 启动平板设置前端，固定 QQC2 样式为 Plasma 桌面样式。
+export QT_QUICK_CONTROLS_STYLE=org.kde.desktop
+exec /usr/bin/qml6 /usr/local/share/loa-tablet-settings/main.qml "$@"
