@@ -68,8 +68,11 @@ cp -a --no-preserve=ownership "$root/rootfs/usr/." "$target/usr/"
 
 install -Dm755 "$root/tools/device/bt-pair-accessory.sh" \
     "$target/usr/local/libexec/bt-pair-accessory.sh"
+install -Dm755 "$root/tools/device/extract-odm-audio.sh" \
+    "$target/usr/local/sbin/extract-odm-audio.sh"
 
 chmod 0755 "$target/usr/local/sbin/dby-console.sh"
+chmod 0755 "$target/usr/local/sbin/loa-smartpa.py"
 chmod 0755 "$target/usr/local/libexec/bt-awake.py"
 chmod 0755 "$target/usr/local/libexec/mt5727-bt-link.sh"
 chmod 0755 "$target/usr/local/libexec/pen-link-keepalive.py"

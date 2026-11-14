@@ -1,0 +1,264 @@
+From: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
+Subject: [PATCH] sound: soc: qcom: add speaker TDM path and WCD938x capture
+
+Applied to Linux 7.3.1.
+
+Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
+
+--- a/sound/soc/qcom/qdsp6/q6afe.c
++++ b/sound/soc/qcom/qdsp6/q6afe.c
+@@ -1404,6 +1404,9 @@
+ 	pcfg->tdm_cfg.sync_mode = cfg->sync_mode;
+ 	pcfg->tdm_cfg.sync_src = cfg->sync_src;
+ 	pcfg->tdm_cfg.nslots_per_frame = cfg->nslots_per_frame;
++	pcfg->tdm_cfg.ctrl_data_out_enable = cfg->data_out_enable;
++	pcfg->tdm_cfg.ctrl_invert_sync_pulse = cfg->invert_sync;
++	pcfg->tdm_cfg.ctrl_sync_data_delay = cfg->data_delay;
+ 
+ 	pcfg->tdm_cfg.slot_width = cfg->slot_width;
+ 	pcfg->tdm_cfg.slot_mask = cfg->slot_mask;
+--- a/sound/soc/qcom/qdsp6/q6afe.h
++++ b/sound/soc/qcom/qdsp6/q6afe.h
+@@ -192,6 +192,9 @@
+ 	u16	nslots_per_frame;
+ 	u16	slot_width;
+ 	u16	slot_mask;
++	u16	data_out_enable;
++	u16	invert_sync;
++	u16	data_delay;
+ 	u32	data_align_type;
+ 	u16	ch_mapping[AFE_MAX_CHAN_COUNT];
+ };
+--- a/sound/soc/qcom/qdsp6/q6routing.c
++++ b/sound/soc/qcom/qdsp6/q6routing.c
+@@ -1151,6 +1151,12 @@
+ 	session->path_type = path_type;
+ 	session->sample_rate = params_rate(params);
+ 	session->channels = params_channels(params);
++	/*
++	 * 扬声器 TDM 的 ALSA 前端是 2 声道，ADM 需要按 4 声道打开，
++	 * 由 DSP 的混音矩阵把立体声扩展到四个 TDM 槽位。
++	 */
++	if (be_id == PRIMARY_TDM_RX_0)
++		session->channels = 4;
+ 
+ 	switch (params_format(params)) {
+ 	case SNDRV_PCM_FORMAT_S16_LE:
+@@ -1159,6 +1165,9 @@
+ 	case SNDRV_PCM_FORMAT_S24_LE:
+ 			session->bits_per_sample = 24;
+ 		break;
++	case SNDRV_PCM_FORMAT_S32_LE:
++			session->bits_per_sample = 32;
++		break;
+ 	default:
+ 		break;
+ 	}
+--- a/sound/soc/qcom/qdsp6/q6afe-dai.c
++++ b/sound/soc/qcom/qdsp6/q6afe-dai.c
+@@ -272,12 +272,27 @@
+ 	struct q6afe_dai_data *dai_data = dev_get_drvdata(dai->dev);
+ 	struct q6afe_tdm_cfg *tdm = &dai_data->port_config[dai->id].tdm;
+ 
+-	tdm->bit_width = params_width(params);
++	/*
++	 * S32_LE 只是让用户空间的样本落进 32 位容器的高 24 位，DSP 侧仍
++	 * 按 24 bit 样本配置，与原厂 audio_platform_info 的取值一致。
++	 */
++	if (params_format(params) == SNDRV_PCM_FORMAT_S32_LE)
++		tdm->bit_width = 24;
++	else
++		tdm->bit_width = params_width(params);
+ 	tdm->sample_rate = params_rate(params);
+-	tdm->num_channels = params_channels(params);
++	/*
++	 * 扬声器 TDM 端口保持 4 声道：ALSA 侧只提供 2 声道，ADM 上混后
++	 * 由 q6tdm_set_channel_map() 按四槽输出，这里不用覆盖该值。
++	 */
++	if (tdm->num_channels != 4)
++		tdm->num_channels = params_channels(params);
+ 	tdm->data_align_type = dai_data->priv[dai->id].data_align;
+ 	tdm->sync_src = dai_data->priv[dai->id].sync_src;
+ 	tdm->sync_mode = dai_data->priv[dai->id].sync_mode;
++	tdm->data_out_enable = dai_data->priv[dai->id].data_out_enable;
++	tdm->invert_sync = dai_data->priv[dai->id].invert_sync;
++	tdm->data_delay = dai_data->priv[dai->id].data_delay;
+ 
+ 	return 0;
+ }
+--- a/sound/soc/qcom/qdsp6/q6asm-dai.c
++++ b/sound/soc/qcom/qdsp6/q6asm-dai.c
+@@ -113,7 +113,8 @@
+ 				SNDRV_PCM_INFO_INTERLEAVED |
+ 				SNDRV_PCM_INFO_PAUSE | SNDRV_PCM_INFO_RESUME),
+ 	.formats =              (SNDRV_PCM_FMTBIT_S16_LE |
+-				SNDRV_PCM_FMTBIT_S24_LE),
++				SNDRV_PCM_FMTBIT_S24_LE |
++				SNDRV_PCM_FMTBIT_S32_LE),
+ 	.rates =                SNDRV_PCM_RATE_8000_192000,
+ 	.rate_min =             8000,
+ 	.rate_max =             192000,
+@@ -139,7 +140,8 @@
+ 				  SNDRV_PCM_RATE_176400 |		\
+ 				  SNDRV_PCM_RATE_192000),		\
+ 			.formats = (SNDRV_PCM_FMTBIT_S16_LE |		\
+-					SNDRV_PCM_FMTBIT_S24_LE),	\
++					SNDRV_PCM_FMTBIT_S24_LE |	\
++					SNDRV_PCM_FMTBIT_S32_LE),	\
+ 			.channels_min = 1,				\
+ 			.channels_max = 8,				\
+ 			.rate_min =     8000,				\
+@@ -509,6 +511,14 @@
+ 	case SNDRV_PCM_FORMAT_S24_LE:
+ 		prtd->bits_per_sample = 24;
+ 		break;
++	case SNDRV_PCM_FORMAT_S32_LE:
++		/*
++		 * DSP 从 32 位容器的高 24 位取样本，且固件不接受 32 bit
++		 * 样本配置。用户空间以 S32_LE 打开时提供 32 位字，低 8 位
++		 * 被忽略，因此仍按 24 bit 通知 DSP。
++		 */
++		prtd->bits_per_sample = 24;
++		break;
+ 	}
+ 
+ 	return 0;
+--- a/sound/soc/qcom/sm8250.c
++++ b/sound/soc/qcom/sm8250.c
+@@ -17,6 +17,25 @@
+ #include "sdw.h"
+ 
+ #define MI2S_BCLK_RATE		1536000
++/* 扬声器 TDM：48 kHz × 4 slot × 32 bit */
++#define TDM_IBIT_RATE		6144000
++#define TDM_SLOTS		4
++#define TDM_SLOT_WIDTH		32
++#define TDM_SLOT_MASK		GENMASK(TDM_SLOTS - 1, 0)
++/* WCD938x 的 ADC1..4 各占 TX 侧一个通道 */
++#define WCD_TX_CHANNELS		4
++
++/*
++ * 播放数据的声道 i 放到 TDM 的 slot i。四颗功放各自监听一个 slot，
++ * 主机只负责把 4 声道 PCM 排到这条数据线上。
++ *
++ * AFE 的槽位映射参数按字节记录每个声道的起始位置，32 bit 槽宽下一个
++ * 槽占 4 字节，因此这里给出 0、4、8、12。实机传入 0、1、2、3 时 DSP
++ * 返回 EBADPARAM，端口无法启动。
++ */
++static const unsigned int sm8250_tdm_rx_slots[TDM_SLOTS] = {
++	0, TDM_SLOT_WIDTH / 8, 2 * (TDM_SLOT_WIDTH / 8), 3 * (TDM_SLOT_WIDTH / 8),
++};
+ 
+ struct sm8250_snd_data {
+ 	bool stream_prepared[AFE_PORT_MAX];
+@@ -58,6 +77,7 @@
+ static int sm8250_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
+ 				     struct snd_pcm_hw_params *params)
+ {
++	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
+ 	struct snd_interval *rate = hw_param_interval(params,
+ 					SNDRV_PCM_HW_PARAM_RATE);
+ 	struct snd_interval *channels = hw_param_interval(params,
+@@ -65,8 +85,33 @@
+ 	struct snd_mask *fmt = hw_param_mask(params, SNDRV_PCM_HW_PARAM_FORMAT);
+ 
+ 	rate->min = rate->max = 48000;
+-	channels->min = channels->max = 2;
+-	snd_mask_set_format(fmt, SNDRV_PCM_FORMAT_S16_LE);
++
++	/*
++	 * 扬声器 TDM 使用 4 声道、24 bit 采样（放在 32 bit 槽内）；WCD938x
++	 * 采集侧四路 ADC 各占一个通道；其余后端保持 2 声道 16 bit。
++	 *
++	 * DSP 把 TDM 槽的高 24 位当作有效数据，而 ALSA 的 S24_LE 约定低
++	 * 24 位有效，用户空间按该约定写出的样本会整体衰减 8 位。这里声明
++	 * S32_LE，让用户空间按 32 位容器提供数据，高 24 位自然对应到 DSP
++	 * 的样本位置；q6asm 仍以 24 bit 通知 DSP。
++	 */
++	if (cpu_dai->id == PRIMARY_TDM_RX_0) {
++		/*
++		 * 与原厂取值一致：ALSA 前端以 2 声道打开，TDM 端口的 4 声道
++		 * 由 ADM 在 channel_mode 4 下上混得到，槽位映射由 q6afe 的
++		 * 通道映射参数另行下发。
++		 */
++		channels->min = channels->max = 2;
++		/* 清空用户态格式位，确保 BE 只以 32 bit 容器打开 */
++		snd_mask_none(fmt);
++		snd_mask_set_format(fmt, SNDRV_PCM_FORMAT_S32_LE);
++	} else if (cpu_dai->id == TX_CODEC_DMA_TX_3) {
++		channels->min = channels->max = WCD_TX_CHANNELS;
++		snd_mask_set_format(fmt, SNDRV_PCM_FORMAT_S16_LE);
++	} else {
++		channels->min = channels->max = 2;
++		snd_mask_set_format(fmt, SNDRV_PCM_FORMAT_S16_LE);
++	}
+ 
+ 	return 0;
+ }
+@@ -78,6 +123,7 @@
+ 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+ 	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
+ 	struct snd_soc_dai *codec_dai = snd_soc_rtd_to_codec(rtd, 0);
++	int ret;
+ 
+ 	switch (cpu_dai->id) {
+ 	case PRIMARY_MI2S_RX:
+@@ -128,6 +174,29 @@
+ 		snd_soc_dai_set_fmt(cpu_dai, fmt);
+ 		snd_soc_dai_set_fmt(codec_dai, codec_dai_fmt);
+ 		break;
++	case PRIMARY_TDM_RX_0:
++		/*
++		 * 扬声器 TDM 通路。LPASS 作为主端输出 48 kHz 帧，每帧 4 个
++		 * 32 bit slot，位时钟 6.144 MHz。
++		 */
++		ret = snd_soc_dai_set_sysclk(cpu_dai,
++					     Q6AFE_LPASS_CLK_ID_PRI_TDM_IBIT,
++					     TDM_IBIT_RATE,
++					     SNDRV_PCM_STREAM_PLAYBACK);
++		if (ret)
++			return ret;
++
++		ret = snd_soc_dai_set_tdm_slot(cpu_dai, 0, TDM_SLOT_MASK,
++					       TDM_SLOTS, TDM_SLOT_WIDTH);
++		if (ret)
++			return ret;
++
++		ret = snd_soc_dai_set_channel_map(cpu_dai, 0, NULL,
++						  TDM_SLOTS,
++						  sm8250_tdm_rx_slots);
++		if (ret)
++			return ret;
++		break;
+ 	default:
+ 		break;
+ 	}
+@@ -153,9 +222,27 @@
+ 	return qcom_snd_sdw_hw_free(substream, &data->stream_prepared[cpu_dai->id]);
+ }
+ 
++static void sm8250_snd_shutdown(struct snd_pcm_substream *substream)
++{
++	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
++	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
++	int ret;
++
++	/* 关闭时把 TDM 位时钟归零，AFE 随后停止端口 */
++	if (cpu_dai->id == PRIMARY_TDM_RX_0) {
++		ret = snd_soc_dai_set_sysclk(cpu_dai,
++					     Q6AFE_LPASS_CLK_ID_PRI_TDM_IBIT, 0,
++					     SNDRV_PCM_STREAM_PLAYBACK);
++		if (ret)
++			dev_err(rtd->dev, "failed to stop TDM clock: %d\n", ret);
++	}
++
++	qcom_snd_sdw_shutdown(substream);
++}
++
+ static const struct snd_soc_ops sm8250_be_ops = {
+ 	.startup = sm8250_snd_startup,
+-	.shutdown = qcom_snd_sdw_shutdown,
++	.shutdown = sm8250_snd_shutdown,
+ 	.hw_free = sm8250_snd_hw_free,
+ 	.prepare = sm8250_snd_prepare,
+ };

@@ -1,0 +1,13 @@
+[Unit]
+Description=DBY-W09 TFA9874 speaker amplifier control
+After=local-fs.target sound.target
+Wants=sound.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/sbin/loa-smartpa.py
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
