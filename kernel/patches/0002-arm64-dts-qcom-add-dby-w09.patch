@@ -17,14 +17,14 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  dtb-$(CONFIG_ARCH_QCOM)	+= sm8250-samsung-x1q.dtb
 --- /dev/null
 +++ b/arch/arm64/boot/dts/qcom/sm8250-huawei-dby-w09.dts
-@@ -0,0 +1,1594 @@
+@@ -0,0 +1,1603 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +/*
 + * Huawei MatePad 11 2021 (DBY-W09), Qualcomm SM8250 (kona).
 + *
 + * 板级设备树：内存与保留区、UFS/SD/USB、Type-C 与 DisplayPort、
-+ * 双 DSI 显示与触摸、无线供电、WLAN 与蓝牙、ADSP 音频、RTC、
-+ * 按键以及 GPU 配置。
++ * 双 DSI 显示与触摸、无线供电、WLAN 与蓝牙、ADSP 音频、Venus 视频
++ * 解码、RTC、按键以及 GPU 配置。
 + */
 +
 +/dts-v1/;
@@ -1352,6 +1352,15 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +			qcom,glink-channels = "IPCRTR";
 +		};
 +	};
++};
++
++/*
++ * Venus 视频加速器（PAS id 9）。固件放在 SD 卡根文件系统的
++ * /lib/firmware/qcom/sm8250/dby-w09/ 下。
++ */
++&venus {
++	firmware-name = "qcom/sm8250/dby-w09/venus.mdt";
++	status = "okay";
 +};
 +
 +/*

@@ -1,0 +1,29 @@
+From: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
+Subject: [PATCH] media: venus: extend the EOS address quirk to firmware 1.0.96
+
+Applied to Linux 7.3.1.
+
+Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
+
+--- a/drivers/media/platform/qcom/venus/vdec.c
++++ b/drivers/media/platform/qcom/venus/vdec.c
+@@ -569,12 +569,14 @@
+ 		fdata.buffer_type = HFI_BUFFER_INPUT;
+ 		fdata.flags |= HFI_BUFFERFLAG_EOS;
+ 
+-		/* Send NULL EOS addr for only IRIS2 (SM8250),for firmware <= 1.0.87.
+-		 * SC7280 also reports "1.0.<hash>" parsed as 1.0.0; restricting to IRIS2
+-		 * avoids misapplying this quirk and breaking VP9 decode on SC7280.
++		/*
++		 * DBY-W09 的原厂固件版本为 VIDEO.VPU.1.0-00096，EOS 缓冲区
++		 * 地址的行为与 1.0.87 及更早的版本相同：地址需要为 NULL。
++		 * 传入 0xdeadb000 时固件会发起 IOVA 0 的访问，SMMU 报告翻译
++		 * 异常，随后固件以 FA = 0x0、cause = 0x6 终止，会话错误恢复
++		 * 失败并复位整机。上游的 NULL 地址判断因此放宽到 1.0.96。
+ 		 */
+-
+-		if (IS_IRIS2(inst->core) && is_fw_rev_or_older(inst->core, 1, 0, 87))
++		if (IS_IRIS2(inst->core) && is_fw_rev_or_older(inst->core, 1, 0, 96))
+ 			fdata.device_addr = 0;
+ 		else
+ 			fdata.device_addr = 0xdeadb000;

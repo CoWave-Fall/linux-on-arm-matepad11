@@ -1,0 +1,15 @@
+[Unit]
+Description=DBY-W09 Venus video firmware load
+# 固件放在 SD 卡根文件系统，内核在挂载根之前就会 probe，首次加载必然失败，
+# 因此在根文件系统就绪后重新触发一次 probe。
+After=local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'test -e /sys/bus/platform/drivers/qcom-venus/aa00000.video-codec && exit 0; echo aa00000.video-codec > /sys/bus/platform/drivers/qcom-venus/bind'
+ExecStartPost=/bin/sh -c 'for i in $(seq 1 20); do [ -e /dev/video1 ] && exit 0; sleep 1; done; exit 1'
+
+[Install]
+WantedBy=multi-user.target
