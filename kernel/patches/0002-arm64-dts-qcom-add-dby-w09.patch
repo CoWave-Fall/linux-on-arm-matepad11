@@ -17,7 +17,7 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  dtb-$(CONFIG_ARCH_QCOM)	+= sm8250-samsung-x1q.dtb
 --- /dev/null
 +++ b/arch/arm64/boot/dts/qcom/sm8250-huawei-dby-w09.dts
-@@ -0,0 +1,1122 @@
+@@ -0,0 +1,1210 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +/*
 + * Huawei MatePad 11 2021 (DBY-W09), Qualcomm SM8250 (kona).
@@ -35,6 +35,7 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +#include <dt-bindings/interrupt-controller/irq.h>
 +#include <dt-bindings/phy/phy.h>
 +#include <dt-bindings/regulator/qcom,rpmh-regulator.h>
++#include <dt-bindings/usb/pd.h>
 +#include "sm8250.dtsi"
 +#include "pm8150.dtsi"
 +#include "pm8150b.dtsi"
@@ -309,6 +310,16 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +			regulator-boot-on;
 +		};
 +
++		/* QMP USB3/DP 组合 PHY 的 0.92 V 模拟电源 */
++		vreg_l18a_0p92: ldo18 {
++			regulator-name = "vreg_l18a_0p92";
++			regulator-min-microvolt = <920000>;
++			regulator-max-microvolt = <920000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++			regulator-always-on;
++			regulator-boot-on;
++		};
++
 +		vreg_s4a_1p8: smps4 {
 +			regulator-name = "vreg_s4a_1p8";
 +			regulator-min-microvolt = <1800000>;
@@ -391,21 +402,26 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +};
 +
 +/*
-+ * USB 2.0 外设模式：initramfs 用它建立 ACM 串口，主机侧出现 /dev/ttyACM*，
-+ * 作为无法读取屏幕时的控制台通道。
++ * USB 3.0 外设模式：DWC3 同时使用 HS PHY 与 USB3/DP 组合 PHY。initramfs
++ * 通过该控制器建立 ACM 串口，主机侧出现 /dev/ttyACM*，作为无法读取屏幕
++ * 时的控制台通道；Type-C 端口控制器负责检测插头方向并切换 SS 通道。
 + */
 +&usb_1 {
 +	status = "okay";
-+
-+	/* 未启用 SS PHY，由 UTMI 时钟充当 PIPE 时钟 */
-+	qcom,select-utmi-as-pipe-clk;
 +};
 +
 +&usb_1_dwc3 {
++	/*
++	 * DWC_usb31 的 LLUCTL 寄存器位于 0xd024，超出 sm8250.dtsi 原本
++	 * 0xcd00 的映射长度；SuperSpeed 初始化会读写该寄存器，这里扩大到
++	 * 0xe000，避免访问落在 ioremap 范围之外触发缺页。
++	 */
++	reg = <0 0x0a600000 0 0xe000>;
++
 +	dr_mode = "peripheral";
-+	maximum-speed = "high-speed";
-+	phys = <&usb_1_hsphy>;
-+	phy-names = "usb2-phy";
++	maximum-speed = "super-speed";
++	phys = <&usb_1_hsphy>, <&usb_1_qmpphy QMP_USB43DP_USB3_PHY>;
++	phy-names = "usb2-phy", "usb3-phy";
 +};
 +
 +&usb_1_hsphy {
@@ -414,6 +430,18 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +	vdda-pll-supply = <&vreg_l5a_0p88>;
 +	vdda18-supply = <&vreg_l12a_1p8>;
 +	vdda33-supply = <&vreg_l2a_3p1>;
++};
++
++/*
++ * USB3/DP 组合 PHY。DP 通道暂未启用，这里只提供 USB3 SuperSpeed；
++ * orientation-switch 由 sm8250.dtsi 声明，Type-C 端口据此切换 SS 通道。
++ */
++&usb_1_qmpphy {
++	status = "okay";
++	mode-switch;
++
++	vdda-phy-supply = <&vreg_l18a_0p92>;
++	vdda-pll-supply = <&vreg_l9a_1p2>;
 +};
 +
 +&qupv3_id_1 {
@@ -1063,6 +1091,66 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +			io-channel-names = "vbat";
 +		};
 +	};
++};
++
++/*
++ * PM8150B 的 Type-C 端口控制器与 USB PD PHY。设备固定为受电与外设角色，
++ * 端口控制器只负责 CC 检测、插头方向与 PD 协商；插头方向经端口图传给
++ * QMP PHY 的 orientation-switch，用于交换 SuperSpeed 收发通道。
++ */
++&pm8150b_typec {
++	status = "okay";
++
++	vdd-pdphy-supply = <&vreg_l2a_3p1>;
++
++	connector {
++		compatible = "usb-c-connector";
++		label = "USB-C";
++
++		power-role = "sink";
++		data-role = "device";
++		self-powered;
++
++		vbus-supply = <&pm8150b_vbus>;
++		op-sink-microwatt = <10000000>;
++
++		sink-pdos = <PDO_FIXED(5000, 3000, PDO_FIXED_USB_COMM)>;
++
++		ports {
++			#address-cells = <1>;
++			#size-cells = <0>;
++
++			port@0 {
++				reg = <0>;
++
++				pm8150b_hs_in: endpoint {
++					remote-endpoint = <&usb_1_dwc3_hs_out>;
++				};
++			};
++
++			port@1 {
++				reg = <1>;
++
++				pm8150b_ss_in: endpoint {
++					remote-endpoint = <&usb_1_qmpphy_out>;
++				};
++			};
++		};
++	};
++};
++
++&pm8150b_vbus {
++	regulator-min-microamp = <500000>;
++	regulator-max-microamp = <3000000>;
++	status = "okay";
++};
++
++&usb_1_dwc3_hs_out {
++	remote-endpoint = <&pm8150b_hs_in>;
++};
++
++&usb_1_qmpphy_out {
++	remote-endpoint = <&pm8150b_ss_in>;
 +};
 +
 +&pm8150b_adc {
