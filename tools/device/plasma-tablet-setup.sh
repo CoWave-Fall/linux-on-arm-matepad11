@@ -1,10 +1,12 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
-# 平板桌面体验配置：虚拟键盘、触摸屏边缘手势与旋转快捷方式。
+# 平板桌面体验配置：虚拟键盘、触摸屏边缘手势、旋转快捷方式与自动亮度曲线。
 # 以桌面用户身份在图形会话内运行；重复执行结果相同。
 
 set -euo pipefail
+
+script_dir=$(cd "$(dirname "$0")" && pwd)
 
 if [ -z "${XDG_RUNTIME_DIR:-}" ] || [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
     echo "缺少图形会话环境，请在桌面用户下执行" >&2
@@ -50,7 +52,11 @@ write_desktop loa-rotate-normal.desktop "切换到横屏" right
 write_desktop loa-rotate-left.desktop "切换到竖屏" normal
 write_desktop loa-rotate-right.desktop "切换到竖屏（反向）" inverted
 
-# 边缘手势立即生效；虚拟键盘在下次登录时加载
+# 自动亮度：KWin 的曲线只能逐点学习，重装后写入 10 点基线。
+# 已有四个以上控制点时脚本保留现状，只首次执行或 --force 时覆盖。
+python3 "$script_dir/loa-autobrightness-curve.py"
+
+# 边缘手势立即生效；虚拟键盘与自动亮度曲线在下次登录时加载
 qdbus6 org.kde.KWin /KWin reconfigure 2>/dev/null || true
 
-echo "桌面配置已写入，虚拟键盘在下次登录后启用"
+echo "桌面配置已写入，虚拟键盘与自动亮度曲线在下次登录后启用"

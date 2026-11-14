@@ -35,7 +35,7 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  obj-$(CONFIG_BACKLIGHT_LM3630A)		+= lm3630a_bl.o
 --- /dev/null
 +++ b/Documentation/devicetree/bindings/leds/backlight/richtek,rt8555.yaml
-@@ -0,0 +1,53 @@
+@@ -0,0 +1,71 @@
 +# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
 +%YAML 1.2
 +---
@@ -67,6 +67,24 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +    maxItems: 1
 +    description: GPIO that enables the backlight converter.
 +
++  richtek,min-brightness:
++    $ref: /schemas/types.yaml#/definitions/uint32
++    minimum: 1
++    maximum: 1023
++    default: 7
++    description:
++      Lowest raw brightness level written to the 10-bit register. User
++      brightness values are mapped onto the range between this level and
++      richtek,max-brightness, while zero still turns the panel off.
++
++  richtek,max-brightness:
++    $ref: /schemas/types.yaml#/definitions/uint32
++    minimum: 1
++    maximum: 1023
++    default: 982
++    description:
++      Highest raw brightness level written to the 10-bit register.
++
 +required:
 +  - compatible
 +  - reg
@@ -91,7 +109,7 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +...
 --- /dev/null
 +++ b/drivers/video/backlight/rt8555.c
-@@ -0,0 +1,154 @@
+@@ -0,0 +1,238 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Richtek RT8555 背光控制器驱动。
@@ -103,6 +121,10 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 + *
 + * 芯片的通道电流、升压频率与调光方式由引导阶段或片上 OTP 配置完成，
 + * 驱动只接管亮度寄存器，避免在 Linux 侧重复写入厂商初始化序列。
++ *
++ * 寄存器值与人的亮度感受呈幂律关系，直接按百分比写入会让低亮度区
++ * 变化过于剧烈。驱动对外提供 CIE 1931 明度曲线的亮度值，内部换算
++ * 到厂商给出的原始级别区间。
 + */
 +
 +#include <linux/backlight.h>
@@ -117,10 +139,18 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +#define RT8555_BRT_MAX		0x3FF
 +#define RT8555_BRT_MSB_MASK	0x03
 +
++/*
++ * 原厂 12 位亮度上下限 30 与 3932，范围 0..4095。换算到 10 位寄存器
++ * 并四舍五入得到 7 与 982，设备树可以覆盖。
++ */
++#define RT8555_RAW_MIN_DEFAULT	7
++#define RT8555_RAW_MAX_DEFAULT	982
++
 +struct rt8555 {
 +	struct i2c_client *client;
-+	struct backlight_device *bl;
 +	struct gpio_desc *enable;
++	unsigned int raw_min;
++	unsigned int raw_max;
 +};
 +
 +static int rt8555_write_brightness(struct rt8555 *priv, unsigned int level)
@@ -151,11 +181,69 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +	return ((msb & RT8555_BRT_MSB_MASK) << 8) | lsb;
 +}
 +
++/*
++ * 把感知亮度换算成芯片原始级别。
++ *
++ * 输入 0..RT8555_BRT_MAX 先按 CIE 1931 明度换算成 0..1000 的 L*，
++ * 再由 L* 求相对亮度 Y。L* 与 Y 的关系为 L* = 116 * Y^(1/3) - 16，
++ * L* 低于 8 时改用线性段 L* = 903.3 * Y。Y 用 16 位定点数表示，
++ * 最后线性映射到 [raw_min, raw_max]。亮度 0 直接返回 0，保证关屏。
++ */
++static unsigned int rt8555_level_to_raw(const struct rt8555 *priv,
++					unsigned int level)
++{
++	unsigned int span = priv->raw_max - priv->raw_min;
++	u64 l;
++	u64 t;
++	u64 y;
++
++	if (!level)
++		return 0;
++
++	l = (u64)level * 1000 / RT8555_BRT_MAX;
++
++	if (l <= 80) {
++		y = l * 65536 / 9033;
++	} else {
++		t = ((l + 160) << 16) / 1160;
++		y = t * t >> 16;
++		y = y * t >> 16;
++	}
++
++	return priv->raw_min + (unsigned int)((u64)span * y >> 16);
++}
++
++/*
++ * 冷启动时寄存器里是上一次留下的原始级别，需要反查对应的感知亮度。
++ * 正算函数单调递增，用二分查找避免开立方。
++ */
++static unsigned int rt8555_raw_to_level(const struct rt8555 *priv,
++					unsigned int raw)
++{
++	unsigned int lo = 0;
++	unsigned int hi = RT8555_BRT_MAX;
++
++	if (raw <= priv->raw_min)
++		return 0;
++
++	while (lo < hi) {
++		unsigned int mid = (lo + hi + 1) / 2;
++
++		if (rt8555_level_to_raw(priv, mid) <= raw)
++			lo = mid;
++		else
++			hi = mid - 1;
++	}
++
++	return lo;
++}
++
 +static int rt8555_update_status(struct backlight_device *bl)
 +{
 +	struct rt8555 *priv = bl_get_data(bl);
++	unsigned int level = backlight_get_brightness(bl);
 +
-+	return rt8555_write_brightness(priv, backlight_get_brightness(bl));
++	return rt8555_write_brightness(priv, rt8555_level_to_raw(priv, level));
 +}
 +
 +static const struct backlight_ops rt8555_bl_ops = {
@@ -175,6 +263,21 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +		return -ENOMEM;
 +
 +	priv->client = client;
++	priv->raw_min = RT8555_RAW_MIN_DEFAULT;
++	priv->raw_max = RT8555_RAW_MAX_DEFAULT;
++
++	/*
++	 * 上下限都可以在设备树覆盖，方便按实机观感调整。原始级别超过
++	 * 10 位范围或上下限颠倒时拒绝 probe，避免写入无效值。
++	 */
++	of_property_read_u32(client->dev.of_node, "richtek,min-brightness",
++			     &priv->raw_min);
++	of_property_read_u32(client->dev.of_node, "richtek,max-brightness",
++			     &priv->raw_max);
++	if (priv->raw_max > RT8555_BRT_MAX || priv->raw_min > priv->raw_max)
++		return dev_err_probe(&client->dev, -EINVAL,
++				     "invalid brightness range %u..%u\n",
++				     priv->raw_min, priv->raw_max);
 +
 +	/*
 +	 * 使能脚由引导阶段保持高电平。这里重新请求一次并在移除时释放，
@@ -194,8 +297,8 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +	memset(&props, 0, sizeof(props));
 +	props.type = BACKLIGHT_PLATFORM;
 +	props.max_brightness = RT8555_BRT_MAX;
-+	props.brightness = level;
-+	props.scale = BACKLIGHT_SCALE_LINEAR;
++	props.brightness = rt8555_raw_to_level(priv, level);
++	props.scale = BACKLIGHT_SCALE_NON_LINEAR;
 +
 +	bl = devm_backlight_device_register(&client->dev, "rt8555-backlight",
 +					   &client->dev, priv,
@@ -204,7 +307,6 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +		return dev_err_probe(&client->dev, PTR_ERR(bl),
 +				     "cannot register backlight device\n");
 +
-+	priv->bl = bl;
 +	i2c_set_clientdata(client, priv);
 +
 +	return 0;

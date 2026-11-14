@@ -1,6 +1,6 @@
 # 操作全流程
 
-更新时间：2026-11-10 23:52 +8
+更新时间：2026-11-14 21:05 +08:00
 
 本文从已解锁并完成备份的设备开始，依次完成 U-Boot 构建、recovery 刷写、
 SD 卡根文件系统、内核启动、系统配置与桌面安装。全程保留 HarmonyOS 的
@@ -472,7 +472,9 @@ systemctl enable plasmalogin
 /usr/local/share/loa-tools/device/plasma-tablet-setup.sh
 ```
 
-脚本写入虚拟键盘、触摸边缘手势、旋转快捷方式与边缘触发宽度。
+脚本写入虚拟键盘、触摸边缘手势、旋转快捷方式与边缘触发宽度，并在末尾
+调用 `loa-autobrightness-curve.py`，把 10 点自动亮度基线写进
+`~/.config/kwinoutputconfig.json`。
 
 ### 环境色温
 
@@ -504,6 +506,20 @@ loa-tabletctl auto-brightness on
 loa-tabletctl rotate normal
 loa-tabletctl key-bindings
 ```
+
+### 自动亮度曲线
+
+KWin 的自动亮度曲线只能在手动调亮度时按当前照度逐点学习，重装 rootfs 后
+会退回稀疏状态并重新出现抖动。平板配置脚本已在末尾调用
+`loa-autobrightness-curve.py`，也可以在图形会话内单独执行：
+
+```bash
+/usr/local/share/loa-tools/device/loa-autobrightness-curve.py
+```
+
+配置文件里的控制点少于 4 个时覆盖为基线曲线并开启自动亮度，已有学习结果
+时保持现状，`--force` 强制写回基线。KWin 只在启动时读取该文件，写完退出
+登录再进入生效。
 
 ### 蓝牙配对
 

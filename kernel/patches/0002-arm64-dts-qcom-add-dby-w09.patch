@@ -17,14 +17,14 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  dtb-$(CONFIG_ARCH_QCOM)	+= sm8250-samsung-x1q.dtb
 --- /dev/null
 +++ b/arch/arm64/boot/dts/qcom/sm8250-huawei-dby-w09.dts
-@@ -0,0 +1,1603 @@
+@@ -0,0 +1,1610 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +/*
 + * Huawei MatePad 11 2021 (DBY-W09), Qualcomm SM8250 (kona).
 + *
 + * 板级设备树：内存与保留区、UFS/SD/USB、Type-C 与 DisplayPort、
-+ * 双 DSI 显示与触摸、无线供电、WLAN 与蓝牙、ADSP 音频、Venus 视频
-+ * 解码、RTC、按键以及 GPU 配置。
++ * 双 DSI 显示与触摸、背光、无线供电、WLAN 与蓝牙、ADSP 音频、Venus
++ * 视频解码、RTC、按键以及 GPU 配置。
 + */
 +
 +/dts-v1/;
@@ -587,6 +587,13 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +		compatible = "richtek,rt8555";
 +		reg = <0x31>;
 +		enable-gpios = <&tlmm 10 GPIO_ACTIVE_HIGH>;
++
++		/*
++		 * 厂商 12 位亮度范围为 30..3932，按 10 位寄存器换算得到
++		 * 7..982，驱动在这两个原始级别之间分配用户亮度。
++		 */
++		richtek,min-brightness = <7>;
++		richtek,max-brightness = <982>;
 +
 +		pinctrl-names = "default";
 +		pinctrl-0 = <&bl_en_default>;
