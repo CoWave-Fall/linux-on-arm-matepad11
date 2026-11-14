@@ -17,13 +17,13 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  dtb-$(CONFIG_ARCH_QCOM)	+= sm8250-samsung-x1q.dtb
 --- /dev/null
 +++ b/arch/arm64/boot/dts/qcom/sm8250-huawei-dby-w09.dts
-@@ -0,0 +1,1210 @@
+@@ -0,0 +1,1279 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +/*
 + * Huawei MatePad 11 2021 (DBY-W09), Qualcomm SM8250 (kona).
 + *
-+ * 板级设备树：内存与保留区、UFS/SD/USB、双 DSI 显示与触摸、
-+ * 无线供电、WLAN 与蓝牙、RTC、按键以及 GPU 配置。
++ * 板级设备树：内存与保留区、UFS/SD/USB、Type-C 与 DisplayPort、
++ * 双 DSI 显示与触摸、无线供电、WLAN 与蓝牙、RTC、按键以及 GPU 配置。
 + */
 +
 +/dts-v1/;
@@ -402,9 +402,11 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +};
 +
 +/*
-+ * USB 3.0 外设模式：DWC3 同时使用 HS PHY 与 USB3/DP 组合 PHY。initramfs
++ * USB 3.0 双角色：DWC3 同时使用 HS PHY 与 USB3/DP 组合 PHY。initramfs
 + * 通过该控制器建立 ACM 串口，主机侧出现 /dev/ttyACM*，作为无法读取屏幕
-+ * 时的控制台通道；Type-C 端口控制器负责检测插头方向并切换 SS 通道。
++ * 时的控制台通道。Type-C 端口控制器负责检测插头方向、电源角色与数据
++ * 角色：连接主机时作为外设，连接 U 盘或 OTG 设备时切换为主机，并由
++ * PM8150B 的 VBUS 稳压器向设备供电。
 + */
 +&usb_1 {
 +	status = "okay";
@@ -418,8 +420,9 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +	 */
 +	reg = <0 0x0a600000 0 0xe000>;
 +
-+	dr_mode = "peripheral";
++	dr_mode = "otg";
 +	maximum-speed = "super-speed";
++	usb-role-switch;
 +	phys = <&usb_1_hsphy>, <&usb_1_qmpphy QMP_USB43DP_USB3_PHY>;
 +	phy-names = "usb2-phy", "usb3-phy";
 +};
@@ -433,8 +436,9 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +};
 +
 +/*
-+ * USB3/DP 组合 PHY。DP 通道暂未启用，这里只提供 USB3 SuperSpeed；
-+ * orientation-switch 由 sm8250.dtsi 声明，Type-C 端口据此切换 SS 通道。
++ * USB3/DP 组合 PHY。USB 侧提供 SuperSpeed；DP 侧在进入 DisplayPort
++ * 交替模式后由 Type-C 复用器启用。orientation-switch 由 sm8250.dtsi
++ * 声明，mode-switch 供端口控制器查找组合 PHY 的复用器。
 + */
 +&usb_1_qmpphy {
 +	status = "okay";
@@ -677,6 +681,26 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +	/* 该面板要求每条链路由本 PHY 的 PLL 产生位时钟 */
 +	qcom,dsi-phy-own-pll;
 +	status = "okay";
++};
++
++/*
++ * DisplayPort 交替模式：DP 控制器经 QMP 组合 PHY 的 DP 通道输出，
++ * 两条 lane 支持 RBR、HBR 与 HBR2。HPD 由 Type-C 交替模式的 VDM 状态
++ * 更新经端口控制器的辅助 HPD 桥转发；QMP PHY 注册的辅助桥经
++ * usb_1_qmpphy_out 与 USB-C 连接器相连，为 DP 连接器提供 fwnode。
++ */
++&mdss_dp {
++	status = "okay";
++};
++
++&mdss_dp_out {
++	data-lanes = <0 1>;
++	link-frequencies = /bits/ 64 <1620000000 2700000000 5400000000>;
++	remote-endpoint = <&usb_1_qmpphy_dp_in>;
++};
++
++&usb_1_qmpphy_dp_in {
++	remote-endpoint = <&mdss_dp_out>;
 +};
 +
 +&uart12 {
@@ -1094,9 +1118,11 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +};
 +
 +/*
-+ * PM8150B 的 Type-C 端口控制器与 USB PD PHY。设备固定为受电与外设角色，
-+ * 端口控制器只负责 CC 检测、插头方向与 PD 协商；插头方向经端口图传给
-+ * QMP PHY 的 orientation-switch，用于交换 SuperSpeed 收发通道。
++ * PM8150B 的 Type-C 端口控制器与 USB PD PHY。电源角色与数据角色均为双
++ * 角色：连接充电器或主机时作为受电与外设，连接 U 盘、键鼠或 OTG 设备
++ * 时切换为供电与主机。插头方向同时传给 QMP PHY 与 FSA4480，用于交换
++ * SuperSpeed 收发通道和 DP AUX 通道。displayport 交替模式条目让端口在
++ * Discover Modes 中声明 DFP_D、插座形态与 C/D/E 三种引脚分配。
 + */
 +&pm8150b_typec {
 +	status = "okay";
@@ -1107,14 +1133,26 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +		compatible = "usb-c-connector";
 +		label = "USB-C";
 +
-+		power-role = "sink";
-+		data-role = "device";
++		power-role = "dual";
++		try-power-role = "sink";
++		data-role = "dual";
 +		self-powered;
 +
 +		vbus-supply = <&pm8150b_vbus>;
 +		op-sink-microwatt = <10000000>;
 +
++		source-pdos = <PDO_FIXED(5000, 3000,
++					 PDO_FIXED_DUAL_ROLE |
++					 PDO_FIXED_USB_COMM |
++					 PDO_FIXED_DATA_SWAP)>;
 +		sink-pdos = <PDO_FIXED(5000, 3000, PDO_FIXED_USB_COMM)>;
++
++		altmodes {
++			displayport {
++				svid = /bits/ 16 <0xff01>;
++				vdo = <0x00001c46>;
++			};
++		};
 +
 +		ports {
 +			#address-cells = <1>;
@@ -1135,6 +1173,14 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +					remote-endpoint = <&usb_1_qmpphy_out>;
 +				};
 +			};
++
++			port@2 {
++				reg = <2>;
++
++				pm8150b_sbu: endpoint {
++					remote-endpoint = <&fsa4480_sbu>;
++				};
++			};
 +		};
 +	};
 +};
@@ -1151,6 +1197,29 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +
 +&usb_1_qmpphy_out {
 +	remote-endpoint = <&pm8150b_ss_in>;
++};
++
++/*
++ * FSA4480 是 USB-C 连接器 SBU 引脚的模拟开关：DP 交替模式下把 AUX+/-
++ * 接到 QMP 组合 PHY。器件挂在 QUPv3 wrap2 SE15（i2c15）上，地址 0x43。
++ */
++&i2c15 {
++	status = "okay";
++
++	typec-mux@43 {
++		compatible = "fcs,fsa4480";
++		reg = <0x43>;
++
++		mode-switch;
++		orientation-switch;
++
++		port {
++			fsa4480_sbu: endpoint {
++				remote-endpoint = <&pm8150b_sbu>;
++				data-lanes = <0 1>;
++			};
++		};
++	};
 +};
 +
 +&pm8150b_adc {
