@@ -17,13 +17,14 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  dtb-$(CONFIG_ARCH_QCOM)	+= sm8250-samsung-x1q.dtb
 --- /dev/null
 +++ b/arch/arm64/boot/dts/qcom/sm8250-huawei-dby-w09.dts
-@@ -0,0 +1,1279 @@
+@@ -0,0 +1,1352 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +/*
 + * Huawei MatePad 11 2021 (DBY-W09), Qualcomm SM8250 (kona).
 + *
 + * 板级设备树：内存与保留区、UFS/SD/USB、Type-C 与 DisplayPort、
-+ * 双 DSI 显示与触摸、无线供电、WLAN 与蓝牙、RTC、按键以及 GPU 配置。
++ * 双 DSI 显示与触摸、无线供电、WLAN 与蓝牙、ADSP 音频、RTC、
++ * 按键以及 GPU 配置。
 + */
 +
 +/dts-v1/;
@@ -35,6 +36,8 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +#include <dt-bindings/interrupt-controller/irq.h>
 +#include <dt-bindings/phy/phy.h>
 +#include <dt-bindings/regulator/qcom,rpmh-regulator.h>
++#include <dt-bindings/sound/qcom,q6afe.h>
++#include <dt-bindings/sound/qcom,q6asm.h>
 +#include <dt-bindings/usb/pd.h>
 +#include "sm8250.dtsi"
 +#include "pm8150.dtsi"
@@ -237,6 +240,40 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +		vin-supply = <&vreg_l11c_3p0>;
 +		enable-gpios = <&tlmm 12 GPIO_ACTIVE_HIGH>;
 +		regulator-enable-ramp-delay = <2000>;
++	};
++
++	/*
++	 * 声卡：DP 音频的后端是 ADSP 的 DISPLAY_PORT_RX，codec 由 DRM
++	 * 创建的 hdmi-codec 提供。前端 MultiMedia1 供用户空间播放，
++	 * ADM 在运行期通过 q6routing 的混音控件选择后端。
++	 */
++	sound {
++		compatible = "qcom,sm8250-sndcard";
++		model = "DBY-W09";
++
++		mm1-dai-link {
++			link-name = "MultiMedia1";
++
++			cpu {
++				sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA1>;
++			};
++		};
++
++		displayport-rx-dai-link {
++			link-name = "DisplayPort Playback";
++
++			cpu {
++				sound-dai = <&q6afedai DISPLAY_PORT_RX>;
++			};
++
++			platform {
++				sound-dai = <&q6routing>;
++			};
++
++			codec {
++				sound-dai = <&mdss_dp>;
++			};
++		};
 +	};
 +};
 +
@@ -1249,6 +1286,42 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +		qrtr_requests {
 +			qcom,glink-channels = "IPCRTR";
 +		};
++	};
++};
++
++/*
++ * ADSP（音频 DSP，0x17300000）。Q6DSP 的 AFE、ADM 与 ASM 服务经 glink
++ * 上的 APR 访问，DP 音频使用 AFE 的 DISPLAY_PORT_RX 端口。PAS 固件取自
++ * vendor 分区的 image/adsp.mdt 与 adsp.b00..b18，放在 SD 卡根文件系统的
++ * /lib/firmware/qcom/sm8250/dby-w09/ 下；APR 服务带 protection-domain，
++ * 需要 QRTR 的 IPCRTR 通道完成 PDR 查询。
++ */
++&adsp {
++	firmware-name = "qcom/sm8250/dby-w09/adsp.mdt";
++	status = "okay";
++
++	glink-edge {
++		qrtr_requests {
++			qcom,glink-channels = "IPCRTR";
++		};
++	};
++};
++
++/*
++ * q6afe 的 DAI 由驱动静态注册，子节点用于声明实际使用的端口。
++ */
++&q6afedai {
++	dai@104 {
++		reg = <DISPLAY_PORT_RX>;
++	};
++};
++
++/*
++ * q6asm 只注册子节点列出的前端 DAI，至少需要一个。
++ */
++&q6asmdai {
++	dai@0 {
++		reg = <MSM_FRONTEND_DAI_MULTIMEDIA1>;
 +	};
 +};
 +
