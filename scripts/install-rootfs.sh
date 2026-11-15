@@ -73,6 +73,7 @@ install -Dm755 "$root/tools/device/extract-odm-audio.sh" \
 
 chmod 0755 "$target/usr/local/sbin/dby-console.sh"
 chmod 0755 "$target/usr/local/sbin/loa-smartpa.py"
+chmod 0755 "$target/usr/local/libexec/loa-charge-led"
 chmod 0755 "$target/usr/local/libexec/bt-awake.py"
 chmod 0755 "$target/usr/local/libexec/mt5727-bt-link.sh"
 chmod 0755 "$target/usr/local/libexec/pen-link-keepalive.py"

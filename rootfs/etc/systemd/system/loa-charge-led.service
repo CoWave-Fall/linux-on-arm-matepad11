@@ -1,0 +1,11 @@
+[Unit]
+Description=DBY-W09 charging indicator LED
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/libexec/loa-charge-led
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

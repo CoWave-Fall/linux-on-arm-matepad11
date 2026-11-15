@@ -1,0 +1,123 @@
+#!/usr/bin/python3
+"""按外部供电状态设置 PM8150L 通知灯。
+
+设备只有红、绿两颗通知灯，由 leds-qcom-lpg 以多色 LED 暴露为
+`/sys/class/leds/multicolor:status`。状态来源为 PM8150B 电池驱动：
+`usb/online` 表示外部供电在位，`battery/status` 给出满电判定。
+
+映射关系：外部供电在位且未满电时亮红灯，满电时亮绿灯，其余情况熄灭。
+多色 LED 的 `multi_intensity` 只在 `brightness` 大于零时生效，启动时把
+亮度设为最大值，之后只改两个通道的强度。
+
+服务以 root 运行，由 systemd 在 multi-user.target 拉起。轮询间隔 2 秒，
+状态变化时写一次 sysfs；写入失败直接终止进程，由 systemd 重启。
+"""
+
+import logging
+import os
+import signal
+import sys
+import time
+
+LED_ROOT = "/sys/class/leds/multicolor:status"
+BATTERY_ROOT = "/sys/class/power_supply/battery"
+USB_ROOT = "/sys/class/power_supply/usb"
+
+# 两路 LED 的最大强度均为 511。红灯取约四分之一、绿灯取约一半，
+# 兼顾夜间可见与功耗，取值参照原厂默认亮度比例。
+RED_INTENSITY = 128
+GREEN_INTENSITY = 256
+
+POLL_SECONDS = 2
+# 启动时等待 LED 与电源设备枚举，类设备由内核异步注册。
+STARTUP_TIMEOUT_SECONDS = 30
+
+logger = logging.getLogger("loa-charge-led")
+
+stop_requested = False
+
+
+def read_attribute(path):
+    with open(path, encoding="utf-8") as file:
+        return file.read().strip()
+
+
+def write_attribute(path, value):
+    with open(path, "w", encoding="utf-8") as file:
+        file.write(f"{value}\n")
+
+
+def wait_for_paths(paths):
+    deadline = time.monotonic() + STARTUP_TIMEOUT_SECONDS
+    while True:
+        missing = [path for path in paths if not os.path.exists(path)]
+        if not missing:
+            return
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"等待设备节点超时：{', '.join(missing)}")
+        time.sleep(1)
+
+
+def desired_intensity():
+    """返回 (红, 绿) 强度。外部供电缺失时两路均为零。"""
+    if read_attribute(f"{USB_ROOT}/online") != "1":
+        return (0, 0)
+    if read_attribute(f"{BATTERY_ROOT}/status") == "Full":
+        return (0, GREEN_INTENSITY)
+    return (RED_INTENSITY, 0)
+
+
+def apply_intensity(intensity):
+    red, green = intensity
+    write_attribute(f"{LED_ROOT}/multi_intensity", f"{red} {green}")
+
+
+def handle_stop(_signum, _frame):
+    global stop_requested
+    stop_requested = True
+
+
+def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="loa-charge-led: %(levelname)s %(message)s",
+    )
+
+    signal.signal(signal.SIGTERM, handle_stop)
+    signal.signal(signal.SIGINT, handle_stop)
+
+    wait_for_paths([
+        f"{LED_ROOT}/multi_intensity",
+        f"{LED_ROOT}/brightness",
+        f"{USB_ROOT}/online",
+        f"{BATTERY_ROOT}/status",
+    ])
+
+    # 通知灯的多色绑定可能被其他触发器占用，先解除再写强度。
+    write_attribute(f"{LED_ROOT}/trigger", "none")
+    max_brightness = read_attribute(f"{LED_ROOT}/max_brightness")
+    write_attribute(f"{LED_ROOT}/brightness", max_brightness)
+
+    current = None
+    while not stop_requested:
+        intensity = desired_intensity()
+        if intensity != current:
+            apply_intensity(intensity)
+            logger.info("外部供电 %s，电池 %s，通知灯设为 %d/%d",
+                        read_attribute(f"{USB_ROOT}/online"),
+                        read_attribute(f"{BATTERY_ROOT}/status"),
+                        *intensity)
+            current = intensity
+        time.sleep(POLL_SECONDS)
+
+    apply_intensity((0, 0))
+    logger.info("服务停止，通知灯熄灭")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, TimeoutError) as error:
+        logger.error("%s", error)
+        raise SystemExit(1)

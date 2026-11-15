@@ -1711,7 +1711,7 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +MODULE_LICENSE("GPL");
 --- /dev/null
 +++ b/drivers/power/supply/pm8150b_battery.c
-@@ -0,0 +1,727 @@
+@@ -0,0 +1,813 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Qualcomm PM8150B 电池与充电器驱动。
@@ -1722,11 +1722,16 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 + * 集合：SMB5 的充电状态与输入检测、FG 的硬件单调 SOC、RRADC 的电池
 + * 温度，以及 VADC 的电池电压。容量优先使用 FG 的单调 SOC，FG 未运行
 + * 时退回开路电压查表。
++ *
++ * 固件在插件时启动 SMB5 看门狗，bite 动作配置为关闭充电；原厂驱动在
++ * bark 中断里写 PET 寄存器喂狗。本驱动没有接入中断，改为定时喂狗，并在
++ * probe 时补写充电使能位，避免上一次 bite 留下的关闭状态继续生效。
 + */
 +
 +#include <linux/bitops.h>
 +#include <linux/bits.h>
 +#include <linux/delay.h>
++#include <linux/devm-helpers.h>
 +#include <linux/iio/consumer.h>
 +#include <linux/module.h>
 +#include <linux/mutex.h>
@@ -1735,12 +1740,14 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +#include <linux/power_supply.h>
 +#include <linux/regmap.h>
 +#include <linux/slab.h>
++#include <linux/workqueue.h>
 +
 +/* SMB5 子外设基址 */
 +#define SMB5_CHGR_BASE		0x1000
 +#define SMB5_DCDC_BASE		0x1100
 +#define SMB5_USBIN_BASE		0x1300
 +#define SMB5_DCIN_BASE		0x1400
++#define SMB5_MISC_BASE		0x1600
 +
 +#define CHGR_STATUS_1		(SMB5_CHGR_BASE + 0x06)
 +#define CHGR_STATUS_7		(SMB5_CHGR_BASE + 0x0d)
@@ -1748,6 +1755,17 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +#define DCDC_POWER_PATH		(SMB5_DCDC_BASE + 0x0b)
 +#define USBIN_INT_RT_STS	(SMB5_USBIN_BASE + 0x10)
 +#define DCIN_INT_RT_STS		(SMB5_DCIN_BASE + 0x10)
++
++/*
++ * 看门狗 PET 寄存器位于 MISC 子外设。固件把 WD_CFG 的
++ * WDOG_TIMER_EN_ON_PLUGIN 与 SNARL_BARK_BITE_WD_CFG 的
++ * BITE_WDOG_DISABLE_CHARGING 置位，因此插件后若不喂狗，bite 会关闭
++ * 充电。原厂驱动在 bark 中断里写 PET 位；这里定时写入同一寄存器，间隔
++ * 远小于最短 bark 时间 16 秒。
++ */
++#define BARK_BITE_WDOG_PET_REG	(SMB5_MISC_BASE + 0x43)
++#define BARK_BITE_WDOG_PET_BIT	BIT(0)
++#define WDOG_PET_INTERVAL_MS	5000
 +
 +#define CHGR_STATUS_MASK	GENMASK(2, 0)
 +#define CHGR_INHIBIT_CHARGE	0
@@ -1828,6 +1846,7 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +	struct power_supply *battery_psy;
 +	struct power_supply *usb_psy;
 +	struct mutex ima_lock;
++	struct delayed_work wdog_work;
 +};
 +
 +/*
@@ -2020,7 +2039,13 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +	if (ret)
 +		return ret;
 +
-+	*current_ua = div_s64((s64)(s16)raw * FG_IBAT_NUMR, 1000);
++	/*
++	 * FG 的 IBATT 为 16 位有符号数，原厂 fg-util.c 用
++	 * sign_extend32(temp, 15) 解码，寄存器正的约定表示放电；实测
++	 * 放电与净放电时都读到正数。power_supply 的 ABI 要求放电为负，
++	 * 因此统一取反。
++	 */
++	*current_ua = -div_s64((s64)(s16)raw * FG_IBAT_NUMR, 1000);
 +	return 0;
 +}
 +
@@ -2381,11 +2406,57 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +	.get_property		= pm8150b_usb_get_property,
 +};
 +
++static void pm8150b_pet_wdog(struct pm8150b_battery *batt)
++{
++	int ret;
++
++	ret = regmap_write(batt->regmap, BARK_BITE_WDOG_PET_REG,
++			   BARK_BITE_WDOG_PET_BIT);
++	if (ret)
++		dev_err_ratelimited(batt->dev, "写入看门狗 PET 失败：%d\n", ret);
++}
++
++/*
++ * 看门狗在 bite 时会把充电使能清零。驱动不提供充电开关，使能位为 0
++ * 只可能来自 bite 或固件初值，这里直接补写。先读后写，避免每个周期
++ * 重复写命令寄存器。
++ */
++static void pm8150b_ensure_charging(struct pm8150b_battery *batt)
++{
++	unsigned int val;
++	int ret;
++
++	ret = pm8150b_read(batt, CHGR_ENABLE_CMD, &val);
++	if (ret) {
++		dev_err_ratelimited(batt->dev, "读取充电使能失败：%d\n", ret);
++		return;
++	}
++	if (val & CHG_ENABLE_BIT)
++		return;
++
++	ret = regmap_update_bits(batt->regmap, CHGR_ENABLE_CMD, CHG_ENABLE_BIT,
++				 CHG_ENABLE_BIT);
++	if (ret)
++		dev_err_ratelimited(batt->dev, "打开充电使能失败：%d\n", ret);
++}
++
++static void pm8150b_wdog_work(struct work_struct *work)
++{
++	struct pm8150b_battery *batt =
++		container_of(work, struct pm8150b_battery, wdog_work.work);
++
++	pm8150b_pet_wdog(batt);
++	pm8150b_ensure_charging(batt);
++	schedule_delayed_work(&batt->wdog_work,
++			      msecs_to_jiffies(WDOG_PET_INTERVAL_MS));
++}
++
 +static int pm8150b_battery_probe(struct platform_device *pdev)
 +{
 +	struct device *dev = &pdev->dev;
 +	struct power_supply_config psy_cfg = { };
 +	struct pm8150b_battery *batt;
++	int ret;
 +
 +	batt = devm_kzalloc(dev, sizeof(*batt), GFP_KERNEL);
 +	if (!batt)
@@ -2416,6 +2487,21 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +	if (IS_ERR(batt->usb_psy))
 +		return dev_err_probe(dev, PTR_ERR(batt->usb_psy),
 +				     "failed to register USB power_supply\n");
++
++	ret = devm_delayed_work_autocancel(dev, &batt->wdog_work,
++					   pm8150b_wdog_work);
++	if (ret)
++		return ret;
++
++	/*
++	 * 先喂狗再打开充电使能，顺序反过来可能在下一次 bark 前再次被
++	 * bite 关闭。使能位被固件或上一次 bite 清零时，这一步同时恢复
++	 * 充电；充电阈值与输入限流不在此处配置。
++	 */
++	pm8150b_pet_wdog(batt);
++	pm8150b_ensure_charging(batt);
++	schedule_delayed_work(&batt->wdog_work,
++			      msecs_to_jiffies(WDOG_PET_INTERVAL_MS));
 +
 +	platform_set_drvdata(pdev, batt);
 +	dev_info(dev, "PM8150B battery and charger registered\n");
