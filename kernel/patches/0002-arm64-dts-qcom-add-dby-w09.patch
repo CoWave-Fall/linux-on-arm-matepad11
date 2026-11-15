@@ -15,9 +15,20 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  dtb-$(CONFIG_ARCH_QCOM)	+= sm8250-mtp.dtb
  dtb-$(CONFIG_ARCH_QCOM)	+= sm8250-samsung-r8q.dtb
  dtb-$(CONFIG_ARCH_QCOM)	+= sm8250-samsung-x1q.dtb
+--- a/arch/arm64/boot/dts/qcom/sm8250.dtsi
++++ b/arch/arm64/boot/dts/qcom/sm8250.dtsi
+@@ -6050,7 +6050,7 @@
+ 					#address-cells = <1>;
+ 					#size-cells = <0>;
+ 
+-					service@3 {
++					q6core: service@3 {
+ 						reg = <APR_SVC_ADSP_CORE>;
+ 						compatible = "qcom,q6core";
+ 						qcom,protection-domain = "avs/audio", "msm/adsp/audio_pd";
 --- /dev/null
 +++ b/arch/arm64/boot/dts/qcom/sm8250-huawei-dby-w09.dts
-@@ -0,0 +1,1632 @@
+@@ -0,0 +1,1690 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +/*
 + * Huawei MatePad 11 2021 (DBY-W09), Qualcomm SM8250 (kona).
@@ -302,6 +313,15 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +	 */
 +	spdif_dit: spdif-transmitter {
 +		compatible = "linux,spdif-dit";
++		#sound-dai-cells = <0>;
++	};
++
++	/*
++	 * 功放反馈采集的桩 codec。PRIMARY_TDM_TX_0 从功放的 DATAO
++	 * 线读回四个槽位，采集方向同样只需要一个占位 DAI。
++	 */
++	spdif_dir: spdif-receiver {
++		compatible = "linux,spdif-dir";
 +		#sound-dai-cells = <0>;
 +	};
 +};
@@ -1426,6 +1446,24 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +};
 +
 +/*
++ * ADSP 音频服务通过 SID 0x1801 访问主机内存，q6asm 的 dais 节点已声明
++ * 该流。q6afe 与 q6adm 的共享内存映射命令需要同一个流，DSP 才能经
++ * SMMU 翻译报文里的地址。
++ */
++&q6afe {
++	iommus = <&apps_smmu 0x1801 0x0>;
++};
++
++&q6adm {
++	iommus = <&apps_smmu 0x1801 0x0>;
++};
++
++/* q6core 注册自定义拓扑表时同样把缓冲交给 DSP，共用同一条流。 */
++&q6core {
++	iommus = <&apps_smmu 0x1801 0x0>;
++};
++
++/*
 + * q6afe 的 DAI 由驱动静态注册，子节点用于声明实际使用的端口。
 + */
 +&q6afedai {
@@ -1442,6 +1480,17 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +	 */
 +	dai@24 {
 +		reg = <PRIMARY_TDM_RX_0>;
++		qcom,tdm-sync-mode = <2>;
++		qcom,tdm-sync-src = <1>;
++		qcom,tdm-data-out = <0>;
++		qcom,tdm-invert-sync = <1>;
++		qcom,tdm-data-delay = <1>;
++		qcom,tdm-data-align = <0>;
++	};
++
++	/* 反馈采集端口与扬声器端口共用同一个 TDM 帧，同步参数相同 */
++	dai@25 {
++		reg = <PRIMARY_TDM_TX_0>;
 +		qcom,tdm-sync-mode = <2>;
 +		qcom,tdm-sync-src = <1>;
 +		qcom,tdm-data-out = <0>;
@@ -1576,6 +1625,26 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +
 +		codec {
 +			sound-dai = <&spdif_dit>;
++		};
++
++		platform {
++			sound-dai = <&q6routing>;
++		};
++	};
++
++	/*
++	 * 功放反馈采集链路：PRIMARY_TDM_TX_0 读回四个槽位里的电流检测
++	 * 样本，路由把 MultiMedia3 的采集流接到该端口。
++	 */
++	speakers-capture-dai-link {
++		link-name = "Speakers Capture";
++
++		cpu {
++			sound-dai = <&q6afedai PRIMARY_TDM_TX_0>;
++		};
++
++		codec {
++			sound-dai = <&spdif_dir>;
 +		};
 +
 +		platform {

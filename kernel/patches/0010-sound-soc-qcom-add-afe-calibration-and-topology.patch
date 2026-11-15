@@ -1,0 +1,1149 @@
+From: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
+Subject: [PATCH] sound: soc: qcom: add AFE calibration and custom topology support
+
+Applied to Linux 7.3.1.
+
+Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
+
+--- a/sound/soc/qcom/qdsp6/q6core.c
++++ b/sound/soc/qcom/qdsp6/q6core.c
+@@ -8,20 +8,95 @@
+ #include <linux/module.h>
+ #include <linux/sched.h>
+ #include <linux/of.h>
++#include <linux/of_device.h>
+ #include <linux/of_platform.h>
+ #include <linux/jiffies.h>
++#include <linux/sizes.h>
++#include <linux/dma-mapping.h>
++#include <linux/firmware.h>
++#include <linux/iommu.h>
+ #include <linux/soc/qcom/apr.h>
+ #include "q6core.h"
+ #include "q6dsp-errno.h"
+ 
+ #define ADSP_STATE_READY_TIMEOUT_MS    3000
+ #define Q6_READY_TIMEOUT_MS 100
++/* 拓扑模块加载涉及 DSP 侧的模块实例化，允许比服务查询更长的等待 */
++#define Q6_TOPO_LOAD_TIMEOUT_MS 1000
+ #define AVCS_CMD_ADSP_EVENT_GET_STATE		0x0001290C
+ #define AVCS_CMDRSP_ADSP_EVENT_GET_STATE	0x0001290D
+ #define AVCS_GET_VERSIONS       0x00012905
+ #define AVCS_GET_VERSIONS_RSP   0x00012906
+ #define AVCS_CMD_GET_FWK_VERSION	0x001292c
+ #define AVCS_CMDRSP_GET_FWK_VERSION	0x001292d
++#define AVCS_CMD_LOAD_TOPO_MODULES	0x0001296C
++
++/*
++ * 自定义拓扑表的注册命令。设备 ACDB 中的拓扑编号不在 DSP 的默认表里，
++ * 用户态 HAL 在打开音频通路前把整张表交给 CORE 注册；对应指令与载荷
++ * 格式取自原厂 techpack。
++ */
++#define AVCS_CMD_REGISTER_TOPOLOGIES		0x00012923
++#define AVCS_CMD_SHARED_MEM_MAP_REGIONS		0x00012924
++#define AVCS_CMDRSP_SHARED_MEM_MAP_REGIONS	0x00012925
++#define AVCS_CMD_SHARED_MEM_UNMAP_REGIONS	0x00012926
++#define AVCS_CMD_DEREGISTER_TOPOLOGIES		0x0001292a
++
++#define ADSP_MEMORY_MAP_SHMEM8_4K_POOL		3
++#define AVCS_MODE_DEREGISTER_ALL_CUSTOM_TOPOLOGIES 2
++
++/*
++ * DSP 侧约定：共享内存地址的高 32 位携带 SMMU SID 的低 4 位。原厂
++ * msm_audio_ion 在返回地址时把 (sid << 32) 或上去，上行报文因此是
++ * lsw = IOVA、msw = SID 编码。本机 iommus 为 <&apps_smmu 0x1801 0x0>，
++ * 原厂 DT 用 qcom,smmu-sid-mask = <0xf> 取到 1。主线使用 32 位 DMA
++ * 掩码，IOVA 不超过 4 GB，若沿用 upper_32_bits() 则 msw 恒为 0，DSP
++ * 会把这段 IOVA 当成物理地址使用。
++ */
++#define Q6CORE_SMMU_SID_MASK	0xF
++
++#define Q6CORE_FW_CUSTOM_TOPO \
++	"qcom/sm8250/dby-w09/audio/core_custom_topologies.bin"
++
++struct avcs_cmd_load_unload_topo_modules {
++	struct apr_hdr hdr;
++	u32 topology_id;
++} __packed;
++
++struct avcs_cmd_shared_mem_map_regions {
++	struct apr_hdr hdr;
++	u16 mem_pool_id;
++	u16 num_regions;
++	u32 property_flag;
++} __packed;
++
++struct avcs_shared_map_region_payload {
++	u32 shm_addr_lsw;
++	u32 shm_addr_msw;
++	u32 mem_size_bytes;
++} __packed;
++
++struct avcs_cmd_shared_mem_unmap_regions {
++	struct apr_hdr hdr;
++	u32 mem_map_handle;
++} __packed;
++
++struct avcs_cmd_register_topologies {
++	struct apr_hdr hdr;
++	u32 payload_addr_lsw;
++	u32 payload_addr_msw;
++	u32 mem_map_handle;
++	u32 payload_size;
++} __packed;
++
++struct avcs_cmd_deregister_topologies {
++	struct apr_hdr hdr;
++	u32 payload_addr_lsw;
++	u32 payload_addr_msw;
++	u32 mem_map_handle;
++	u32 payload_size;
++	u32 mode;
++} __packed;
+ 
+ struct avcs_svc_info {
+ 	uint32_t service_id;
+@@ -63,10 +138,51 @@
+ 	bool get_state_supported;
+ 	bool get_version_supported;
+ 	bool is_version_requested;
++	/* 拓扑模块加载的应答状态，供 q6core_load_topo_modules() 等待 */
++	bool topo_load_done;
++	uint32_t topo_load_status;
++	/*
++	 * 自定义拓扑注册的应答状态。注册流程按注销、映射、注册、解映射
++	 * 四步推进，每步发送前清零，等待回调置位。
++	 */
++	bool topo_rsp_done;
++	uint32_t topo_rsp_status;
++	uint32_t topo_map_handle;
+ };
+ 
+ static struct q6core *g_core;
+ 
++/*
++ * 对照打点：按字打印拓扑注册流程的报文与应答，输出形式与鸿蒙侧的同名
++ * 打点一致（KERN_ERR、DUMP_PREFIX_OFFSET、16、4），便于逐字节比对。
++ */
++static void q6core_dbg_pkt(const char *tag, const void *pkt, size_t len)
++{
++	char prefix[40];
++
++	snprintf(prefix, sizeof(prefix), "Q6CORE %s pkt: ", tag);
++	print_hex_dump(KERN_ERR, prefix, DUMP_PREFIX_OFFSET, 16, 4, pkt, len,
++		       false);
++}
++
++static void q6core_dbg_rsp(const char *tag, const struct apr_resp_pkt *data)
++{
++	const struct apr_hdr *hdr = &data->hdr;
++	char prefix[40];
++
++	pr_err("Q6CORE %s rsp hdr: msg=%u hdr_len=%u ver=%u src_svc=%u src_domain=%u src_port=%u dest_svc=%u dest_domain=%u dest_port=%u token=%08x opcode=%08x size=%d\n",
++	       tag, (hdr->hdr_field >> 8) & 0x3, (hdr->hdr_field >> 4) & 0xF,
++	       hdr->hdr_field & 0xF, hdr->src_svc, hdr->src_domain,
++	       hdr->src_port, hdr->dest_svc, hdr->dest_domain,
++	       hdr->dest_port, hdr->token, hdr->opcode, data->payload_size);
++
++	if (data->payload && data->payload_size > 0) {
++		snprintf(prefix, sizeof(prefix), "Q6CORE %s rsp: ", tag);
++		print_hex_dump(KERN_ERR, prefix, DUMP_PREFIX_OFFSET, 16, 4,
++			       data->payload, data->payload_size, false);
++	}
++}
++
+ static int q6core_callback(struct apr_device *adev, const struct apr_resp_pkt *data)
+ {
+ 	struct q6core *core = dev_get_drvdata(&adev->dev);
+@@ -93,6 +209,29 @@
+ 				core->get_state_supported = false;
+ 			core->resp_received = true;
+ 			break;
++		case AVCS_CMD_LOAD_TOPO_MODULES:
++			/*
++			 * 该命令的应答只用来取得 DSP 状态码。DSP 返回 0 表示
++			 * 拓扑模块已在 DSP 侧注册，非零表示拓扑表缺失。
++			 */
++			core->topo_load_status = result->status;
++			core->topo_load_done = true;
++			wake_up(&core->wait);
++			break;
++		case AVCS_CMD_DEREGISTER_TOPOLOGIES:
++		case AVCS_CMD_SHARED_MEM_MAP_REGIONS:
++		case AVCS_CMD_SHARED_MEM_UNMAP_REGIONS:
++		case AVCS_CMD_REGISTER_TOPOLOGIES:
++			/*
++			 * 注册流程的四个步骤共用一组等待标记。映射成功时
++			 * DSP 返回 AVCS_CMDRSP_SHARED_MEM_MAP_REGIONS，映射
++			 * 失败则以基本应答报告状态；其余三步只有基本应答。
++			 */
++			q6core_dbg_rsp("basic", data);
++			core->topo_rsp_status = result->status;
++			core->topo_rsp_done = true;
++			wake_up(&core->wait);
++			break;
+ 		}
+ 		break;
+ 	}
+@@ -136,6 +275,21 @@
+ 
+ 		core->resp_received = true;
+ 		break;
++	case AVCS_CMDRSP_SHARED_MEM_MAP_REGIONS:
++		/*
++		 * 映射成功的应答只携带 map handle，状态由 handle 是否为
++		 * 零体现；映射失败走基本应答，由上面的分支记录。
++		 */
++		if (data->payload_size < sizeof(uint32_t)) {
++			dev_err(&adev->dev, "map response too short: %d\n",
++				data->payload_size);
++			return -EINVAL;
++		}
++		q6core_dbg_rsp("map", data);
++		core->topo_map_handle = *(const uint32_t *)data->payload;
++		core->topo_rsp_done = true;
++		wake_up(&core->wait);
++		break;
+ 	default:
+ 		dev_err(&adev->dev, "Message id from adsp core svc: 0x%x\n",
+ 			hdr->opcode);
+@@ -293,6 +447,391 @@
+ }
+ EXPORT_SYMBOL_GPL(q6core_get_svc_api_info);
+ 
++/*
++ * 原厂在打开扬声器通路的 ADM 拓扑前，先让 CORE 加载 0x11000003 对应的
++ * 拓扑模块。该编号来自 ACDB 的全局拓扑表，模块集合包含扬声器保护与
++ * 四声道处理，缺少时 ADM 只能使用默认拓扑。
++ */
++int q6core_load_topo_modules(u32 topology_id)
++{
++	struct avcs_cmd_load_unload_topo_modules cmd = { };
++	struct q6core *core = g_core;
++	int ret;
++
++	if (!core)
++		return -ENODEV;
++
++	cmd.hdr.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD,
++					  APR_HDR_LEN(APR_HDR_SIZE),
++					  APR_PKT_VER);
++	cmd.hdr.pkt_size = sizeof(cmd);
++	cmd.hdr.opcode = AVCS_CMD_LOAD_TOPO_MODULES;
++	cmd.topology_id = topology_id;
++
++	mutex_lock(&core->lock);
++	core->topo_load_done = false;
++	core->topo_load_status = 0;
++
++	ret = apr_send_pkt(core->adev, (struct apr_pkt *)&cmd);
++	if (ret < 0) {
++		mutex_unlock(&core->lock);
++		return ret;
++	}
++
++	ret = wait_event_timeout(core->wait, core->topo_load_done,
++				 msecs_to_jiffies(Q6_TOPO_LOAD_TIMEOUT_MS));
++	if (!ret) {
++		dev_err(&core->adev->dev,
++			"load topology 0x%x timed out\n", topology_id);
++		mutex_unlock(&core->lock);
++		return -ETIMEDOUT;
++	}
++
++	ret = core->topo_load_status;
++	mutex_unlock(&core->lock);
++
++	if (ret) {
++		dev_err(&core->adev->dev,
++			"load topology 0x%x rejected, status %d\n",
++			topology_id, ret);
++		return -EIO;
++	}
++
++	dev_info(&core->adev->dev,
++		 "load topology 0x%x accepted\n", topology_id);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(q6core_load_topo_modules);
++
++/*
++ * 校验拓扑表长度与条目是否吻合。格式为 u32 count，随后每条
++ * { u32 type; u32 topology_id; u32 version; u32 num_modules;
++ *   (u32 module_id, u32 attr) * num_modules }。
++ * 长度对不上说明固件不是该设备采集的那份，直接拒绝发送。
++ */
++static int q6core_check_custom_topo(const u8 *data, size_t size, u32 *count_out)
++{
++	size_t off = sizeof(u32);
++	u32 count, i;
++
++	if (size < sizeof(u32))
++		return -EINVAL;
++
++	memcpy(&count, data, sizeof(count));
++	if (!count || count > (size - off) / (4 * sizeof(u32)))
++		return -EINVAL;
++
++	for (i = 0; i < count; i++) {
++		u32 entry[4], num_modules;
++
++		if (size - off < sizeof(entry))
++			return -EINVAL;
++		memcpy(entry, data + off, sizeof(entry));
++		off += sizeof(entry);
++
++		num_modules = entry[3];
++		if (num_modules > (size - off) / (2 * sizeof(u32)))
++			return -EINVAL;
++		off += num_modules * 2 * sizeof(u32);
++	}
++
++	if (off != size)
++		return -EINVAL;
++
++	*count_out = count;
++	return 0;
++}
++
++/**
++ * q6core_smmu_sid() - 取得上行报文里的 SMMU SID 编码
++ * @dev: 参与 DSP 通信的 APR 服务设备
++ * @sid: 输出的 SID 编码，写入共享内存地址的高 32 位
++ *
++ * 与原厂 msm_audio_ion_probe() 的做法一致：从 iommus 首项取 SID，再按
++ * qcom,smmu-sid-mask 的低 4 位截断。DSP 用地址高 32 位判定共享内存经
++ * SMMU 翻译，因此映射命令与所有带外载荷都要填同一个值。
++ *
++ * Return: 成功返回 0，失败返回负错误码。
++ */
++int q6core_smmu_sid(struct device *dev, u32 *sid)
++{
++	struct of_phandle_args spec;
++	int ret;
++
++	ret = of_parse_phandle_with_args(dev->of_node, "iommus",
++					 "#iommu-cells", 0, &spec);
++	if (ret)
++		return ret;
++
++	*sid = spec.args[0] & Q6CORE_SMMU_SID_MASK;
++	of_node_put(spec.np);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(q6core_smmu_sid);
++
++/**
++ * q6core_register_custom_topologies() - 注册设备 ACDB 的自定义拓扑表
++ *
++ * 扬声器通路使用的拓扑编号不在 DSP 的默认表内。原厂由用户态 HAL 把整张
++ * 拓扑表放进 ION 缓冲后经 CORE 注册，这里改由驱动读取同一份字节。流程
++ * 与顺序照搬原厂：注销全部自定义拓扑、映射缓冲、注册、解映射。注册完成
++ * 后 DSP 已复制表项，缓冲可以释放。
++ *
++ * Return: 成功返回 0，失败返回负错误码。
++ */
++int q6core_register_custom_topologies(void)
++{
++	struct q6core *core = g_core;
++	struct avcs_cmd_deregister_topologies dereg = { };
++	struct avcs_cmd_shared_mem_map_regions *map;
++	struct avcs_shared_map_region_payload *region;
++	struct avcs_cmd_register_topologies reg = { };
++	struct avcs_cmd_shared_mem_unmap_regions unmap = { };
++	const struct firmware *fw;
++	struct device *dev;
++	dma_addr_t paddr;
++	dma_addr_t phys;
++	void *vaddr;
++	size_t map_size, payload_size;
++	u32 count, handle = 0, sid;
++	int ret, send_ret, pkt_size;
++
++	if (!core)
++		return -ENODEV;
++
++	dev = &core->adev->dev;
++
++	/*
++	 * DSP 经音频服务的 SMMU 流访问主机内存。设备树缺少 iommus 时
++	 * dma_alloc_coherent() 给出的是 CPU 物理地址，DSP 侧无法翻译；
++	 * 这里直接拒绝，避免重演上下文错误。
++	 */
++	if (!device_iommu_mapped(dev)) {
++		dev_err(dev, "no IOMMU stream for CORE topologies\n");
++		return -ENODEV;
++	}
++
++	ret = q6core_smmu_sid(dev, &sid);
++	if (ret) {
++		dev_err(dev, "CORE SMMU SID unavailable %d\n", ret);
++		return ret;
++	}
++
++	ret = request_firmware(&fw, Q6CORE_FW_CUSTOM_TOPO, dev);
++	if (ret) {
++		dev_err(dev, "firmware %s unavailable %d\n",
++			Q6CORE_FW_CUSTOM_TOPO, ret);
++		return ret;
++	}
++
++	ret = q6core_check_custom_topo(fw->data, fw->size, &count);
++	if (ret) {
++		dev_err(dev, "topology table malformed, size %zu\n",
++			fw->size);
++		release_firmware(fw);
++		return ret;
++	}
++
++	payload_size = fw->size;
++	map_size = ALIGN(fw->size, SZ_4K);
++	vaddr = dma_alloc_coherent(dev, map_size, &paddr, GFP_KERNEL);
++	if (!vaddr) {
++		dev_err(dev, "cannot allocate topology table, size %zu\n",
++			map_size);
++		release_firmware(fw);
++		return -ENOMEM;
++	}
++	memcpy(vaddr, fw->data, fw->size);
++	release_firmware(fw);
++
++	dev_err(dev, "Q6CORE topo blk: paddr=%pad size=%zu map_size=%zu sid=0x%x\n",
++		&paddr, payload_size, map_size, sid);
++	print_hex_dump(KERN_ERR, "Q6CORE topo head: ", DUMP_PREFIX_OFFSET, 16, 4,
++		       vaddr, 32, false);
++
++	pkt_size = sizeof(*map) + sizeof(*region);
++	map = kzalloc(pkt_size, GFP_KERNEL);
++	if (!map) {
++		ret = -ENOMEM;
++		goto free_buf;
++	}
++	region = (void *)(map + 1);
++
++	map->hdr.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD,
++					   APR_HDR_LEN(APR_HDR_SIZE),
++					   APR_PKT_VER);
++	map->hdr.pkt_size = pkt_size;
++	map->hdr.opcode = AVCS_CMD_SHARED_MEM_MAP_REGIONS;
++	map->mem_pool_id = ADSP_MEMORY_MAP_SHMEM8_4K_POOL;
++	map->num_regions = 1;
++	map->property_flag = 0;
++	/*
++	 * 高 32 位放 SID 编码而非地址高位：DSP 用它判定这段缓冲由 SMMU
++	 * 翻译。原厂在映射与注册两条命令里都填这个值。
++	 */
++	region->shm_addr_lsw = lower_32_bits(paddr);
++	region->shm_addr_msw = sid;
++	region->mem_size_bytes = map_size;
++
++	mutex_lock(&core->lock);
++
++	/* 1. 注销全部自定义拓扑。与原厂一致，该步的结果只记录。 */
++	dereg.hdr.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD,
++					    APR_HDR_LEN(APR_HDR_SIZE),
++					    APR_PKT_VER);
++	dereg.hdr.pkt_size = sizeof(dereg);
++	dereg.hdr.opcode = AVCS_CMD_DEREGISTER_TOPOLOGIES;
++	dereg.mode = AVCS_MODE_DEREGISTER_ALL_CUSTOM_TOPOLOGIES;
++
++	core->topo_rsp_done = false;
++	core->topo_rsp_status = 0;
++
++	q6core_dbg_pkt("dereg", &dereg, sizeof(dereg));
++	ret = apr_send_pkt(core->adev, (struct apr_pkt *)&dereg);
++	dev_info(dev, "Q6CORE deregister send ret=%d\n", ret);
++	if (ret < 0) {
++		dev_err(dev, "CORE deregister send failed %d\n", ret);
++		ret = -EIO;
++		goto unlock;
++	}
++
++	ret = wait_event_timeout(core->wait, core->topo_rsp_done,
++				 msecs_to_jiffies(Q6_TOPO_LOAD_TIMEOUT_MS));
++	if (!ret) {
++		dev_warn(dev, "CORE deregister timed out\n");
++	} else {
++		dev_info(dev, "CORE deregistered topologies, status %u\n",
++			 core->topo_rsp_status);
++	}
++
++	/* 2. 映射拓扑表缓冲，取得 DSP 侧的句柄 */
++	core->topo_rsp_done = false;
++	core->topo_rsp_status = 0;
++	core->topo_map_handle = 0;
++
++	q6core_dbg_pkt("map", map, pkt_size);
++	ret = apr_send_pkt(core->adev, (struct apr_pkt *)map);
++	dev_info(dev, "Q6CORE map send ret=%d\n", ret);
++	if (ret < 0) {
++		dev_err(dev, "CORE map send failed %d\n", ret);
++		ret = -EIO;
++		goto unlock;
++	}
++
++	ret = wait_event_timeout(core->wait, core->topo_rsp_done,
++				 msecs_to_jiffies(Q6_TOPO_LOAD_TIMEOUT_MS));
++	if (!ret) {
++		dev_err(dev, "CORE map timed out, paddr %pad size %zu\n",
++			&paddr, map_size);
++		ret = -ETIMEDOUT;
++		goto unlock;
++	}
++
++	handle = core->topo_map_handle;
++	if (!handle) {
++		dev_err(dev, "CORE map rejected, status %u\n",
++			core->topo_rsp_status);
++		ret = -EIO;
++		goto unlock;
++	}
++
++	dev_info(dev, "CORE topology table mapped size=%zu handle=0x%x\n",
++		 map_size, handle);
++
++	/* 确认这段 IOVA 在音频服务的页表里确有翻译，便于排除映射缺失 */
++	phys = iommu_iova_to_phys(iommu_get_domain_for_dev(dev), paddr);
++	dev_err(dev, "Q6CORE map iova=%pad phys=%pa\n", &paddr, &phys);
++
++	/* 3. 注册拓扑表，应答状态为 0 表示 DSP 已接收 */
++	reg.hdr.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD,
++					  APR_HDR_LEN(APR_HDR_SIZE),
++					  APR_PKT_VER);
++	reg.hdr.pkt_size = sizeof(reg);
++	reg.hdr.opcode = AVCS_CMD_REGISTER_TOPOLOGIES;
++	reg.payload_addr_lsw = lower_32_bits(paddr);
++	/* 与映射命令一致：高 32 位是 SID 编码 */
++	reg.payload_addr_msw = sid;
++	reg.mem_map_handle = handle;
++	reg.payload_size = payload_size;
++
++	core->topo_rsp_done = false;
++	core->topo_rsp_status = 0;
++
++	q6core_dbg_pkt("reg", &reg, sizeof(reg));
++	ret = apr_send_pkt(core->adev, (struct apr_pkt *)&reg);
++	dev_info(dev, "Q6CORE register send ret=%d\n", ret);
++	if (ret < 0) {
++		dev_err(dev, "CORE register send failed %d\n", ret);
++		ret = -EIO;
++		goto unmap;
++	}
++
++	ret = wait_event_timeout(core->wait, core->topo_rsp_done,
++				 msecs_to_jiffies(Q6_TOPO_LOAD_TIMEOUT_MS));
++	if (!ret) {
++		dev_err(dev, "CORE register timed out\n");
++		ret = -ETIMEDOUT;
++		goto unmap;
++	}
++
++	if (core->topo_rsp_status) {
++		dev_err(dev, "CORE register rejected, status %u\n",
++			core->topo_rsp_status);
++		ret = -EIO;
++		goto unmap;
++	}
++
++	dev_info(dev, "CORE registered %u topologies, %zu bytes\n",
++		 count, payload_size);
++	ret = 0;
++
++	/* 4. 解映射。注册完成时 DSP 已复制表项，缓冲不再需要。 */
++unmap:
++	unmap.hdr.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD,
++					    APR_HDR_LEN(APR_HDR_SIZE),
++					    APR_PKT_VER);
++	unmap.hdr.pkt_size = sizeof(unmap);
++	unmap.hdr.opcode = AVCS_CMD_SHARED_MEM_UNMAP_REGIONS;
++	unmap.mem_map_handle = handle;
++
++	core->topo_rsp_done = false;
++	core->topo_rsp_status = 0;
++
++	q6core_dbg_pkt("unmap", &unmap, sizeof(unmap));
++	send_ret = apr_send_pkt(core->adev, (struct apr_pkt *)&unmap);
++	dev_info(dev, "Q6CORE unmap send ret=%d\n", send_ret);
++	if (send_ret < 0) {
++		dev_err(dev, "CORE unmap send failed\n");
++		if (!ret)
++			ret = -EIO;
++		goto unlock;
++	}
++
++	if (!wait_event_timeout(core->wait, core->topo_rsp_done,
++				msecs_to_jiffies(Q6_TOPO_LOAD_TIMEOUT_MS))) {
++		dev_err(dev, "CORE unmap timed out\n");
++		if (!ret)
++			ret = -ETIMEDOUT;
++		goto unlock;
++	}
++
++	if (core->topo_rsp_status) {
++		dev_err(dev, "CORE unmap rejected, status %u\n",
++			core->topo_rsp_status);
++		if (!ret)
++			ret = -EIO;
++	}
++
++unlock:
++	mutex_unlock(&core->lock);
++	kfree(map);
++free_buf:
++	dma_free_coherent(dev, map_size, vaddr, paddr);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(q6core_register_custom_topologies);
++
+ /**
+  * q6core_is_adsp_ready() - Get status of adsp
+  *
+@@ -327,11 +866,29 @@
+ 
+ static int q6core_probe(struct apr_device *adev)
+ {
++	struct device *dev = &adev->dev;
++	int ret;
++
++	/*
++	 * CORE 与 q6afe、q6adm 一样挂在 APR 总线上，注册时不经过
++	 * of_dma_configure。自定义拓扑表经共享内存交给 DSP，地址必须
++	 * 由 DMA API 分配才能落在音频服务的 SMMU 流内。这里按设备树的
++	 * iommus 补上 DMA 配置；掩码先设为 32 位，否则
++	 * dma_alloc_coherent() 会因掩码为零拒绝请求。
++	 */
++	ret = dma_coerce_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	if (ret)
++		return ret;
++
++	ret = of_dma_configure(dev, dev->of_node, true);
++	if (ret)
++		return ret;
++
+ 	g_core = kzalloc_obj(*g_core);
+ 	if (!g_core)
+ 		return -ENOMEM;
+ 
+-	dev_set_drvdata(&adev->dev, g_core);
++	dev_set_drvdata(dev, g_core);
+ 
+ 	mutex_init(&g_core->lock);
+ 	g_core->adev = adev;
+--- a/sound/soc/qcom/qdsp6/q6core.h
++++ b/sound/soc/qcom/qdsp6/q6core.h
+@@ -9,7 +9,12 @@
+ 	uint32_t api_branch_version;
+ };
+ 
++struct device;
++
+ bool q6core_is_adsp_ready(void);
++int q6core_smmu_sid(struct device *dev, u32 *sid);
+ int q6core_get_svc_api_info(int svc_id, struct q6core_svc_api_info *ainfo);
++int q6core_load_topo_modules(u32 topology_id);
++int q6core_register_custom_topologies(void);
+ 
+ #endif /* __Q6CORE_H__ */
+--- a/sound/soc/qcom/qdsp6/q6adm.c
++++ b/sound/soc/qcom/qdsp6/q6adm.c
+@@ -3,14 +3,18 @@
+ // Copyright (c) 2018, Linaro Limited
+ 
+ #include <linux/device.h>
++#include <linux/dma-mapping.h>
++#include <linux/firmware.h>
+ #include <linux/jiffies.h>
+ #include <linux/kernel.h>
+ #include <linux/kref.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
++#include <linux/of_device.h>
+ #include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+ #include <linux/sched.h>
++#include <linux/sizes.h>
+ #include <linux/slab.h>
+ #include <linux/soc/qcom/apr.h>
+ #include <linux/wait.h>
+@@ -23,8 +27,22 @@
+ 
+ #define ADM_CMD_DEVICE_OPEN_V5		0x00010326
+ #define ADM_CMDRSP_DEVICE_OPEN_V5	0x00010329
++#define ADM_CMD_DEVICE_OPEN_V8		0x0001036A
++#define ADM_CMDRSP_DEVICE_OPEN_V8	0x0001036B
+ #define ADM_CMD_DEVICE_CLOSE_V5		0x00010327
+ #define ADM_CMD_MATRIX_MAP_ROUTINGS_V5	0x00010325
++#define ADM_CMD_ADD_TOPOLOGIES		0x00010335
++#define ADM_CMD_SHARED_MEM_MAP_REGIONS		0x00010322
++#define ADM_CMDRSP_SHARED_MEM_MAP_REGIONS	0x00010323
++#define ADM_CMD_SET_PP_PARAMS_V6	0x0001035D
++#define ADSP_MEMORY_MAP_SHMEM8_4K_POOL	0x3
++
++/*
++ * 设备数据块由用户空间部署，路径相对 /lib/firmware。PP 数据块取自
++ * 原厂播放时的带外载荷。
++ */
++#define Q6ADM_FW_AUDPROC	"qcom/sm8250/dby-w09/audio/adm_audproc_acdb210_48k.bin"
++#define Q6ADM_FW_AUDVOL		"qcom/sm8250/dby-w09/audio/adm_audvol_acdb210_48k.bin"
+ 
+ #define TIMEOUT_MS 1000
+ #define RESET_COPP_ID 99
+@@ -53,6 +71,20 @@
+ 	struct q6adm *adm;
+ };
+ 
++/*
++ * ADM 的带外数据块按共享内存访问，缓冲区需要保持映射与有效，直到
++ * 驱动卸载。
++ */
++struct q6adm_shared_mem {
++	void *vaddr;
++	dma_addr_t paddr;
++	size_t payload_size;
++	size_t map_size;
++	u32 map_handle;
++	u32 msw;
++	bool mapped;
++};
++
+ struct q6adm {
+ 	struct apr_device *apr;
+ 	struct device *dev;
+@@ -63,6 +95,11 @@
+ 	struct aprv2_ibasic_rsp_result_t result;
+ 	struct mutex lock;
+ 	wait_queue_head_t matrix_map_wait;
++	struct q6adm_shared_mem audproc_mem;
++	struct q6adm_shared_mem audvol_mem;
++	wait_queue_head_t topo_wait;
++	struct aprv2_ibasic_rsp_result_t topo_result;
++	u32 mmap_handle;
+ };
+ 
+ struct q6adm_cmd_device_open_v5 {
+@@ -77,6 +114,27 @@
+ 	u8 dev_channel_mapping[8];
+ } __packed;
+ 
++/*
++ * V8 把端点参数挪到报文尾部的可变长载荷里，并新增第三个端点与压缩数据类型。
++ * 这颗 DSP 的 ADM 服务支持 V8，原厂驱动也走同一条路径。
++ */
++struct q6adm_cmd_device_open_v8 {
++	u16 flags;
++	u16 mode_of_operation;
++	u32 topology_id;
++	u16 endpoint_id_1;
++	u16 endpoint_id_2;
++	u16 endpoint_id_3;
++	u16 compressed_data_type;
++} __packed;
++
++struct q6adm_device_endpoint_payload {
++	u16 dev_num_channel;
++	u16 bit_width;
++	u32 sample_rate;
++	u8 dev_channel_mapping[32];
++} __packed;
++
+ struct q6adm_cmd_matrix_map_routings_v5 {
+ 	u32 matrix_id;
+ 	u32 num_sessions;
+@@ -87,6 +145,33 @@
+ 	u16 num_copps;
+ } __packed;
+ 
++/* 拓扑表注册、共享内存映射与带外 PP 参数命令 */
++struct q6adm_cmd_add_topologies {
++	u32 payload_addr_lsw;
++	u32 payload_addr_msw;
++	u32 mem_map_handle;
++	u32 payload_size;
++} __packed;
++
++struct q6adm_cmd_shared_mem_map_regions {
++	u16 mem_pool_id;
++	u16 num_regions;
++	u32 property_flag;
++} __packed;
++
++struct q6adm_shared_map_region_payload {
++	u32 shm_addr_lsw;
++	u32 shm_addr_msw;
++	u32 mem_size_bytes;
++} __packed;
++
++struct q6adm_cmd_set_pp_params {
++	u32 payload_addr_lsw;
++	u32 payload_addr_msw;
++	u32 mem_map_handle;
++	u32 payload_size;
++} __packed;
++
+ static struct q6copp *q6adm_find_copp(struct q6adm *adm, int port_idx,
+ 				  int copp_idx)
+ {
+@@ -218,6 +303,7 @@
+ 		}
+ 		switch (result->opcode) {
+ 		case ADM_CMD_DEVICE_OPEN_V5:
++		case ADM_CMD_DEVICE_OPEN_V8:
+ 		case ADM_CMD_DEVICE_CLOSE_V5:
+ 			list_for_each_entry(copp, &adm->copps_list, node) {
+ 				if ((port_idx == copp->afe_port) && (copp_idx == copp->copp_idx)) {
+@@ -231,6 +317,21 @@
+ 			adm->result = *result;
+ 			wake_up(&adm->matrix_map_wait);
+ 			break;
++		case ADM_CMD_SET_PP_PARAMS_V6:
++			list_for_each_entry(copp, &adm->copps_list, node) {
++				if ((port_idx == copp->afe_port) &&
++				    (copp_idx == copp->copp_idx)) {
++					copp->result = *result;
++					wake_up(&copp->wait);
++					break;
++				}
++			}
++			break;
++		case ADM_CMD_ADD_TOPOLOGIES:
++		case ADM_CMD_SHARED_MEM_MAP_REGIONS:
++			adm->topo_result = *result;
++			wake_up(&adm->topo_wait);
++			break;
+ 
+ 		default:
+ 			dev_err(&adev->dev, "Unknown Cmd: 0x%x\n",
+@@ -239,7 +340,8 @@
+ 		}
+ 		return 0;
+ 	}
+-	case ADM_CMDRSP_DEVICE_OPEN_V5: {
++	case ADM_CMDRSP_DEVICE_OPEN_V5:
++	case ADM_CMDRSP_DEVICE_OPEN_V8: {
+ 		struct adm_cmd_rsp_device_open_v5 {
+ 			u32 status;
+ 			u16 copp_id;
+@@ -264,6 +366,15 @@
+ 		kref_put(&copp->refcount, q6adm_free_copp);
+ 	}
+ 	break;
++	case ADM_CMDRSP_SHARED_MEM_MAP_REGIONS:
++		/* 映射成功的应答只带句柄，失败走通用错误应答路径 */
++		if (data->payload_size < sizeof(u32))
++			return -EINVAL;
++		adm->mmap_handle = *(u32 *)data->payload;
++		adm->topo_result.opcode = hdr->opcode;
++		adm->topo_result.status = 0;
++		wake_up(&adm->topo_wait);
++		break;
+ 	default:
+ 		dev_err(&adev->dev, "Unknown cmd:0x%x\n",
+ 		       hdr->opcode);
+@@ -327,10 +438,13 @@
+ 			     int port_id, int path, int topology,
+ 			     int channel_mode, int bit_width, int rate)
+ {
+-	struct q6adm_cmd_device_open_v5 *open;
++	struct q6adm_cmd_device_open_v8 *open;
++	struct q6adm_device_endpoint_payload ep = { 0 };
+ 	int afe_port = q6afe_get_port_id(port_id);
+ 	struct apr_pkt *pkt;
+-	int ret, pkt_size = APR_HDR_SIZE + sizeof(*open);
++	int ret;
++	size_t ep_size = 8 + roundup(channel_mode, 4);
++	size_t pkt_size = APR_HDR_SIZE + sizeof(*open) + ep_size;
+ 
+ 	void *p __free(kfree) = kzalloc(pkt_size, GFP_KERNEL);
+ 	if (!p)
+@@ -345,21 +459,36 @@
+ 	pkt->hdr.src_port = afe_port;
+ 	pkt->hdr.dest_port = afe_port;
+ 	pkt->hdr.token = port_id << 16 | copp->copp_idx;
+-	pkt->hdr.opcode = ADM_CMD_DEVICE_OPEN_V5;
++	pkt->hdr.opcode = ADM_CMD_DEVICE_OPEN_V8;
+ 	open->flags = ADM_LEGACY_DEVICE_SESSION;
+ 	open->mode_of_operation = path;
+-	open->endpoint_id_1 = afe_port;
+ 	open->topology_id = topology;
+-	open->dev_num_channel = channel_mode & 0x00FF;
+-	open->bit_width = bit_width;
+-	open->sample_rate = rate;
++	open->endpoint_id_1 = afe_port;
++	/*
++	 * 第二、第三端点取无效值。原厂的 V5 与 V8 两条打开路径都写 0xFFFF，
++	 * 主线的结构体清零后为 0，DSP 可能把 0 当作真实端点。
++	 */
++	open->endpoint_id_2 = 0xFFFF;
++	open->endpoint_id_3 = 0xFFFF;
++	open->compressed_data_type = 0;
++
++	ep.dev_num_channel = channel_mode & 0x00FF;
++	ep.bit_width = bit_width;
++	ep.sample_rate = rate;
+ 
+-	ret = q6dsp_map_channels(&open->dev_channel_mapping[0],
+-				 channel_mode);
++	ret = q6dsp_map_channels(&ep.dev_channel_mapping[0], channel_mode);
+ 	if (ret)
+ 		return ret;
+ 
+-	return q6adm_apr_send_copp_pkt(adm, copp, pkt, ADM_CMDRSP_DEVICE_OPEN_V5);
++	memcpy(p + APR_HDR_SIZE + sizeof(*open), &ep, ep_size);
++
++	dev_dbg(adm->dev,
++		"adm open port=0x%x path=%d topo=0x%x ch_mode=%d bw=%d rate=%d map=%u,%u,%u,%u\n",
++		afe_port, path, topology, channel_mode, bit_width, rate,
++		ep.dev_channel_mapping[0], ep.dev_channel_mapping[1],
++		ep.dev_channel_mapping[2], ep.dev_channel_mapping[3]);
++
++	return q6adm_apr_send_copp_pkt(adm, copp, pkt, ADM_CMDRSP_DEVICE_OPEN_V8);
+ }
+ 
+ /**
+@@ -549,6 +678,205 @@
+ }
+ EXPORT_SYMBOL_GPL(q6adm_matrix_map);
+ 
++/*
++ * 把固件块复制进连续的 DMA 缓冲，并通过 ADM 服务的共享内存映射命令
++ * 取得 DSP 侧句柄。缓冲区在驱动生命周期内保持有效。
++ */
++static int q6adm_shared_mem_map(struct q6adm *adm,
++				struct q6adm_shared_mem *mem, const char *name)
++{
++	struct q6adm_cmd_shared_mem_map_regions *cmd;
++	struct q6adm_shared_map_region_payload *region;
++	const struct firmware *fw;
++	struct apr_pkt *pkt;
++	int ret, pkt_size;
++
++	if (mem->mapped)
++		return 0;
++
++	/* 与 DSP 之间的共享内存地址高 32 位带 SMMU SID 编码 */
++	ret = q6core_smmu_sid(adm->dev, &mem->msw);
++	if (ret) {
++		dev_err(adm->dev, "%s SMMU SID unavailable %d\n",
++			name, ret);
++		return ret;
++	}
++
++	ret = request_firmware(&fw, name, adm->dev);
++	if (ret) {
++		dev_err(adm->dev, "firmware %s unavailable %d\n",
++			name, ret);
++		return ret;
++	}
++
++	mem->payload_size = fw->size;
++	mem->map_size = ALIGN(fw->size, SZ_4K);
++	/*
++	 * DSP 经 ADSP 的 SMMU 流访问这块内存，地址必须由 DMA API 分配。
++	 * of_dma_configure() 已按设备树配置好流，paddr 是 DSP 可翻译的
++	 * IOVA。
++	 */
++	mem->vaddr = dma_alloc_coherent(adm->dev, mem->map_size, &mem->paddr,
++					GFP_KERNEL);
++	if (!mem->vaddr) {
++		dev_err(adm->dev, "cannot allocate %s, size %zu\n",
++			name, mem->map_size);
++		release_firmware(fw);
++		return -ENOMEM;
++	}
++	memcpy(mem->vaddr, fw->data, fw->size);
++	release_firmware(fw);
++
++	pkt_size = APR_HDR_SIZE + sizeof(*cmd) + sizeof(*region);
++	void *p __free(kfree) = kzalloc(pkt_size, GFP_KERNEL);
++	if (!p) {
++		dma_free_coherent(adm->dev, mem->map_size, mem->vaddr,
++				  mem->paddr);
++		mem->vaddr = NULL;
++		return -ENOMEM;
++	}
++
++	pkt = p;
++	cmd = p + APR_HDR_SIZE;
++	region = p + APR_HDR_SIZE + sizeof(*cmd);
++
++	pkt->hdr.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD,
++					   APR_HDR_LEN(APR_HDR_SIZE),
++					   APR_PKT_VER);
++	pkt->hdr.pkt_size = pkt_size;
++	pkt->hdr.token = 0;
++	pkt->hdr.opcode = ADM_CMD_SHARED_MEM_MAP_REGIONS;
++
++	cmd->mem_pool_id = ADSP_MEMORY_MAP_SHMEM8_4K_POOL;
++	cmd->num_regions = 1;
++	cmd->property_flag = 0;
++
++	region->shm_addr_lsw = lower_32_bits(mem->paddr);
++	region->shm_addr_msw = mem->msw;
++	region->mem_size_bytes = mem->map_size;
++
++	mutex_lock(&adm->lock);
++	adm->topo_result.opcode = 0;
++	adm->topo_result.status = 0;
++	adm->mmap_handle = 0;
++
++	ret = apr_send_pkt(adm->apr, pkt);
++	if (ret < 0) {
++		dev_err(adm->dev, "map %s send failed %d\n", name, ret);
++		mutex_unlock(&adm->lock);
++		goto free_buf;
++	}
++
++	ret = wait_event_timeout(adm->topo_wait,
++			(adm->topo_result.opcode ==
++			 ADM_CMDRSP_SHARED_MEM_MAP_REGIONS) ||
++			(adm->topo_result.opcode ==
++			 ADM_CMD_SHARED_MEM_MAP_REGIONS),
++			msecs_to_jiffies(TIMEOUT_MS));
++	if (!ret) {
++		dev_err(adm->dev, "map %s timed out\n", name);
++		ret = -ETIMEDOUT;
++		mutex_unlock(&adm->lock);
++		goto free_buf;
++	}
++
++	if (adm->topo_result.opcode != ADM_CMDRSP_SHARED_MEM_MAP_REGIONS) {
++		dev_err(adm->dev, "map %s rejected, status %d\n",
++			name, adm->topo_result.status);
++		ret = -EINVAL;
++		mutex_unlock(&adm->lock);
++		goto free_buf;
++	}
++
++	mem->map_handle = adm->mmap_handle;
++	mem->mapped = true;
++	mutex_unlock(&adm->lock);
++
++	dev_info(adm->dev, "mapped %s size=%zu handle=0x%x\n",
++		 name, mem->payload_size, mem->map_handle);
++	return 0;
++
++free_buf:
++	dma_free_coherent(adm->dev, mem->map_size, mem->vaddr, mem->paddr);
++	mem->vaddr = NULL;
++	return ret;
++}
++
++static int q6adm_send_pp_block(struct q6adm *adm, struct q6copp *copp,
++			       struct q6adm_shared_mem *mem, const char *name)
++{
++	struct q6adm_cmd_set_pp_params *pp;
++	struct apr_pkt *pkt;
++	int ret, pkt_size = APR_HDR_SIZE + sizeof(*pp);
++
++	void *p __free(kfree) = kzalloc(pkt_size, GFP_KERNEL);
++	if (!p)
++		return -ENOMEM;
++
++	pkt = p;
++	pp = p + APR_HDR_SIZE;
++
++	pkt->hdr.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD,
++					   APR_HDR_LEN(APR_HDR_SIZE),
++					   APR_PKT_VER);
++	pkt->hdr.pkt_size = pkt_size;
++	pkt->hdr.src_port = q6afe_get_port_id(copp->afe_port);
++	pkt->hdr.dest_port = copp->id;
++	pkt->hdr.token = copp->afe_port << 16 | copp->copp_idx;
++	pkt->hdr.opcode = ADM_CMD_SET_PP_PARAMS_V6;
++
++	pp->payload_addr_lsw = lower_32_bits(mem->paddr);
++	pp->payload_addr_msw = mem->msw;
++	pp->mem_map_handle = mem->map_handle;
++	pp->payload_size = mem->payload_size;
++
++	/*
++	 * q6adm_apr_send_copp_pkt() 成功时返回剩余 jiffies，只有负值才是
++	 * 失败；这里统一换算成 0。
++	 */
++	ret = q6adm_apr_send_copp_pkt(adm, copp, pkt, 0);
++	if (ret < 0) {
++		dev_err(adm->dev, "ADM %s block failed %d\n", name, ret);
++		return ret;
++	}
++
++	dev_info(adm->dev, "ADM %s %zu bytes ok\n", name,
++		 mem->payload_size);
++
++	return 0;
++}
++
++/**
++ * q6adm_send_pp_cals() - 给扬声器通路的 COPP 下发 PP 数据块
++ * @dev: ADM 子设备
++ * @copp: 已经打开的 COPP
++ *
++ * 原厂在该 COPP 打开并完成矩阵映射后发送 AUDPROC 与 AUDVOL 两块，
++ * 用于确定 MFC 输出格式与声道混音权重。
++ */
++int q6adm_send_pp_cals(struct device *dev, struct q6copp *copp)
++{
++	struct q6adm *adm = dev_get_drvdata(dev->parent);
++	int ret;
++
++	if (!adm || !copp)
++		return -EINVAL;
++
++	ret = q6adm_shared_mem_map(adm, &adm->audproc_mem, Q6ADM_FW_AUDPROC);
++	if (ret)
++		return ret;
++	ret = q6adm_shared_mem_map(adm, &adm->audvol_mem, Q6ADM_FW_AUDVOL);
++	if (ret)
++		return ret;
++
++	ret = q6adm_send_pp_block(adm, copp, &adm->audproc_mem, "AUDPROC");
++	if (ret)
++		return ret;
++
++	return q6adm_send_pp_block(adm, copp, &adm->audvol_mem, "AUDVOL");
++}
++EXPORT_SYMBOL_GPL(q6adm_send_pp_cals);
++
+ /**
+  * q6adm_close() - Close adm copp
+  *
+@@ -569,6 +897,22 @@
+ {
+ 	struct device *dev = &adev->dev;
+ 	struct q6adm *adm;
++	int ret;
++
++	/*
++	 * q6adm 与 q6afe 一样挂在 APR 总线上，注册时不经过
++	 * of_dma_configure。共享内存映射需要 DMA 掩码与 IOMMU 流，
++	 * 这里按设备树的 iommus 属性补上配置。掩码必须先行设置，
++	 * of_dma_configure() 会把它与上限做与运算，初始值 0 会让
++	 * 分配始终被拒绝。
++	 */
++	ret = dma_coerce_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	if (ret)
++		return ret;
++
++	ret = of_dma_configure(dev, dev->of_node, true);
++	if (ret)
++		return ret;
+ 
+ 	adm = devm_kzalloc(dev, sizeof(*adm), GFP_KERNEL);
+ 	if (!adm)
+@@ -580,6 +924,7 @@
+ 	q6core_get_svc_api_info(adev->svc_id, &adm->ainfo);
+ 	mutex_init(&adm->lock);
+ 	init_waitqueue_head(&adm->matrix_map_wait);
++	init_waitqueue_head(&adm->topo_wait);
+ 
+ 	INIT_LIST_HEAD(&adm->copps_list);
+ 	spin_lock_init(&adm->copps_list_lock);
+--- a/sound/soc/qcom/qdsp6/q6adm.h
++++ b/sound/soc/qcom/qdsp6/q6adm.h
+@@ -23,5 +23,6 @@
+ int q6adm_get_copp_id(struct q6copp *copp);
+ int q6adm_matrix_map(struct device *dev, int path,
+ 		     struct route_payload payload_map, int perf_mode);
++int q6adm_send_pp_cals(struct device *dev, struct q6copp *copp);
+ 
+ #endif /* __Q6_ADM_V2_H__ */

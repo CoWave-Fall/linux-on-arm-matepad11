@@ -7,7 +7,517 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 
 --- a/sound/soc/qcom/qdsp6/q6afe.c
 +++ b/sound/soc/qcom/qdsp6/q6afe.c
-@@ -1404,6 +1404,9 @@
+@@ -9,12 +9,16 @@
+ #include <linux/wait.h>
+ #include <linux/jiffies.h>
+ #include <linux/sched.h>
++#include <linux/sizes.h>
+ #include <linux/module.h>
+ #include <linux/kref.h>
+ #include <linux/of.h>
++#include <linux/of_device.h>
+ #include <linux/of_platform.h>
+ #include <linux/spinlock.h>
+ #include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/firmware.h>
+ #include <linux/soc/qcom/apr.h>
+ #include <sound/soc.h>
+ #include <sound/soc-dai.h>
+@@ -28,11 +32,35 @@
+ #define AFE_PORT_CMD_DEVICE_START	0x000100E5
+ #define AFE_PORT_CMD_DEVICE_STOP	0x000100E6
+ #define AFE_PORT_CMD_SET_PARAM_V2	0x000100EF
++#define AFE_PORT_CMD_SET_PARAM_V3	0x000100FA
++#define AFE_SERVICE_CMD_SHARED_MEM_MAP_REGIONS	0x000100EA
++#define AFE_SERVICE_CMDRSP_SHARED_MEM_MAP_REGIONS 0x000100EB
++#define ADSP_MEMORY_MAP_SHMEM8_4K_POOL	0x3
+ #define AFE_SVC_CMD_SET_PARAM		0x000100f3
+ #define AFE_PORT_CMDRSP_GET_PARAM_V2	0x00010106
+ #define AFE_PARAM_ID_HDMI_CONFIG	0x00010210
+ #define AFE_MODULE_AUDIO_DEV_INTERFACE	0x0001020C
+ #define AFE_MODULE_TDM			0x0001028A
++#define AFE_PARAM_ID_SET_TOPOLOGY	0x0001025A
++#define AFE_API_VERSION_TOPOLOGY_V1	0x1
++#define AFE_MODULE_ID_TFADSP_RX		0x1000B911
++#define AFE_PARAM_ID_TFADSP_RX_CFG	0x1000B921
++#define AFE_TOPOLOGY_ID_TFADSP_RX	0x1000B910
++
++/* 功放反馈通路：PRI TDM TX 0 采集四颗 TFA9874 的电压与电流槽位 */
++#define AFE_MODULE_FEEDBACK		0x00010257
++#define AFE_PARAM_ID_FEEDBACK_PATH_CFG	0x0001022C
++#define AFE_TOPOLOGY_ID_TFADSP_TX	0x1000B909
++#define AFE_TDM_FEEDBACK_HW_DELAY_US	578
++#define AFE_TDM_RX_HW_DELAY_US		474
++
++/*
++ * 设备数据块由用户空间部署，不编入源码。路径相对
++ * /lib/firmware，块内容从本机 ACDB 原始区段取得。
++ */
++#define Q6AFE_FW_COMMON_RX	"qcom/sm8250/dby-w09/audio/afe_common_rx_acdb210_48k.bin"
++/* 反馈端口的 AFE_COMMON_TX 校准块，acdb 102、8 kHz、path 1，共 20 字节 */
++#define Q6AFE_FW_COMMON_TX	"qcom/sm8250/dby-w09/audio/afe_common_tx_acdb102_8k.bin"
+ 
+ #define AFE_PARAM_ID_CDC_SLIMBUS_SLAVE_CFG 0x00010235
+ #define AFE_PARAM_ID_USB_AUDIO_DEV_PARAMS    0x000102A5
+@@ -45,6 +73,8 @@
+ #define AFE_PARAM_ID_I2S_CONFIG	0x0001020D
+ #define AFE_PARAM_ID_TDM_CONFIG	0x0001029D
+ #define AFE_PARAM_ID_PORT_SLOT_MAPPING_CONFIG	0x00010297
++#define AFE_PARAM_ID_DEVICE_HW_DELAY	0x00010243
++#define AFE_API_VERSION_DEVICE_HW_DELAY	0x1
+ #define AFE_PARAM_ID_CODEC_DMA_CONFIG	0x000102B8
+ #define AFE_PARAM_ID_USB_AUDIO_CONFIG    0x000102A4
+ #define AFE_CMD_REMOTE_LPASS_CORE_HW_VOTE_REQUEST	0x000100f4
+@@ -387,6 +417,20 @@
+ #define AFE_CMD_RESP_NONE	1
+ #define AFE_CLK_TOKEN		1024
+ 
++/*
++ * 固件块在 DSP 中按共享内存访问。缓冲区必须保持映射与有效，直到
++ * 驱动卸载；DSP 在参数生效期间可能继续引用。
++ */
++struct q6afe_shared_mem {
++	void *vaddr;
++	dma_addr_t paddr;
++	size_t payload_size;
++	size_t map_size;
++	u32 map_handle;
++	u32 msw;
++	bool mapped;
++};
++
+ struct q6afe {
+ 	struct apr_device *apr;
+ 	struct device *dev;
+@@ -396,6 +440,9 @@
+ 	wait_queue_head_t wait;
+ 	struct list_head port_list;
+ 	spinlock_t port_list_lock;
++	struct q6afe_shared_mem common_rx_mem;
++	struct q6afe_shared_mem common_tx_mem;
++	u32 mmap_handle;
+ };
+ 
+ struct afe_port_cmd_device_start {
+@@ -416,6 +463,19 @@
+ 	u16 reserved;
+ } __packed;
+ 
++/*
++ * 带实例标识的参数头。下游驱动在 ADSP 支持实例标识时一律使用该版本，
++ * 原厂音频 HAL 也走这条路径。与原版相比多了 instance_id 字段，并且
++ * param_size 扩宽到 32 位。
++ */
++struct afe_port_param_data_v3 {
++	u32 module_id;
++	u16 instance_id;
++	u16 reserved;
++	u32 param_id;
++	u32 param_size;
++} __packed;
++
+ struct afe_svc_cmd_set_param {
+ 	uint32_t payload_size;
+ 	uint32_t payload_address_lsw;
+@@ -431,6 +491,35 @@
+ 	u32 mem_map_handle;
+ } __packed;
+ 
++struct afe_port_cmd_set_param_v3 {
++	u16 port_id;
++	u16 reserved;
++	u32 payload_address_lsw;
++	u32 payload_address_msw;
++	u32 mem_map_handle;
++	u32 payload_size;
++} __packed;
++
++/* AFE 服务的共享内存映射命令与拓扑表注册命令 */
++struct afe_svc_cmd_shared_mem_map_regions {
++	u16 mem_pool_id;
++	u16 num_regions;
++	u32 property_flag;
++} __packed;
++
++struct afe_shared_map_region_payload {
++	u32 shm_addr_lsw;
++	u32 shm_addr_msw;
++	u32 mem_size_bytes;
++} __packed;
++
++struct afe_cmd_set_topologies {
++	u32 payload_addr_lsw;
++	u32 payload_addr_msw;
++	u32 mem_map_handle;
++	u32 payload_size;
++} __packed;
++
+ struct afe_param_id_hdmi_multi_chan_audio_cfg {
+ 	u32 hdmi_cfg_minor_version;
+ 	u16 datatype;
+@@ -646,10 +735,46 @@
+ 	u16	ch_mapping[AFE_PORT_MAX_AUDIO_CHAN_CNT];
+ } __packed;
+ 
++/*
++ * 设备硬件延迟。原厂 HAL 在 TDM 端口启动前把该参数下发到 DSP，取值
++ * 来自 ACDB 的 calibration（本机扬声器通路为 0）。主线此前没有发送，
++ * 启动序列与原厂不一致。
++ */
++struct afe_param_id_device_hw_delay_cfg {
++	u32	device_hw_delay_minor_version;
++	u32	delay_in_us;
++} __packed;
++
++/*
++ * AFE_SLOT_MAPPING_CONFIG 的 v2 布局。下游驱动在 AFE 服务版本不低于
++ * V3 时使用该版本，offset 数组扩展到 32 项。v1 在四通道 TDM 上只
++ * 生效前三个槽位，扬声器通路的第 4 槽没有数据。
++ */
++#define AFE_API_VERSION_SLOT_MAPPING_CONFIG_V2 0x2
++#define AFE_PORT_MAX_AUDIO_CHAN_CNT_V2 0x20
++
++struct afe_param_id_slot_mapping_cfg_v2 {
++	u32	minor_version;
++	u16	num_channels;
++	u16	bitwidth;
++	u32	data_align_type;
++	u16	ch_mapping[AFE_PORT_MAX_AUDIO_CHAN_CNT_V2];
++} __packed;
++
++/*
++ * 端口拓扑编号。原厂扬声器通路的 TDM RX 端口在启动前下发该参数，
++ * 让 AFE 加载带 TFA DSP 模块的拓扑。主线的默认拓扑能输出前三个
++ * 槽位，第四槽没有数据，监听 slot3 的 TFA9874 因此报 TDMERR。
++ */
++struct afe_param_id_set_topology_cfg {
++	u32	minor_version;
++	u32	topology_id;
++} __packed;
++
+ struct q6afe_port {
+ 	wait_queue_head_t wait;
+ 	union afe_port_config port_cfg;
+-	struct afe_param_id_slot_mapping_cfg *scfg;
++	struct afe_param_id_slot_mapping_cfg_v2 *scfg;
+ 	struct aprv2_ibasic_rsp_result_t result;
+ 	int token;
+ 	int id;
+@@ -1004,6 +1129,8 @@
+ 	return ret;
+ }
+ 
++static struct q6afe *g_afe;
++
+ static int q6afe_callback(struct apr_device *adev, const struct apr_resp_pkt *data)
+ {
+ 	struct q6afe *afe = dev_get_drvdata(&adev->dev);
+@@ -1023,9 +1150,11 @@
+ 		}
+ 		switch (res->opcode) {
+ 		case AFE_PORT_CMD_SET_PARAM_V2:
++		case AFE_PORT_CMD_SET_PARAM_V3:
+ 		case AFE_PORT_CMD_DEVICE_STOP:
+ 		case AFE_PORT_CMD_DEVICE_START:
+ 		case AFE_SVC_CMD_SET_PARAM:
++		case AFE_SERVICE_CMD_SHARED_MEM_MAP_REGIONS:
+ 			port = q6afe_find_port(afe, hdr->token);
+ 			if (port) {
+ 				port->result = *res;
+@@ -1042,6 +1171,18 @@
+ 		}
+ 	}
+ 		break;
++	case AFE_SERVICE_CMDRSP_SHARED_MEM_MAP_REGIONS:
++		/*
++		 * 映射成功的应答只带一个句柄，失败时走通用错误应答路径。
++		 * 这里把句柄交给等待方，并按命令号唤醒。
++		 */
++		if (data->payload_size < sizeof(u32))
++			return -EINVAL;
++		afe->mmap_handle = *(u32 *)data->payload;
++		afe->result.opcode = AFE_SERVICE_CMD_SHARED_MEM_MAP_REGIONS;
++		afe->result.status = 0;
++		wake_up(&afe->wait);
++		break;
+ 	case AFE_CMD_RSP_REMOTE_LPASS_CORE_HW_VOTE_REQUEST:
+ 		afe->result.opcode = hdr->opcode;
+ 		afe->result.status = res->status;
+@@ -1151,6 +1292,11 @@
+ 	pdata->param_id = param_id;
+ 	pdata->param_size = psize;
+ 
++	dev_dbg(afe->dev,
++		"setparam port=0x%x opcode=0x%x module=0x%x param=0x%x size=%d payload=%zu\n",
++		port ? port->id : 0, AFE_SVC_CMD_SET_PARAM, module_id,
++		param_id, psize, sizeof(*pdata) + psize);
++
+ 	ret = afe_apr_send_pkt(afe, pkt, port, AFE_SVC_CMD_SET_PARAM);
+ 	if (ret)
+ 		dev_err(afe->dev, "AFE set params failed %d\n", ret);
+@@ -1165,11 +1311,11 @@
+ 			       psize, port->token);
+ }
+ 
+-static int q6afe_port_set_param_v2(struct q6afe_port *port, void *data,
++static int q6afe_port_set_param_v3(struct q6afe_port *port, void *data,
+ 				   int param_id, int module_id, int psize)
+ {
+-	struct afe_port_cmd_set_param_v2 *param;
+-	struct afe_port_param_data_v2 *pdata;
++	struct afe_port_cmd_set_param_v3 *param;
++	struct afe_port_param_data_v3 *pdata;
+ 	struct q6afe *afe = port->afe;
+ 	struct apr_pkt *pkt;
+ 	u16 port_id = port->id;
+@@ -1193,18 +1339,26 @@
+ 	pkt->hdr.src_port = 0;
+ 	pkt->hdr.dest_port = 0;
+ 	pkt->hdr.token = port->token;
+-	pkt->hdr.opcode = AFE_PORT_CMD_SET_PARAM_V2;
++	pkt->hdr.opcode = AFE_PORT_CMD_SET_PARAM_V3;
+ 
+ 	param->port_id = port_id;
+-	param->payload_size = sizeof(*pdata) + psize;
++	param->reserved = 0;
+ 	param->payload_address_lsw = 0x00;
+ 	param->payload_address_msw = 0x00;
+ 	param->mem_map_handle = 0x00;
++	param->payload_size = sizeof(*pdata) + psize;
+ 	pdata->module_id = module_id;
++	pdata->instance_id = 0;
++	pdata->reserved = 0;
+ 	pdata->param_id = param_id;
+ 	pdata->param_size = psize;
+ 
+-	ret = afe_apr_send_pkt(afe, pkt, port, AFE_PORT_CMD_SET_PARAM_V2);
++	dev_dbg(afe->dev,
++		"setparam port=0x%x opcode=0x%x module=0x%x param=0x%x size=%d payload=%zu\n",
++		port_id, AFE_PORT_CMD_SET_PARAM_V3, module_id, param_id, psize,
++		sizeof(*pdata) + psize);
++
++	ret = afe_apr_send_pkt(afe, pkt, port, AFE_PORT_CMD_SET_PARAM_V3);
+ 	if (ret)
+ 		dev_err(afe->dev, "AFE enable for port 0x%x failed %d\n",
+ 		       port_id, ret);
+@@ -1212,10 +1366,177 @@
+ 	return ret;
+ }
+ 
++/*
++ * 把固件块复制进连续的 DMA 缓冲，再通过 AFE 服务的共享内存映射
++ * 命令取得 DSP 侧句柄。调用方随后在命令里给出物理地址与句柄，
++ * DSP 按该地址读取块内容。缓冲区在驱动生命周期内保持有效。
++ */
++static int q6afe_shared_mem_map(struct q6afe *afe,
++				struct q6afe_shared_mem *mem, const char *name)
++{
++	struct afe_svc_cmd_shared_mem_map_regions *cmd;
++	struct afe_shared_map_region_payload *region;
++	const struct firmware *fw;
++	struct apr_pkt *pkt;
++	int ret, pkt_size;
++
++	if (mem->mapped)
++		return 0;
++
++	/* 与 DSP 之间的共享内存地址高 32 位带 SMMU SID 编码 */
++	ret = q6core_smmu_sid(afe->dev, &mem->msw);
++	if (ret) {
++		dev_err(afe->dev, "%s SMMU SID unavailable %d\n",
++			name, ret);
++		return ret;
++	}
++
++	ret = request_firmware(&fw, name, afe->dev);
++	if (ret) {
++		dev_err(afe->dev, "firmware %s unavailable %d\n",
++			name, ret);
++		return ret;
++	}
++
++	mem->payload_size = fw->size;
++	mem->map_size = ALIGN(fw->size, SZ_4K);
++	/*
++	 * DSP 经 ADSP 的 SMMU 流访问这块内存，地址必须由 DMA API 分配，
++	 * IOMMU 才会为它建立映射。probe 中的 of_dma_configure() 已按设备
++	 * 树的 iommus 配置好流，这里取到的 paddr 是 DSP 可翻译的 IOVA。
++	 */
++	mem->vaddr = dma_alloc_coherent(afe->dev, mem->map_size, &mem->paddr,
++					GFP_KERNEL);
++	if (!mem->vaddr) {
++		dev_err(afe->dev, "alloc %s failed, size %zu\n",
++			name, mem->map_size);
++		release_firmware(fw);
++		return -ENOMEM;
++	}
++	memcpy(mem->vaddr, fw->data, fw->size);
++	release_firmware(fw);
++
++	pkt_size = APR_HDR_SIZE + sizeof(*cmd) + sizeof(*region);
++	void *p __free(kfree) = kzalloc(pkt_size, GFP_KERNEL);
++	if (!p) {
++		dma_free_coherent(afe->dev, mem->map_size, mem->vaddr,
++				  mem->paddr);
++		mem->vaddr = NULL;
++		return -ENOMEM;
++	}
++
++	pkt = p;
++	cmd = p + APR_HDR_SIZE;
++	region = p + APR_HDR_SIZE + sizeof(*cmd);
++
++	pkt->hdr.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD,
++					   APR_HDR_LEN(APR_HDR_SIZE),
++					   APR_PKT_VER);
++	pkt->hdr.pkt_size = pkt_size;
++	pkt->hdr.token = AFE_CLK_TOKEN;
++	pkt->hdr.opcode = AFE_SERVICE_CMD_SHARED_MEM_MAP_REGIONS;
++
++	cmd->mem_pool_id = ADSP_MEMORY_MAP_SHMEM8_4K_POOL;
++	cmd->num_regions = 1;
++	cmd->property_flag = 0;
++
++	region->shm_addr_lsw = lower_32_bits(mem->paddr);
++	region->shm_addr_msw = mem->msw;
++	region->mem_size_bytes = mem->map_size;
++
++	afe->mmap_handle = 0;
++	ret = afe_apr_send_pkt(afe, pkt, NULL,
++			       AFE_SERVICE_CMD_SHARED_MEM_MAP_REGIONS);
++	if (ret) {
++		dev_err(afe->dev, "map %s failed %d, paddr %pad size %zu\n",
++			name, ret, &mem->paddr, mem->map_size);
++		dma_free_coherent(afe->dev, mem->map_size, mem->vaddr,
++				  mem->paddr);
++		mem->vaddr = NULL;
++		return ret;
++	}
++
++	mem->map_handle = afe->mmap_handle;
++	mem->mapped = true;
++	dev_info(afe->dev, "mapped %s size=%zu handle=0x%x\n",
++		 name, mem->payload_size, mem->map_handle);
++	return 0;
++}
++
++/*
++ * 把共享内存块作为带外 SET_PARAM_V3 下发。DSP 按报文里的地址直接
++ * 读取块内容，报文只给出长度，不追加参数头。
++ */
++static int q6afe_send_shm_block(struct q6afe_port *port,
++				struct q6afe_shared_mem *mem, const char *fw,
++				const char *name)
++{
++	struct q6afe *afe = port->afe;
++	struct afe_port_cmd_set_param_v3 *param;
++	struct apr_pkt *pkt;
++	int ret, pkt_size;
++
++	ret = q6afe_shared_mem_map(afe, mem, fw);
++	if (ret)
++		return ret;
++
++	pkt_size = APR_HDR_SIZE + sizeof(*param);
++	void *p __free(kfree) = kzalloc(pkt_size, GFP_KERNEL);
++	if (!p)
++		return -ENOMEM;
++
++	pkt = p;
++	param = p + APR_HDR_SIZE;
++
++	pkt->hdr.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD,
++					   APR_HDR_LEN(APR_HDR_SIZE),
++					   APR_PKT_VER);
++	pkt->hdr.pkt_size = pkt_size;
++	pkt->hdr.token = port->token;
++	pkt->hdr.opcode = AFE_PORT_CMD_SET_PARAM_V3;
++
++	param->port_id = port->id;
++	param->reserved = 0;
++	param->payload_address_lsw = lower_32_bits(mem->paddr);
++	param->payload_address_msw = mem->msw;
++	param->mem_map_handle = mem->map_handle;
++	param->payload_size = mem->payload_size;
++
++	ret = afe_apr_send_pkt(afe, pkt, port, AFE_PORT_CMD_SET_PARAM_V3);
++	if (ret)
++		dev_err(afe->dev, "port 0x%x %s block failed %d\n",
++			port->id, name, ret);
++	else
++		dev_info(afe->dev, "port 0x%x %s %zu bytes ok\n",
++			 port->id, name, mem->payload_size);
++
++	return ret;
++}
++
++/*
++ * AFE_COMMON_RX 校准块（acdb 210、48 kHz）。块内已按实例标识参数头
++ * 逐条排列，带外发送时只给出块长度，不再追加参数头。
++ */
++static int q6afe_send_common_rx_cal(struct q6afe_port *port)
++{
++	return q6afe_send_shm_block(port, &port->afe->common_rx_mem,
++				    Q6AFE_FW_COMMON_RX, "AFE_COMMON_RX");
++}
++
++/*
++ * AFE_COMMON_TX 校准块（acdb 102、8 kHz、path 1）。原厂在 TX 端口
++ * 打开时下发，内容为 0x1000b912 与 0x1000b920 两个拓扑编号。
++ */
++static int q6afe_send_common_tx_cal(struct q6afe_port *port)
++{
++	return q6afe_send_shm_block(port, &port->afe->common_tx_mem,
++				    Q6AFE_FW_COMMON_TX, "AFE_COMMON_TX");
++}
++
+ static int q6afe_port_set_lpass_clock(struct q6afe_port *port,
+ 				 struct afe_clk_cfg *cfg)
+ {
+-	return q6afe_port_set_param_v2(port, cfg,
++	return q6afe_port_set_param_v3(port, cfg,
+ 				       AFE_PARAM_ID_LPAIF_CLK_CONFIG,
+ 				       AFE_MODULE_AUDIO_DEV_INTERFACE,
+ 				       sizeof(*cfg));
+@@ -1231,7 +1552,7 @@
+ static int q6afe_set_digital_codec_core_clock(struct q6afe_port *port,
+ 					      struct afe_digital_clk_cfg *cfg)
+ {
+-	return q6afe_port_set_param_v2(port, cfg,
++	return q6afe_port_set_param_v3(port, cfg,
+ 				       AFE_PARAM_ID_INT_DIGITAL_CDC_CLK_CONFIG,
+ 				       AFE_MODULE_AUDIO_DEV_INTERFACE,
+ 				       sizeof(*cfg));
+@@ -1306,10 +1627,19 @@
+ 		break;
+ 	}
+ 
++	dev_dbg(port->afe->dev,
++		"sysclk port=0x%x clk_id=0x%x src=%d root=%d freq=%u dir=%d ret=%d\n",
++		port->id, clk_id, clk_src, clk_root, freq, dir, ret);
++
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(q6afe_port_set_sysclk);
+ 
++/*
++ * 端口对象的内部创建，定义在文件后部。
++ */
++static struct q6afe_port *q6afe_port_alloc(struct q6afe *afe, int id);
++
+ /**
+  * q6afe_port_stop() - Stop a afe port
+  *
+@@ -1395,6 +1725,7 @@
+ 			     struct q6afe_tdm_cfg *cfg)
+ {
+ 	union afe_port_config *pcfg = &port->port_cfg;
++	int i;
+ 
+ 	pcfg->tdm_cfg.tdm_cfg_minor_version = AFE_API_VERSION_TDM_CONFIG;
+ 	pcfg->tdm_cfg.num_channels = cfg->num_channels;
+@@ -1404,19 +1735,53 @@
  	pcfg->tdm_cfg.sync_mode = cfg->sync_mode;
  	pcfg->tdm_cfg.sync_src = cfg->sync_src;
  	pcfg->tdm_cfg.nslots_per_frame = cfg->nslots_per_frame;
@@ -17,6 +527,398 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  
  	pcfg->tdm_cfg.slot_width = cfg->slot_width;
  	pcfg->tdm_cfg.slot_mask = cfg->slot_mask;
++	dev_info(port->afe->dev,
++		 "tdm prepare port=0x%x ch=%d rate=%d bw=%d fmt=%d sync=%d/%d slots=%d sw=%d mask=%x out=%d inv=%d delay=%d\n",
++		 port->id, pcfg->tdm_cfg.num_channels,
++		 pcfg->tdm_cfg.sample_rate, pcfg->tdm_cfg.bit_width,
++		 pcfg->tdm_cfg.data_format, pcfg->tdm_cfg.sync_mode,
++		 pcfg->tdm_cfg.sync_src, pcfg->tdm_cfg.nslots_per_frame,
++		 pcfg->tdm_cfg.slot_width, pcfg->tdm_cfg.slot_mask,
++		 pcfg->tdm_cfg.ctrl_data_out_enable,
++		 pcfg->tdm_cfg.ctrl_invert_sync_pulse,
++		 pcfg->tdm_cfg.ctrl_sync_data_delay);
+ 	port->scfg = kzalloc_obj(*port->scfg);
+ 	if (!port->scfg)
+ 		return;
+ 
+-	port->scfg->minor_version = AFE_API_VERSION_SLOT_MAPPING_CONFIG;
++	/*
++	 * 这颗 DSP 的 AFE 服务支持 slot mapping v2，原厂驱动在四通道 TDM
++	 * 上使用的就是 v2。v1 的偏移表只覆盖前三个槽位，第四槽没有数据，
++	 * 对应四颗功放中监听 slot3 的那一颗报 TDMERR。
++	 */
++	port->scfg->minor_version = AFE_API_VERSION_SLOT_MAPPING_CONFIG_V2;
+ 	port->scfg->num_channels = cfg->num_channels;
+-	port->scfg->bitwidth = cfg->bit_width;
++	/*
++	 * slot mapping 的 bitwidth 字段描述的是每个槽位的宽度，不是样本位宽，
++	 * 取 16/24/32 之一。DSP 用它校验 offset 数组的边界：填样本位宽 24 时，
++	 * 四槽帧只有 12 字节，offset 12 的第 4 通道落在边界外被丢弃，slot3
++	 * 因此没有数据。这里填槽宽 32，与原厂 S32_LE 通路的取值一致。
++	 */
++	port->scfg->bitwidth = cfg->slot_width;
+ 	port->scfg->data_align_type = cfg->data_align_type;
+-	memcpy(port->scfg->ch_mapping, cfg->ch_mapping,
+-			sizeof(u16) * AFE_PORT_MAX_AUDIO_CHAN_CNT);
++	for (i = 0; i < AFE_PORT_MAX_AUDIO_CHAN_CNT_V2; i++)
++		port->scfg->ch_mapping[i] =
++			(i < AFE_PORT_MAX_AUDIO_CHAN_CNT) ?
++			cfg->ch_mapping[i] : Q6AFE_CMAP_INVALID;
++
++	dev_dbg(port->afe->dev,
++		"tdm slotmap v%u ch=%u bw=%u align=%u off=%u,%u,%u,%u,total=%zu\n",
++		port->scfg->minor_version, port->scfg->num_channels,
++		port->scfg->bitwidth, port->scfg->data_align_type,
++		port->scfg->ch_mapping[0], port->scfg->ch_mapping[1],
++		port->scfg->ch_mapping[2], port->scfg->ch_mapping[3],
++		sizeof(*port->scfg));
+ }
+ EXPORT_SYMBOL_GPL(q6afe_tdm_port_prepare);
+ 
+@@ -1442,7 +1807,7 @@
+ 
+ 	usb_dev.cfg_minor_version = AFE_API_MINOR_VERSION_USB_AUDIO_CONFIG;
+ 	usb_dev.dev_token = (cardidx << 16) | (pcmidx << 8);
+-	ret = q6afe_port_set_param_v2(port, &usb_dev,
++	ret = q6afe_port_set_param_v3(port, &usb_dev,
+ 				      AFE_PARAM_ID_USB_AUDIO_DEV_PARAMS,
+ 				      AFE_MODULE_AUDIO_DEV_INTERFACE,
+ 				      sizeof(usb_dev));
+@@ -1471,7 +1836,7 @@
+ 
+ 	lpcm_fmt.cfg_minor_version = AFE_API_MINOR_VERSION_USB_AUDIO_CONFIG;
+ 	lpcm_fmt.endian = pcfg->usb_cfg.endian;
+-	ret = q6afe_port_set_param_v2(port, &lpcm_fmt,
++	ret = q6afe_port_set_param_v3(port, &lpcm_fmt,
+ 				      AFE_PARAM_ID_USB_AUDIO_DEV_LPCM_FMT,
+ 				      AFE_MODULE_AUDIO_DEV_INTERFACE, sizeof(lpcm_fmt));
+ 	if (ret) {
+@@ -1482,7 +1847,7 @@
+ 
+ 	svc_int.cfg_minor_version = AFE_API_MINOR_VERSION_USB_AUDIO_CONFIG;
+ 	svc_int.svc_interval = pcfg->usb_cfg.service_interval;
+-	ret = q6afe_port_set_param_v2(port, &svc_int,
++	ret = q6afe_port_set_param_v3(port, &svc_int,
+ 				      AFE_PARAM_ID_USB_AUDIO_SVC_INTERVAL,
+ 				      AFE_MODULE_AUDIO_DEV_INTERFACE, sizeof(svc_int));
+ 	if (ret)
+@@ -1699,6 +2064,111 @@
+ 		dma_cfg->active_channels_mask = (1 << cfg->num_channels) - 1;
+ }
+ EXPORT_SYMBOL_GPL(q6afe_cdc_dma_port_prepare);
++/*
++ * 两组 TFA DSP 配置，内容取自原厂真实播放的 APR 记录。原厂在端口
++ * 启动前发送一遍，端口启动后再补发一遍。
++ */
++static void q6afe_send_tfa_cfg(struct q6afe_port *port, const char *phase)
++{
++	static const u8 tfa_cfg[][9] = {
++		{ 0x00, 0x81, 0x05, 0x06, 0xf6, 0x35, 0x07, 0x35, 0xe7 },
++		{ 0x10, 0x81, 0x05, 0x06, 0xed, 0x69, 0x07, 0x38, 0xfe },
++	};
++	struct q6afe *afe = port->afe;
++	int ret, i;
++
++	for (i = 0; i < ARRAY_SIZE(tfa_cfg); i++) {
++		ret = q6afe_port_set_param_v3(port, (void *)tfa_cfg[i],
++					      AFE_PARAM_ID_TFADSP_RX_CFG,
++					      AFE_MODULE_ID_TFADSP_RX,
++					      sizeof(tfa_cfg[i]));
++		if (ret)
++			dev_err(afe->dev,
++				"AFE TFA cfg %d for port 0x%x failed %d\n",
++				i, port->id, ret);
++	}
++	dev_info(afe->dev, "port 0x%x TFA cfg (%s) done\n",
++		 port->id, phase);
++}
++
++/*
++ * 原厂扬声器通路的启动顺序：TFA DSP 配置、端口拓扑、AFE_COMMON_RX
++ * 校准块。端口拓扑与校准块都需要 AFE 侧先注册设备自定义拓扑表。
++ */
++static void q6afe_tdm_rx_tfa_start(struct q6afe_port *port)
++{
++	struct afe_param_id_set_topology_cfg topo = {
++		.minor_version = AFE_API_VERSION_TOPOLOGY_V1,
++		.topology_id = AFE_TOPOLOGY_ID_TFADSP_RX,
++	};
++	struct q6afe *afe = port->afe;
++	int ret;
++
++	q6afe_send_tfa_cfg(port, "pre-start");
++
++	ret = q6afe_port_set_param_v3(port, &topo, AFE_PARAM_ID_SET_TOPOLOGY,
++				      AFE_MODULE_AUDIO_DEV_INTERFACE,
++				      sizeof(topo));
++	if (ret)
++		dev_info(afe->dev, "port 0x%x topology 0x%x unavailable %d\n",
++			 port->id, topo.topology_id, ret);
++	else
++		dev_info(afe->dev, "port 0x%x topology 0x%x ok\n",
++			 port->id, topo.topology_id);
++
++	ret = q6afe_send_common_rx_cal(port);
++	if (ret)
++		dev_err(afe->dev, "port 0x%x AFE_COMMON_RX failed %d\n",
++			port->id, ret);
++}
++
++/**
++ * q6afe_tdm_tx_vi_prepare() - 配置 PRI TDM TX 0 的 VI 反馈通路
++ * @port: 由采集流打开的 TX 端口实例
++ *
++ * 四颗 TFA9874 把电流检测样本放进 TDM 的发送槽位，LPASS 侧由
++ * PRI TDM TX 0（0x9001）采集（XML 只打开 `TDMCSE`，`TDMVSE` 为 0，
++ * 因此电压检测样本不发送）。原厂在端口打开时依次下发反馈通路配置
++ * （指向扬声器端口 0x9000）、端口拓扑 0x1000B909 与 AFE_COMMON_TX
++ * 校准块，之后才走通用的硬件延迟、TDM 配置、slot mapping 与启动。
++ *
++ * 这里的失败不判定为端口不可用：采集数据经 ADM 矩阵映射送到 ASM，
++ * 与反馈模块是否配置成功无关，因此逐条记录 DSP 应答后继续。
++ */
++static void q6afe_tdm_tx_vi_prepare(struct q6afe_port *port)
++{
++	struct afe_param_id_set_topology_cfg topo = {
++		.minor_version = AFE_API_VERSION_TOPOLOGY_V1,
++		.topology_id = AFE_TOPOLOGY_ID_TFADSP_TX,
++	};
++	/* 原厂报文 32 字节：minor 1、目标端口、4 通道与通道号 1 至 4 */
++	u32 fb_cfg[8] = { 1, AFE_PORT_ID_PRIMARY_TDM_RX, 4, 1, 2, 3, 4, 0 };
++	struct q6afe *afe = port->afe;
++	int ret;
++
++	ret = q6afe_port_set_param_v3(port, fb_cfg,
++				      AFE_PARAM_ID_FEEDBACK_PATH_CFG,
++				      AFE_MODULE_FEEDBACK, sizeof(fb_cfg));
++	if (ret)
++		dev_err(afe->dev, "port 0x%x feedback path cfg failed %d\n",
++			port->id, ret);
++	else
++		dev_info(afe->dev, "port 0x%x feedback path cfg ok\n",
++			 port->id);
++
++	ret = q6afe_port_set_param_v3(port, &topo, AFE_PARAM_ID_SET_TOPOLOGY,
++				      AFE_MODULE_AUDIO_DEV_INTERFACE,
++				      sizeof(topo));
++	if (ret)
++		dev_err(afe->dev, "port 0x%x topology 0x%x failed %d\n",
++			port->id, topo.topology_id, ret);
++	else
++		dev_info(afe->dev, "port 0x%x topology 0x%x ok\n",
++			 port->id, topo.topology_id);
++
++	q6afe_send_common_tx_cal(port);
++}
++
+ /**
+  * q6afe_port_start() - Start a afe port
+  *
+@@ -1715,7 +2185,48 @@
+ 	struct apr_pkt *pkt;
+ 	int pkt_size;
+ 
+-	ret  = q6afe_port_set_param_v2(port, &port->port_cfg, param_id,
++	/*
++	 * 原厂扬声器通路的 TDM RX 端口先下发 TFA DSP 配置与端口拓扑，
++	 * 再下发硬件延迟、TDM 配置与 slot mapping。拓扑缺失时 DSP 用
++	 * 默认通路，第四个 TDM 槽位没有数据。
++	 */
++	if (port->id == AFE_PORT_ID_PRIMARY_TDM_RX)
++		q6afe_tdm_rx_tfa_start(port);
++
++	/* 反馈端口在通用配置之前下发反馈通路、拓扑与校准块 */
++	if (port->id == AFE_PORT_ID_PRIMARY_TDM_TX)
++		q6afe_tdm_tx_vi_prepare(port);
++
++	/*
++	 * 原厂的 TDM 启动序列先下发设备硬件延迟，再配置 TDM 与 slot
++	 * mapping。延迟值取自 ACDB，扬声器 RX 通路为 474 us，TDM TX
++	 * 反馈通路为 578 us。scfg 仅在 TDM 端口上分配，用它判断当前
++	 * 端口类型。
++	 */
++	if (port->scfg) {
++		struct afe_param_id_device_hw_delay_cfg hw_delay = {
++			.device_hw_delay_minor_version =
++				AFE_API_VERSION_DEVICE_HW_DELAY,
++			.delay_in_us =
++				(port->id == AFE_PORT_ID_PRIMARY_TDM_RX) ?
++				AFE_TDM_RX_HW_DELAY_US :
++				AFE_TDM_FEEDBACK_HW_DELAY_US,
++		};
++
++		ret = q6afe_port_set_param_v3(port, &hw_delay,
++					      AFE_PARAM_ID_DEVICE_HW_DELAY,
++					      AFE_MODULE_AUDIO_DEV_INTERFACE,
++					      sizeof(hw_delay));
++		if (ret) {
++			dev_err(afe->dev, "AFE hw delay for port 0x%x failed %d\n",
++				port_id, ret);
++			return ret;
++		}
++		dev_info(afe->dev, "port 0x%x hw delay %uus ok\n",
++			 port_id, hw_delay.delay_in_us);
++	}
++
++	ret  = q6afe_port_set_param_v3(port, &port->port_cfg, param_id,
+ 				       AFE_MODULE_AUDIO_DEV_INTERFACE,
+ 				       sizeof(port->port_cfg));
+ 	if (ret) {
+@@ -1723,16 +2234,27 @@
+ 			port_id, ret);
+ 		return ret;
+ 	}
++	dev_info(afe->dev, "port 0x%x cfg param 0x%x size %zu ok\n",
++		 port_id, param_id, sizeof(port->port_cfg));
+ 
+ 	if (port->scfg) {
+-		ret  = q6afe_port_set_param_v2(port, port->scfg,
++		dev_info(afe->dev,
++			 "port 0x%x slot map v%u ch=%u sw=%u align=%u off=%u,%u,%u,%u\n",
++			 port_id, port->scfg->minor_version,
++			 port->scfg->num_channels, port->scfg->bitwidth,
++			 port->scfg->data_align_type,
++			 port->scfg->ch_mapping[0], port->scfg->ch_mapping[1],
++			 port->scfg->ch_mapping[2], port->scfg->ch_mapping[3]);
++		ret  = q6afe_port_set_param_v3(port, port->scfg,
+ 					AFE_PARAM_ID_PORT_SLOT_MAPPING_CONFIG,
+-					AFE_MODULE_TDM, sizeof(*port->scfg));
++					AFE_MODULE_TDM,
++					sizeof(struct afe_param_id_slot_mapping_cfg_v2));
+ 		if (ret) {
+ 			dev_err(afe->dev, "AFE enable for port 0x%x failed %d\n",
+ 			port_id, ret);
+ 			return ret;
+ 		}
++		dev_info(afe->dev, "port 0x%x slot map ok\n", port_id);
+ 	}
+ 
+ 	pkt_size = APR_HDR_SIZE + sizeof(*start);
+@@ -1755,11 +2277,20 @@
+ 	start->port_id = port_id;
+ 
+ 	ret = afe_apr_send_pkt(afe, pkt, port, AFE_PORT_CMD_DEVICE_START);
+-	if (ret)
++	if (ret) {
+ 		dev_err(afe->dev, "AFE enable for port 0x%x failed %d\n",
+ 			port_id, ret);
++		return ret;
++	}
+ 
+-	return ret;
++	/*
++	 * 原厂在端口启动完成后补发一遍 TFA DSP 配置，使 TFA 模块在
++	 * 时钟已经运行的情况下重新接收参数。
++	 */
++	if (port->id == AFE_PORT_ID_PRIMARY_TDM_RX)
++		q6afe_send_tfa_cfg(port, "post-start");
++
++	return 0;
+ }
+ EXPORT_SYMBOL_GPL(q6afe_port_start);
+ 
+@@ -1772,22 +2303,28 @@
+  * Return: Will be an error pointer on error or a valid afe port
+  * on success.
+  */
+-struct q6afe_port *q6afe_port_get_from_id(struct device *dev, int id)
++/**
++ * q6afe_port_alloc() - 按端口索引创建端口对象
++ *
++ * @afe: AFE 实例
++ * @id: 端口索引（DAI 编号），同时用作 APR token
++ *
++ * 反馈通路端口不由 DAI 链路驱动，调用方持有 AFE 实例即可创建。
++ */
++static struct q6afe_port *q6afe_port_alloc(struct q6afe *afe, int id)
+ {
+-	int port_id;
+-	struct q6afe *afe = dev_get_drvdata(dev->parent);
+ 	struct q6afe_port *port;
+-	int cfg_type;
++	int port_id, cfg_type;
+ 
+ 	if (id < 0 || id >= AFE_PORT_MAX) {
+-		dev_err(dev, "AFE port token[%d] invalid!\n", id);
++		dev_err(afe->dev, "AFE port token[%d] invalid!\n", id);
+ 		return ERR_PTR(-EINVAL);
+ 	}
+ 
+ 	/* if port is multiple times bind/unbind before callback finishes */
+ 	port = q6afe_find_port(afe, id);
+ 	if (port) {
+-		dev_err(dev, "AFE Port already open\n");
++		dev_err(afe->dev, "AFE Port already open\n");
+ 		return port;
+ 	}
+ 
+@@ -1853,7 +2390,7 @@
+ 		cfg_type = AFE_PARAM_ID_USB_AUDIO_CONFIG;
+ 		break;
+ 	default:
+-		dev_err(dev, "Invalid port id 0x%x\n", port_id);
++		dev_err(afe->dev, "Invalid port id 0x%x\n", port_id);
+ 		return ERR_PTR(-EINVAL);
+ 	}
+ 
+@@ -1873,7 +2410,22 @@
+ 		list_add_tail(&port->node, &afe->port_list);
+ 
+ 	return port;
++}
+ 
++/**
++ * q6afe_port_get_from_id() - Get port instance from a port id
++ *
++ * @dev: Pointer to afe child device.
++ * @id: port id
++ *
++ * Return: Will be an error pointer on error or a valid afe port
++ * on success.
++ */
++struct q6afe_port *q6afe_port_get_from_id(struct device *dev, int id)
++{
++	struct q6afe *afe = dev_get_drvdata(dev->parent);
++
++	return q6afe_port_alloc(afe, id);
+ }
+ EXPORT_SYMBOL_GPL(q6afe_port_get_from_id);
+ 
+@@ -1964,6 +2516,26 @@
+ {
+ 	struct q6afe *afe;
+ 	struct device *dev = &adev->dev;
++	int ret;
++
++	/*
++	 * q6afe 挂在 APR 自定义总线上，注册时不经过 of_dma_configure，
++	 * 因此没有 DMA 掩码，也没有按设备树建立 IOMMU 流。共享内存映射
++	 * 命令把地址交给 DSP，地址必须位于 SID 0x1801 的映射范围内；
++	 * 这里补上 DMA 配置，让 dma_alloc_coherent() 返回 DSP 能翻译的
++	 * 地址。设备树中的 iommus 属性提供流 ID。
++	 *
++	 * of_dma_configure() 会用 coherent_dma_mask 与上限做与运算，
++	 * APR 设备的该字段初始为 0，必须先把掩码设成 32 位，否则分配
++	 * 得到的掩码仍是 0，dma_alloc_coherent() 会拒绝请求。
++	 */
++	ret = dma_coerce_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	if (ret)
++		return ret;
++
++	ret = of_dma_configure(dev, dev->of_node, true);
++	if (ret)
++		return ret;
+ 
+ 	afe = devm_kzalloc(dev, sizeof(*afe), GFP_KERNEL);
+ 	if (!afe)
+@@ -1978,6 +2550,7 @@
+ 	spin_lock_init(&afe->port_list_lock);
+ 
+ 	dev_set_drvdata(dev, afe);
++	g_afe = afe;
+ 
+ 	return devm_of_platform_populate(dev);
+ }
 --- a/sound/soc/qcom/qdsp6/q6afe.h
 +++ b/sound/soc/qcom/qdsp6/q6afe.h
 @@ -192,6 +192,9 @@
@@ -29,9 +931,143 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  	u32	data_align_type;
  	u16	ch_mapping[AFE_MAX_CHAN_COUNT];
  };
+@@ -272,4 +275,5 @@
+ 			     const char *client_name, uint32_t *client_handle);
+ int q6afe_unvote_lpass_core_hw(struct device *dev, uint32_t hw_block_id,
+ 			       uint32_t client_handle);
++
+ #endif /* __Q6AFE_H__ */
 --- a/sound/soc/qcom/qdsp6/q6routing.c
 +++ b/sound/soc/qcom/qdsp6/q6routing.c
-@@ -1151,6 +1151,12 @@
+@@ -22,6 +22,7 @@
+ #include "q6afe.h"
+ #include "q6asm.h"
+ #include "q6adm.h"
++#include "q6core.h"
+ #include "q6routing.h"
+ 
+ #define DRV_NAME "q6routing-component"
+@@ -376,6 +377,44 @@
+ 
+ static struct msm_routing_data *routing_data;
+ 
++/*
++ * 设备自定义拓扑只注册一次。AFE 的 TFA 拓扑与 ADM 的 0x11000003
++ * 均来自设备 ACDB，DSP 默认拓扑表没有对应编号。CORE 注册完整张
++ * 拓扑表后，0x11000003 的模块集合才能加载。注册失败时不标记完成，
++ * 下一次 hw_params 重试，便于补齐固件后直接重开播放。
++ */
++static bool speaker_topo_ready;
++static u32 speaker_topology = NULL_COPP_TOPOLOGY;
++
++static void routing_speaker_topo_init(struct device *dev)
++{
++	int ret;
++
++	if (speaker_topo_ready)
++		return;
++
++	/*
++	 * 自定义拓扑表必须先注册，DSP 才认识 0x11000003；原厂由音频
++	 * HAL 在播放前经 CORE_CUSTOM_TOPOLOGIES 校准块完成这一步。
++	 */
++	ret = q6core_register_custom_topologies();
++	if (ret) {
++		dev_err(dev, "CORE topology registration failed %d\n", ret);
++		return;
++	}
++
++	ret = q6core_load_topo_modules(0x11000003);
++	if (ret)
++		dev_warn(dev, "CORE load 0x11000003 failed %d\n", ret);
++
++	/*
++	 * 只有 CORE 加载过模块集合后才切换到自定义 ADM 拓扑，否则 DSP
++	 * 打开 0x11000003 会落在缺少模块的通路上。
++	 */
++	speaker_topology = 0x11000003;
++	speaker_topo_ready = true;
++}
++
+ /**
+  * q6routing_stream_open() - Register a new stream for route setup
+  *
+@@ -389,7 +428,7 @@
+ int q6routing_stream_open(int fedai_id, int perf_mode,
+ 			   int stream_id, int stream_type)
+ {
+-	int j, topology, num_copps = 0;
++	int j, topology, num_copps = 0, ret;
+ 	struct route_payload payload;
+ 	struct q6copp *copp;
+ 	int copp_idx;
+@@ -419,11 +458,31 @@
+ 
+ 	payload.num_copps = 0; /* only RX needs to use payload */
+ 	topology = NULL_COPP_TOPOLOGY;
++	/*
++	 * 扬声器通路使用 ACDB 中的自定义 ADM 拓扑 0x11000003，该拓扑
++	 * 包含 MFC、音量与重采样模块。拓扑表在 hw_params 阶段已经注册，
++	 * 这里直接按该编号打开；DSP 拒绝时退回默认拓扑，保持播放通路
++	 * 可用，同时在日志中留下失败记录。
++	 */
++	if (session->port_id == PRIMARY_TDM_RX_0)
++		topology = speaker_topology;
++
+ 	copp = q6adm_open(routing_data->dev, session->port_id,
+ 			      session->path_type, session->sample_rate,
+ 			      session->channels, topology, perf_mode,
+ 			      session->bits_per_sample, 0, 0);
+ 
++	if (IS_ERR_OR_NULL(copp) && topology != NULL_COPP_TOPOLOGY) {
++		dev_warn(routing_data->dev,
++			 "ADM open topology 0x%x failed, fallback\n",
++			 topology);
++		topology = NULL_COPP_TOPOLOGY;
++		copp = q6adm_open(routing_data->dev, session->port_id,
++				  session->path_type, session->sample_rate,
++				  session->channels, topology, perf_mode,
++				  session->bits_per_sample, 0, 0);
++	}
++
+ 	if (IS_ERR_OR_NULL(copp)) {
+ 		mutex_unlock(&routing_data->lock);
+ 		return -EINVAL;
+@@ -442,8 +501,19 @@
+ 	if (num_copps) {
+ 		payload.num_copps = num_copps;
+ 		payload.session_id = stream_id;
+-		q6adm_matrix_map(routing_data->dev, session->path_type,
+-				 payload, perf_mode);
++		ret = q6adm_matrix_map(routing_data->dev, session->path_type,
++				       payload, perf_mode);
++	}
++
++	/*
++	 * 原厂在矩阵映射之后才下发 ADM 的 AUDPROC 与 AUDVOL 数据块，
++	 * 两块决定 MFC 输出格式与四声道的混音权重。
++	 */
++	if (session->port_id == PRIMARY_TDM_RX_0) {
++		ret = q6adm_send_pp_cals(routing_data->dev, copp);
++		if (ret)
++			dev_err(routing_data->dev,
++				"ADM PP blocks failed %d\n", ret);
+ 	}
+ 	mutex_unlock(&routing_data->lock);
+ 
+@@ -1146,11 +1216,24 @@
+ 
+ 	session = &data->port_data[be_id];
+ 
++	/*
++	 * 扬声器通路在首次配置参数时完成拓扑注册与模块加载：hw_params
++	 * 早于 prepare，AFE 端口启动与 ADM 打开都发生在其后。
++	 */
++	if (be_id == PRIMARY_TDM_RX_0)
++		routing_speaker_topo_init(component->dev);
++
+ 	mutex_lock(&data->lock);
+ 
  	session->path_type = path_type;
  	session->sample_rate = params_rate(params);
  	session->channels = params_channels(params);
@@ -44,7 +1080,7 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  
  	switch (params_format(params)) {
  	case SNDRV_PCM_FORMAT_S16_LE:
-@@ -1159,6 +1165,9 @@
+@@ -1159,10 +1242,21 @@
  	case SNDRV_PCM_FORMAT_S24_LE:
  			session->bits_per_sample = 24;
  		break;
@@ -54,21 +1090,31 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  	default:
  		break;
  	}
+ 
++	/*
++	 * 原厂 ADM 打开扬声器通路时 bit_width 取 24（#25 的报文
++	 * ADM_CMD_DEVICE_OPEN_V8 中该字段为 0x18），AFE 端口的 TDM
++	 * 槽宽仍为 32。这里按原厂取值，与 32 位槽宽并行。
++	 */
++	if (be_id == PRIMARY_TDM_RX_0)
++		session->bits_per_sample = 24;
++
+ 	mutex_unlock(&data->lock);
+ 	return 0;
+ }
 --- a/sound/soc/qcom/qdsp6/q6afe-dai.c
 +++ b/sound/soc/qcom/qdsp6/q6afe-dai.c
-@@ -272,12 +272,27 @@
+@@ -272,12 +272,26 @@
  	struct q6afe_dai_data *dai_data = dev_get_drvdata(dai->dev);
  	struct q6afe_tdm_cfg *tdm = &dai_data->port_config[dai->id].tdm;
  
--	tdm->bit_width = params_width(params);
 +	/*
-+	 * S32_LE 只是让用户空间的样本落进 32 位容器的高 24 位，DSP 侧仍
-+	 * 按 24 bit 样本配置，与原厂 audio_platform_info 的取值一致。
++	 * TDM 端口的样本宽度取 ALSA 格式宽度。S32_LE 时下游驱动与原厂
++	 * HAL 都按 32 bit 配置；若填 24，DSP 会按 4 × 24 bit 的范围
++	 * 校验 slot mapping 的 offset，第 4 通道的 offset 12 落在边界外
++	 * 被丢弃。
 +	 */
-+	if (params_format(params) == SNDRV_PCM_FORMAT_S32_LE)
-+		tdm->bit_width = 24;
-+	else
-+		tdm->bit_width = params_width(params);
+ 	tdm->bit_width = params_width(params);
  	tdm->sample_rate = params_rate(params);
 -	tdm->num_channels = params_channels(params);
 +	/*
@@ -88,44 +1134,174 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  }
 --- a/sound/soc/qcom/qdsp6/q6asm-dai.c
 +++ b/sound/soc/qcom/qdsp6/q6asm-dai.c
-@@ -113,7 +113,8 @@
+@@ -113,7 +113,9 @@
  				SNDRV_PCM_INFO_INTERLEAVED |
  				SNDRV_PCM_INFO_PAUSE | SNDRV_PCM_INFO_RESUME),
  	.formats =              (SNDRV_PCM_FMTBIT_S16_LE |
 -				SNDRV_PCM_FMTBIT_S24_LE),
 +				SNDRV_PCM_FMTBIT_S24_LE |
++				SNDRV_PCM_FMTBIT_S24_3LE |
 +				SNDRV_PCM_FMTBIT_S32_LE),
  	.rates =                SNDRV_PCM_RATE_8000_192000,
  	.rate_min =             8000,
  	.rate_max =             192000,
-@@ -139,7 +140,8 @@
+@@ -139,7 +141,9 @@
  				  SNDRV_PCM_RATE_176400 |		\
  				  SNDRV_PCM_RATE_192000),		\
  			.formats = (SNDRV_PCM_FMTBIT_S16_LE |		\
 -					SNDRV_PCM_FMTBIT_S24_LE),	\
 +					SNDRV_PCM_FMTBIT_S24_LE |	\
++					SNDRV_PCM_FMTBIT_S24_3LE |	\
 +					SNDRV_PCM_FMTBIT_S32_LE),	\
  			.channels_min = 1,				\
  			.channels_max = 8,				\
  			.rate_min =     8000,				\
-@@ -509,6 +511,14 @@
+@@ -281,7 +285,8 @@
+ 		ret = q6asm_media_format_block_multi_ch_pcm(
+ 				prtd->audio_client, prtd->stream_id,
+ 				runtime->rate, runtime->channels, NULL,
+-				prtd->bits_per_sample);
++				prtd->bits_per_sample,
++				snd_pcm_format_physical_width(runtime->format));
+ 	} else if (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {
+ 		ret = q6asm_enc_cfg_blk_pcm_format_support(prtd->audio_client,
+ 							   prtd->stream_id,
+@@ -509,6 +514,21 @@
  	case SNDRV_PCM_FORMAT_S24_LE:
  		prtd->bits_per_sample = 24;
  		break;
++	/*
++	 * 原厂 HAL 的前端是 3 字节打包的 24 bit（S24_3LE），ASM 的媒体
++	 * 格式因此按 24 bit 样本、24 bit 字长下发，ADM 的 bit_width 也
++	 * 取 24。这里把该格式加入播放通路，便于按原厂取值对照。
++	 */
++	case SNDRV_PCM_FORMAT_S24_3LE:
++		prtd->bits_per_sample = 24;
++		break;
 +	case SNDRV_PCM_FORMAT_S32_LE:
 +		/*
-+		 * DSP 从 32 位容器的高 24 位取样本，且固件不接受 32 bit
-+		 * 样本配置。用户空间以 S32_LE 打开时提供 32 位字，低 8 位
-+		 * 被忽略，因此仍按 24 bit 通知 DSP。
++		 * 原厂对 S32_LE 前端按 32 bit 样本、32 bit 字长通知 DSP，
++		 * 这里对齐该取值。
 +		 */
-+		prtd->bits_per_sample = 24;
++		prtd->bits_per_sample = 32;
 +		break;
  	}
  
  	return 0;
+--- a/sound/soc/qcom/qdsp6/q6asm.c
++++ b/sound/soc/qcom/qdsp6/q6asm.c
+@@ -29,6 +29,11 @@
+ #define ASM_DATA_CMD_EOS			0x00010BDB
+ #define ASM_DATA_EVENT_RENDERED_EOS		0x00010C1C
+ #define ASM_NULL_POPP_TOPOLOGY			0x00010C68
++/*
++ * 原厂驱动在 LEGACY_PCM_MODE 下把 ACDB 的 ASM 拓扑写入打开命令，
++ * 校准数据不可用时取该缺省值；主线此前固定发送 NONE。
++ */
++#define ASM_DEFAULT_POPP_TOPOLOGY		0x00010BE4
+ #define ASM_STREAM_CMD_FLUSH_READBUFS		0x00010C09
+ #define ASM_STREAM_CMD_SET_ENCDEC_PARAM		0x00010C10
+ #define ASM_STREAM_POSTPROC_TOPO_ID_NONE	0x00010C68
+@@ -40,6 +45,7 @@
+ #define ASM_PARAM_ID_ENCDEC_ENC_CFG_BLK_V2	0x00010DA3
+ #define ASM_SESSION_CMD_RUN_V2			0x00010DAA
+ #define ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2	0x00010DA5
++#define ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V5	0x00013222
+ #define ASM_MEDIA_FMT_MP3			0x00010BE9
+ #define ASM_MEDIA_FMT_FLAC			0x00010C16
+ #define ASM_MEDIA_FMT_WMA_V9			0x00010DA8
+@@ -99,6 +105,25 @@
+ 	u8 channel_mapping[PCM_MAX_NUM_CHANNEL];
+ } __packed;
+ 
++/*
++ * 扩展布局：在 V2 的 reserved 位置给出字长，并追加字节序、模式与
++ * 32 项通道映射。原厂驱动对 32 bit 样本走该布局，V2 布局会被 DSP
++ * 以 EINVAL 拒绝。
++ */
++#define PCM_MAX_NUM_CHANNEL_V8	32
++
++struct asm_multi_channel_pcm_fmt_blk_v5 {
++	struct asm_data_cmd_media_fmt_update_v2 fmt_blk;
++	u16 num_channels;
++	u16 bits_per_sample;
++	u32 sample_rate;
++	u16 is_signed;
++	u16 sample_word_size;
++	u16 endianness;
++	u16 mode;
++	u8 channel_mapping[PCM_MAX_NUM_CHANNEL_V8];
++} __packed;
++
+ struct asm_flac_fmt_blk_v2 {
+ 	struct asm_data_cmd_media_fmt_update_v2 fmt_blk;
+ 	u16 is_stream_info_present;
+@@ -946,14 +971,14 @@
+ 	/* source endpoint : matrix */
+ 	open->sink_endpointype = ASM_END_POINT_DEVICE_MATRIX;
+ 	open->bits_per_sample = bits_per_sample;
+-	open->postprocopo_id = ASM_NULL_POPP_TOPOLOGY;
++	open->postprocopo_id = ASM_DEFAULT_POPP_TOPOLOGY;
+ 
+ 	switch (format) {
+ 	case SND_AUDIOCODEC_MP3:
+ 		open->dec_fmt_id = ASM_MEDIA_FMT_MP3;
+ 		break;
+ 	case FORMAT_LINEAR_PCM:
+-		open->dec_fmt_id = ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2;
++		open->dec_fmt_id = ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V5;
+ 		break;
+ 	case SND_AUDIOCODEC_FLAC:
+ 		open->dec_fmt_id = ASM_MEDIA_FMT_FLAC;
+@@ -1083,11 +1108,11 @@
+ 					  uint32_t stream_id,
+ 					  uint32_t rate, uint32_t channels,
+ 					  u8 channel_map[PCM_MAX_NUM_CHANNEL],
+-					  uint16_t bits_per_sample)
++					  uint16_t bits_per_sample,
++					  uint16_t sample_word_size)
+ {
+-	struct asm_multi_channel_pcm_fmt_blk_v2 *fmt;
++	struct asm_multi_channel_pcm_fmt_blk_v5 *fmt;
+ 	struct apr_pkt *pkt;
+-	u8 *channel_mapping;
+ 	int pkt_size = APR_HDR_SIZE + sizeof(*fmt);
+ 
+ 	void *p __free(kfree) = kzalloc(pkt_size, GFP_KERNEL);
+@@ -1105,13 +1130,14 @@
+ 	fmt->bits_per_sample = bits_per_sample;
+ 	fmt->sample_rate = rate;
+ 	fmt->is_signed = 1;
+-
+-	channel_mapping = fmt->channel_mapping;
++	fmt->sample_word_size = sample_word_size;
++	fmt->endianness = 0;
++	fmt->mode = 0;
+ 
+ 	if (channel_map) {
+-		memcpy(channel_mapping, channel_map, PCM_MAX_NUM_CHANNEL);
++		memcpy(fmt->channel_mapping, channel_map, PCM_MAX_NUM_CHANNEL);
+ 	} else {
+-		if (q6dsp_map_channels(channel_mapping, channels)) {
++		if (q6dsp_map_channels(fmt->channel_mapping, channels)) {
+ 			dev_err(ac->dev, " map channels failed %d\n", channels);
+ 			return -EINVAL;
+ 		}
+--- a/sound/soc/qcom/qdsp6/q6asm.h
++++ b/sound/soc/qcom/qdsp6/q6asm.h
+@@ -114,7 +114,8 @@
+ 					  uint32_t stream_id,
+ 					  uint32_t rate, uint32_t channels,
+ 					  u8 channel_map[PCM_MAX_NUM_CHANNEL],
+-					  uint16_t bits_per_sample);
++					  uint16_t bits_per_sample,
++					  uint16_t sample_word_size);
+ int q6asm_stream_media_format_block_flac(struct audio_client *ac,
+ 					 uint32_t stream_id,
+ 					 struct q6asm_flac_cfg *cfg);
 --- a/sound/soc/qcom/sm8250.c
 +++ b/sound/soc/qcom/sm8250.c
-@@ -17,6 +17,25 @@
+@@ -17,9 +17,36 @@
  #include "sdw.h"
  
  #define MI2S_BCLK_RATE		1536000
@@ -139,19 +1315,30 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +
 +/*
 + * 播放数据的声道 i 放到 TDM 的 slot i。四颗功放各自监听一个 slot，
-+ * 主机只负责把 4 声道 PCM 排到这条数据线上。
++ * 主机只负责把 4 声道 PCM 排到这条数据线上；反馈采集端口与它处于
++ * 同一个帧，两个方向共用这张表。
 + *
 + * AFE 的槽位映射参数按字节记录每个声道的起始位置，32 bit 槽宽下一个
 + * 槽占 4 字节，因此这里给出 0、4、8、12。实机传入 0、1、2、3 时 DSP
 + * 返回 EBADPARAM，端口无法启动。
++ *
++ * 反转映射（12、8、4、0）的对照实验已完成：TDMERR 跟随物理槽位 3，
++ * 与声道无关，说明 AFE 输出端的第 4 槽没有数据。现已恢复正向映射。
 + */
-+static const unsigned int sm8250_tdm_rx_slots[TDM_SLOTS] = {
++static const unsigned int sm8250_tdm_slots[TDM_SLOTS] = {
 +	0, TDM_SLOT_WIDTH / 8, 2 * (TDM_SLOT_WIDTH / 8), 3 * (TDM_SLOT_WIDTH / 8),
 +};
  
  struct sm8250_snd_data {
  	bool stream_prepared[AFE_PORT_MAX];
-@@ -58,6 +77,7 @@
++	/* PRI TDM 的位时钟是帧级资源，两个方向共用，任一方向打开就保持 */
++	bool tdm_playback_on;
++	bool tdm_capture_on;
++	bool tdm_ibit_on;
+ 	struct snd_soc_card *card;
+ 	struct snd_soc_jack jack;
+ 	struct snd_soc_jack usb_offload_jack;
+@@ -58,6 +85,7 @@
  static int sm8250_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
  				     struct snd_pcm_hw_params *params)
  {
@@ -159,30 +1346,35 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  	struct snd_interval *rate = hw_param_interval(params,
  					SNDRV_PCM_HW_PARAM_RATE);
  	struct snd_interval *channels = hw_param_interval(params,
-@@ -65,8 +85,33 @@
+@@ -65,9 +93,65 @@
  	struct snd_mask *fmt = hw_param_mask(params, SNDRV_PCM_HW_PARAM_FORMAT);
  
  	rate->min = rate->max = 48000;
 -	channels->min = channels->max = 2;
 -	snd_mask_set_format(fmt, SNDRV_PCM_FORMAT_S16_LE);
-+
+ 
 +	/*
-+	 * 扬声器 TDM 使用 4 声道、24 bit 采样（放在 32 bit 槽内）；WCD938x
-+	 * 采集侧四路 ADC 各占一个通道；其余后端保持 2 声道 16 bit。
++	 * 扬声器 TDM 使用 4 声道、32 bit 采样（有效数据占高 24 位）；
++	 * WCD938x 采集侧四路 ADC 各占一个通道；其余后端保持 2 声道 16 bit。
 +	 *
-+	 * DSP 把 TDM 槽的高 24 位当作有效数据，而 ALSA 的 S24_LE 约定低
-+	 * 24 位有效，用户空间按该约定写出的样本会整体衰减 8 位。这里声明
-+	 * S32_LE，让用户空间按 32 位容器提供数据，高 24 位自然对应到 DSP
-+	 * 的样本位置；q6asm 仍以 24 bit 通知 DSP。
++	 * 前端按原厂 HAL 的 2 声道打开，TDM 端口的 4 声道由 ADM 在
++	 * channel_mode 4 下上混得到。格式取 S32_LE：用户空间按 32 位
++	 * 容器提供数据，高 24 位自然对应到 DSP 的样本位置；AFE 的 TDM
++	 * 样本宽度与 slot mapping 的 bitwidth 也都取 32，与鸿蒙 #17
++	 * 实测的原厂参数一致。
 +	 */
 +	if (cpu_dai->id == PRIMARY_TDM_RX_0) {
-+		/*
-+		 * 与原厂取值一致：ALSA 前端以 2 声道打开，TDM 端口的 4 声道
-+		 * 由 ADM 在 channel_mode 4 下上混得到，槽位映射由 q6afe 的
-+		 * 通道映射参数另行下发。
-+		 */
 +		channels->min = channels->max = 2;
 +		/* 清空用户态格式位，确保 BE 只以 32 bit 容器打开 */
++		snd_mask_none(fmt);
++		snd_mask_set_format(fmt, SNDRV_PCM_FORMAT_S32_LE);
++	} else if (cpu_dai->id == PRIMARY_TDM_TX_0) {
++		/*
++		 * VI 反馈端口与扬声器端口处于同一 TDM 帧，采集侧固定
++		 * 四声道 S32_LE：每个槽位对应一颗功放的检测样本，格式
++		 * 与扬声器端口的原厂取值一致。
++		 */
++		channels->min = channels->max = TDM_SLOTS;
 +		snd_mask_none(fmt);
 +		snd_mask_set_format(fmt, SNDRV_PCM_FORMAT_S32_LE);
 +	} else if (cpu_dai->id == TX_CODEC_DMA_TX_3) {
@@ -192,18 +1384,48 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +		channels->min = channels->max = 2;
 +		snd_mask_set_format(fmt, SNDRV_PCM_FORMAT_S16_LE);
 +	}
- 
++
++	return 0;
++}
++
++/*
++ * 按当前正在使用的方向维护 TDM 位时钟：任一方向在运行时保持 6.144 MHz，
++ * 两个方向都关闭后归零。采集流可能比播放流活得久，不能只在扬声器端口
++ * 关闭时归零。
++ */
++static int sm8250_tdm_clk_update(struct snd_soc_dai *cpu_dai,
++				 struct sm8250_snd_data *data, int stream)
++{
++	bool wanted = data->tdm_playback_on || data->tdm_capture_on;
++	int ret;
++
++	if (wanted == data->tdm_ibit_on)
++		return 0;
++
++	ret = snd_soc_dai_set_sysclk(cpu_dai, Q6AFE_LPASS_CLK_ID_PRI_TDM_IBIT,
++				     wanted ? TDM_IBIT_RATE : 0, stream);
++	if (ret) {
++		dev_err(cpu_dai->dev, "TDM clock %s failed %d\n",
++			wanted ? "on" : "off", ret);
++		return ret;
++	}
++
++	data->tdm_ibit_on = wanted;
  	return 0;
  }
-@@ -78,6 +123,7 @@
+ 
+@@ -76,8 +160,10 @@
+ 	unsigned int fmt = SND_SOC_DAIFMT_BP_FP;
+ 	unsigned int codec_dai_fmt = SND_SOC_DAIFMT_BC_FC;
  	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
++	struct sm8250_snd_data *data = snd_soc_card_get_drvdata(rtd->card);
  	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
  	struct snd_soc_dai *codec_dai = snd_soc_rtd_to_codec(rtd, 0);
 +	int ret;
  
  	switch (cpu_dai->id) {
  	case PRIMARY_MI2S_RX:
-@@ -128,6 +174,29 @@
+@@ -128,11 +214,56 @@
  		snd_soc_dai_set_fmt(cpu_dai, fmt);
  		snd_soc_dai_set_fmt(codec_dai, codec_dai_fmt);
  		break;
@@ -212,10 +1434,9 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +		 * 扬声器 TDM 通路。LPASS 作为主端输出 48 kHz 帧，每帧 4 个
 +		 * 32 bit slot，位时钟 6.144 MHz。
 +		 */
-+		ret = snd_soc_dai_set_sysclk(cpu_dai,
-+					     Q6AFE_LPASS_CLK_ID_PRI_TDM_IBIT,
-+					     TDM_IBIT_RATE,
-+					     SNDRV_PCM_STREAM_PLAYBACK);
++		data->tdm_playback_on = true;
++		ret = sm8250_tdm_clk_update(cpu_dai, data,
++					    SNDRV_PCM_STREAM_PLAYBACK);
 +		if (ret)
 +			return ret;
 +
@@ -226,31 +1447,73 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +
 +		ret = snd_soc_dai_set_channel_map(cpu_dai, 0, NULL,
 +						  TDM_SLOTS,
-+						  sm8250_tdm_rx_slots);
++						  sm8250_tdm_slots);
++		if (ret)
++			return ret;
++		break;
++	case PRIMARY_TDM_TX_0:
++		/*
++		 * VI 反馈采集。帧格式与扬声器端口相同，位时钟也共用；
++		 * 采集可能早于播放打开，也可能晚于播放关闭。数据方向与
++		 * 扬声器相反，全部槽位取输入。
++		 */
++		data->tdm_capture_on = true;
++		ret = sm8250_tdm_clk_update(cpu_dai, data,
++					    SNDRV_PCM_STREAM_CAPTURE);
++		if (ret)
++			return ret;
++
++		ret = snd_soc_dai_set_tdm_slot(cpu_dai, TDM_SLOT_MASK, 0,
++					       TDM_SLOTS, TDM_SLOT_WIDTH);
++		if (ret)
++			return ret;
++
++		ret = snd_soc_dai_set_channel_map(cpu_dai, TDM_SLOTS,
++						  sm8250_tdm_slots, 0, NULL);
 +		if (ret)
 +			return ret;
 +		break;
  	default:
  		break;
  	}
-@@ -153,9 +222,27 @@
+ 
+-	return qcom_snd_sdw_startup(substream);
++	ret = qcom_snd_sdw_startup(substream);
++	return ret;
+ }
+ 
+ static int sm8250_snd_prepare(struct snd_pcm_substream *substream)
+@@ -140,8 +271,10 @@
+ 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+ 	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
+ 	struct sm8250_snd_data *data = snd_soc_card_get_drvdata(rtd->card);
++	int ret;
+ 
+-	return qcom_snd_sdw_prepare(substream, &data->stream_prepared[cpu_dai->id]);
++	ret = qcom_snd_sdw_prepare(substream, &data->stream_prepared[cpu_dai->id]);
++	return ret;
+ }
+ 
+ static int sm8250_snd_hw_free(struct snd_pcm_substream *substream)
+@@ -153,9 +286,28 @@
  	return qcom_snd_sdw_hw_free(substream, &data->stream_prepared[cpu_dai->id]);
  }
  
 +static void sm8250_snd_shutdown(struct snd_pcm_substream *substream)
 +{
 +	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
++	struct sm8250_snd_data *data = snd_soc_card_get_drvdata(rtd->card);
 +	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
-+	int ret;
 +
-+	/* 关闭时把 TDM 位时钟归零，AFE 随后停止端口 */
-+	if (cpu_dai->id == PRIMARY_TDM_RX_0) {
-+		ret = snd_soc_dai_set_sysclk(cpu_dai,
-+					     Q6AFE_LPASS_CLK_ID_PRI_TDM_IBIT, 0,
-+					     SNDRV_PCM_STREAM_PLAYBACK);
-+		if (ret)
-+			dev_err(rtd->dev, "failed to stop TDM clock: %d\n", ret);
-+	}
++	/* 扬声器与采集共用位时钟，最后一个关闭的方向负责归零 */
++	if (cpu_dai->id == PRIMARY_TDM_RX_0)
++		data->tdm_playback_on = false;
++	else if (cpu_dai->id == PRIMARY_TDM_TX_0)
++		data->tdm_capture_on = false;
++
++	if (cpu_dai->id == PRIMARY_TDM_RX_0 ||
++	    cpu_dai->id == PRIMARY_TDM_TX_0)
++		sm8250_tdm_clk_update(cpu_dai, data, substream->stream);
 +
 +	qcom_snd_sdw_shutdown(substream);
 +}
