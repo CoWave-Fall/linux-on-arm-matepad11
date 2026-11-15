@@ -1,0 +1,247 @@
+From 47153f9008f6f436e0e319c50e2309b61f084b57 Mon Sep 17 00:00:00 2001
+From: LCX555666 <472294259@qq.com>
+Date: Sun, 15 Nov 2026 02:40:21 +0000
+Subject: [PATCH 2/2] arm64: dts: qcom: dby-w09: add USB-C, PD and OTG support
+
+Wire up the PM8150B Type-C port and its connector, the VBUS regulator, the
+QMP combo PHY, DisplayPort alt mode and the FSA4480 SBU switch.
+
+The connector is dual-role with try-sink, so the PMIC DRP can rotate the
+CC phase and survive hot-plug; a fixed sink role deadlocks against
+dual-role partners.  The sink PDO list includes the 9 V/1.5 A entry used
+by the stock charger definition.
+
+dwc3 is switched to otg with usb-role-switch so TCPM can hand the
+negotiated data role to the controller.  The previous utmi-as-pipe-clk
+override is dropped, as combining it with the SS PHY hangs the boot.
+
+Tested on DBY-W09: PD negotiation to 9 V/1.5 A, battery charging, USB host
+mode through a dock, and DisplayPort output on an external monitor.
+
+Signed-off-by: LCX555666 <472294259@qq.com>
+---
+ .../boot/dts/qcom/sm8250-huawei-dby-w09.dts   | 180 +++++++++++++++++-
+ 1 file changed, 171 insertions(+), 9 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8250-huawei-dby-w09.dts b/arch/arm64/boot/dts/qcom/sm8250-huawei-dby-w09.dts
+index bd0026c..2c0682c 100644
+--- a/arch/arm64/boot/dts/qcom/sm8250-huawei-dby-w09.dts
++++ b/arch/arm64/boot/dts/qcom/sm8250-huawei-dby-w09.dts
+@@ -9,6 +9,7 @@
+ /dts-v1/;
+ 
+ #include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/usb/pd.h>
+ #include <dt-bindings/iio/qcom,spmi-vadc.h>
+ #include <dt-bindings/leds/common.h>
+ #include <dt-bindings/input/linux-event-codes.h>
+@@ -376,16 +377,18 @@ &ufs_mem_phy {
+  */
+ &usb_1 {
+ 	status = "okay";
+-
+-	/* 未启用 SS PHY，由 UTMI 时钟充当 PIPE 时钟 */
+-	qcom,select-utmi-as-pipe-clk;
+ };
+ 
+ &usb_1_dwc3 {
+-	dr_mode = "peripheral";
+-	maximum-speed = "high-speed";
+-	phys = <&usb_1_hsphy>;
+-	phy-names = "usb2-phy";
++	/*
++	 * v109: 恢复官方 sm8250.dtsi 默认（super-speed-plus + usb2/usb3 双 phy，
++	 * 直接继承不写覆盖）。v22 挂死根因是「utmi-as-pipe-clk + SS PHY」组合
++	 * （官方 dwc3-qcom.c:422-437/677-682 注释），不是 SS PHY 本身；
++	 * utmi 覆盖已删，QMP combo PHY 自 v103 起（DP 链路）工作正常。
++	 * OTG：角色由 pm8150b TCPM 协商后通过 usb-role-switch 下发。
++	 */
++	dr_mode = "otg";
++	usb-role-switch;
+ };
+ 
+ &usb_1_hsphy {
+@@ -1039,8 +1042,12 @@ pmic@2 {
+ 		battery@1000 {
+ 			compatible = "qcom,pm8150b-battery";
+ 			reg = <0x1000>;
+-			io-channels = <&pm8150b_adc ADC5_VBAT_SNS>;
+-			io-channel-names = "vbat";
++			/* v107: 充电驱动经此 psy 读 PD 合同（官方 smb5 同样经 psy 取 PD 信息；
++			 * 原厂 pd_dpm 也用 tcp_name 字符串配置） */
++			tcpm-psy-name = "tcpm-source-psy-c440000.spmi:pmic@2:typec@1500";
++			io-channels = <&pm8150b_adc ADC5_VBAT_SNS>,
++				      <&pm8150b_adc ADC5_CHG_TEMP>;
++			io-channel-names = "vbat", "chg_temp";
+ 		};
+ 	};
+ };
+@@ -1051,6 +1058,12 @@ channel@84 {
+ 		qcom,pre-scaling = <1 3>;
+ 		label = "vbat_sns";
+ 	};
++
++	/* 电池 NTC 直读通道：FG SRAM 的温度字在本机上不可信 */
++	channel@9 {
++		reg = <ADC5_CHG_TEMP>;
++		label = "chg_temp";
++	};
+ };
+ 
+ /*
+@@ -1120,3 +1133,152 @@ led-0 {
+ 		flash-max-timeout-us = <1280000>;
+ 	};
+ };
++
++/* v107: 对齐官方 sm8150-hdk.dts:557-561（无 always-on）。
++ * TCPM 按 source 角色按需开 VBUS；always-on 会让 sink 充电/
++ * 拔插时 VBUS 输出失控（dual 角色的前置条件）。 */
++&pm8150b_vbus {
++	regulator-min-microamp = <500000>;
++	regulator-max-microamp = <3000000>;
++	status = "okay";
++};
++
++/* v10: 打开 QMP combo PHY，复现黑屏 */
++&usb_1_qmpphy {
++	status = "okay";
++	vdda-phy-supply = <&vreg_l5a_0p88>;
++	vdda-pll-supply = <&vreg_l9a_1p2>;
++};
++
++&usb_1_dwc3_hs_out {
++	remote-endpoint = <&pm8150b_hs_in>;
++};
++
++/* ===== v13: 只加 Type-C 控制器（TCPM），不碰 DP / USB3 ===== */
++&usb_1_qmpphy_out {
++	/* port@0 的 data-lanes 描述 DP 通道映射，combo PHY 驱动据此判定方向 */
++	data-lanes = <0 1 2 3>;
++	remote-endpoint = <&pm8150b_typec_mux_in>;
++};
++
++&pm8150b_typec {
++	status = "okay";
++	vdd-pdphy-supply = <&vreg_l2a_3p1>;
++
++	connector {
++		compatible = "usb-c-connector";
++		/* v107: dual + try-sink 为官方做法（kaanapali-qrd.dts:94-95、
++		 * qrb2210-arduino-imola.dts:172-174；try-power-role 在 class.c:2621 解析）。
++		 * v61 的「CC 检测死」前提已被 v106 热插拔实测推翻（misc=0x39 真 attach）。
++		 * dual 让 PMIC DRP 轮换相位：热插拔不再卡 Rp-vs-Rp；无源坞插入时
++		 * 本机作 source 经 pm8150b_vbus 对外供电（TCPM 按 vbus-supply 控制）。 */
++		power-role = "dual";
++		try-power-role = "sink";
++		data-role = "dual";
++		self-powered;
++
++		/* TCPM 需要 connector 上的 vbus 供电才能驱动 VBUS */
++		vbus-supply = <&pm8150b_vbus>;
++
++		/*
++		 * 引用 dwc3 注册的 USB 角色切换：
++		 * TCPM 通过 fwnode_usb_role_switch_get() 找消费者侧的
++		 * "usb-role-switch" 引用，再匹配到 dwc3 节点（其上有同名标记），
++		 * 才能把协商出的 host/source 角色真正切给 USB 控制器。
++		 */
++		usb-role-switch = <&usb_1_dwc3>;
++
++		/*
++		 * PD 能力：tcpm_fw_get_caps() 强制要求这三个属性，缺一个就 -EINVAL。
++		 * PDO 编码：bit31..30=类型(01=固定)，bit29..10=电压(50mV)，
++		 * bit9..0=电流(10mA)，bit29..24=能力标志。
++		 * source: 固定 5V/3A + USB_COMM + DATA_SWAP + DUAL_ROLE
++		 * sink:   固定 5V/3A + USB_COMM + DATA_SWAP
++		 */
++		source-pdos = <PDO_FIXED(5000, 3000,
++					 PDO_FIXED_DUAL_ROLE |
++					 PDO_FIXED_USB_COMM |
++					 PDO_FIXED_DATA_SWAP)>;
++		/* v103: 追加华为官方 9V@1.5A 档（huawei_charger.dtsi default-sink-caps）。
++		 * 5V/3A 保留：实机已验证充电，不动。
++		 * cell list 元素用空格分隔，不能用逗号（照 qrb2210-arduino-imola.dts:177-178、
++		 * sm8250-xiaomi-elish-common.dtsi:867-871 的多 PDO 写法）。*/
++		sink-pdos = <PDO_FIXED(5000, 3000, PDO_FIXED_USB_COMM | PDO_FIXED_DATA_SWAP)
++			     PDO_FIXED(9000, 1500, PDO_FIXED_USB_COMM | PDO_FIXED_DATA_SWAP)>;
++		op-sink-microwatt = <15000000>;
++
++		/* v103: DP alt-mode 声明，照 sm8150-hdk.dts:582-587。
++		 * 没有它 TCPM 根本不会发起 DP SVID 发现/进入（比 AUX/SBU 更靠前一层）。*/
++		altmodes {
++			displayport {
++				svid = /bits/ 16 <0xff01>;
++				vdo = <0x00001c46>;
++			};
++		};
++
++		ports {
++			#address-cells = <1>;
++			#size-cells = <0>;
++
++			port@0 {
++				reg = <0>;
++				pm8150b_hs_in: endpoint {
++					remote-endpoint = <&usb_1_dwc3_hs_out>;
++				};
++			};
++
++			port@1 {
++				reg = <1>;
++				pm8150b_typec_mux_in: endpoint {
++					remote-endpoint = <&usb_1_qmpphy_out>;
++				};
++			};
++
++			/* v103: SBU 走 fsa4480，照 sm8150-hdk.dts:605-613 */
++			port@2 {
++				reg = <2>;
++				pm8150b_typec_sbu_out: endpoint {
++					remote-endpoint = <&fsa4480_sbu_mux>;
++				};
++			};
++		};
++	};
++};
++
++/*
++
++/* v59: DP 输出启用（参考 qrb5165-rb5）——DPU intf0 → mdss_dp → QMP DP PHY */
++&mdss_dp {
++	status = "okay";
++};
++
++&mdss_dp_out {
++	data-lanes = <0 1>;
++	remote-endpoint = <&usb_1_qmpphy_dp_in>;
++};
++
++&usb_1_qmpphy_dp_in {
++	remote-endpoint = <&mdss_dp_out>;
++};
++
++/* v103: DP/USB-C SBU 切换器。
++ * 原厂反编译 DTB:22184 = fsa4480@43 on i2c@884000（主线 sm8250.dtsi:1081 的 &i2c15）。
++ * 写法照主线 sm8150-hdk.dts:437-452；地址改成本机 0x43。
++ * vcc-supply / interrupts / clock-frequency 一律不写：本机原厂节点未给出这些值，
++ * 且主线 fsa4480.c 的 vcc 是 optional、无 irq 依赖，主线 i2c15 默认 100kHz。禁止猜测。*/
++&i2c15 {
++	status = "okay";
++
++	typec-mux@43 {
++		compatible = "fcs,fsa4480";
++		reg = <0x43>;
++		mode-switch;
++		orientation-switch;
++
++		port {
++			fsa4480_sbu_mux: endpoint {
++				remote-endpoint = <&pm8150b_typec_sbu_out>;
++			};
++		};
++	};
++};
+-- 
+2.34.1
+

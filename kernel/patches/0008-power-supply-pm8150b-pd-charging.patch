@@ -1,0 +1,363 @@
+From 9cab002b04793ada00fba9d04df6278ac3bfc9ab Mon Sep 17 00:00:00 2001
+From: LCX555666 <472294259@qq.com>
+Date: Sun, 15 Nov 2026 02:40:21 +0000
+Subject: [PATCH 1/2] power: supply: pm8150b: re-arm charging when the PD
+ allowance is stale
+
+The charger driver only programs USBIN_ADAPTER_ALLOW_OVERRIDE and enables
+charging while the state machine reports DISABLE_CHARGE.  The disconnect
+path writes FORCE_NULL to that register, so a missed window leaves the
+USBIN path closed forever: the PD contract may be negotiated and the input
+current limit non-zero while the battery keeps discharging.
+
+On DBY-W09 the hardware leaves DISABLE_CHARGE within milliseconds of VBUS
+attach and parks in PAUSE_CHARGE, so a two-second poll almost never
+observes the expected state.  Re-arm the sequence whenever the programmed
+allowance no longer matches the voltage implied by the active contract.
+The test is idempotent and stops firing once the register is correct.
+
+While here, fix three related issues:
+
+  - negate IBAT, as the fuel gauge reports negative while charging while
+    the power_supply ABI expects positive;
+  - read the battery NTC through ADC5 CHG_TEMP, since the FG SRAM word
+    reads a constant ~55 C on this board;
+  - expose the TCPM contract through the tcpm-psy-name property instead of
+    guessing the power supply name.
+
+Tested on DBY-W09 with a 9 V/1.5 A PD charger: the input path moves from
+FORCE_NULL to FORCE_9V, the current limit from 500 mA to 1.5 A, and the
+battery from "Not charging" to "Charging".
+
+Signed-off-by: LCX555666 <472294259@qq.com>
+---
+ drivers/power/supply/pm8150b_battery.c | 260 ++++++++++++++++++++++++-
+ 1 file changed, 254 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/power/supply/pm8150b_battery.c b/drivers/power/supply/pm8150b_battery.c
+index 5562d55..b42f22d 100644
+--- a/drivers/power/supply/pm8150b_battery.c
++++ b/drivers/power/supply/pm8150b_battery.c
+@@ -50,6 +50,46 @@
+ #define USE_DCIN_BIT		BIT(3)
+ #define CHG_ENABLE_BIT		BIT(0)
+ 
++/* ---- SMB5 充电控制寄存器（参考原厂 smb5-reg.h）---- */
++#define USBIN_CMD_IL_REG	(SMB5_USBIN_BASE + 0x40)
++#define CMD_APSD_REG		(SMB5_USBIN_BASE + 0x41)
++#define CMD_ICL_OVERRIDE_REG	(SMB5_USBIN_BASE + 0x42)
++#define USBIN_ADAPTER_ALLOW_OVERRIDE_REG (SMB5_USBIN_BASE + 0x44)
++#define USBIN_PLUGIN_RT_STS_BIT	BIT(4)
++#define USBIN_SUSPEND_BIT	BIT(0)
++#define APSD_RERUN_BIT		BIT(0)
++#define ICL_OVERRIDE_BIT	BIT(0)
++#define FORCE_5V		BIT(0)
++#define CONTINUOUS		BIT(3)
++/* ---- v107: 官方 smb5-reg.h 枚举 ---- */
++#define FORCE_NULL		0
++#define FORCE_9V		BIT(1)
++#define FORCE_12V		BIT(2)
++/* 官方 smb5-reg.h:285-306 / qpnp-smb5.c usb_icl 参数表 */
++#define USBIN_OPTIONS_1_CFG_REG	(SMB5_USBIN_BASE + 0x62)
++#define BC1P2_SRC_DETECT_BIT	BIT(3)
++#define USBIN_ICL_OPTIONS_REG	(SMB5_USBIN_BASE + 0x66)
++#define USBIN_MODE_CHG_BIT	BIT(0)
++#define USBIN_CURRENT_LIMIT_CFG_REG	(SMB5_USBIN_BASE + 0x70)
++#define USBIN_ICL_STEP_UA	50000
++/* ---- v107b: 官方 smb5-reg.h 诊断寄存器 ---- */
++#define CHGR_FLOAT_VOLTAGE_CFG_REG	(SMB5_CHGR_BASE + 0x70)
++#define ICL_MAX_STATUS_REG		(SMB5_DCDC_BASE + 0x06)
++#define AICL_STATUS_REG			(SMB5_DCDC_BASE + 0x0a)
++#define USBIN_SUSPEND_STS_BIT		BIT(6)
++#define CHGR_CHARGING_PAUSE_CMD_REG	(SMB5_CHGR_BASE + 0x43)
++#define BATIF_INT_RT_STS_REG		0x1210
++#define BAT_THERM_OR_ID_MISSING_BIT	BIT(4)
++#define BAT_TERMINAL_MISSING_BIT	BIT(5)
++#define MISC_THERMREG_SRC_CFG_REG	0x1570
++#define MISC_THERMREG_STATUS_REG	0x1571
++#define USBIN_ICL_MAX_UA	5000000
++#define CHGR_STATUS_2_REG	(SMB5_CHGR_BASE + 0x07)
++#define TYPEC_MISC_REG		0x150b
++#define BARK_BITE_WDOG_PET_REG	0x1643
++#define BARK_BITE_WDOG_PET_BIT	BIT(0)
++#define TYPEC_VBUS_OK		(BIT(5) | BIT(4))
++
+ #define BAT_TEMP_TOO_HOT_BIT	BIT(3)
+ #define BAT_TEMP_TOO_COLD_BIT	BIT(2)
+ 
+@@ -111,9 +151,14 @@ struct pm8150b_battery {
+ 	struct device *dev;
+ 	struct regmap *regmap;
+ 	struct iio_channel *vbat_chan;
++	struct iio_channel *chg_temp_chan;
+ 	struct power_supply *battery_psy;
+ 	struct power_supply *usb_psy;
+ 	struct mutex ima_lock;
++	struct delayed_work chg_work;
++	bool chg_forced;
++	/* v107: TCPM 的 PD 合同 psy 名（DT: tcpm-psy-name） */
++	const char *pd_psy_name;
+ };
+ 
+ /*
+@@ -146,6 +191,174 @@ static int pm8150b_read(struct pm8150b_battery *batt, u32 reg, unsigned int *val
+ 	return regmap_read(batt->regmap, reg, val);
+ }
+ 
++static int pm8150b_write(struct pm8150b_battery *batt, u32 reg, unsigned int val)
++{
++	return regmap_write(batt->regmap, reg, val);
++}
++
++/*
++ * 充电状态监控 + 强制配置。
++ * 原厂在 USB 输入挂载时会写：适配器允许 FORCE_5V、ICL 强制覆盖、
++ * 重跑 APSD、使能充电。本驱动周期检查状态机，若处于 DISABLE_CHARGE
++ * 且有输入迹象就补上这套序列，让状态机放行。
++ */
++static void pm8150b_chg_work(struct work_struct *work)
++{
++	struct pm8150b_battery *batt = container_of(to_delayed_work(work),
++						   struct pm8150b_battery,
++						   chg_work);
++	unsigned int st1 = 0, st2 = 0, path = 0, uin = 0, misc = 0;
++	unsigned int state;
++	bool input;
++	/* v107: PD 合同状态（官方 smb5-lib.c pd_active 等价信号源） */
++	union power_supply_propval pval = { 0 };
++	int uv = 0, iua = 0;
++	bool pd_active = false;
++	u8 allowance;
++	/* v107b 诊断 */
++	unsigned int st7 = 0, fv = 0, icl_max = 0, aicl = 0, cmdil = 0;
++	unsigned int allow = 0, opt1 = 0, iclopt = 0, iclcfg = 0;
++	unsigned int pause_cmd = 0, batif = 0, trm_cfg = 0, trm_st = 0;
++
++	pm8150b_read(batt, CHGR_STATUS_1, &st1);
++	pm8150b_read(batt, CHGR_STATUS_2_REG, &st2);
++	pm8150b_read(batt, DCDC_POWER_PATH, &path);
++	pm8150b_read(batt, USBIN_INT_RT_STS, &uin);
++	pm8150b_read(batt, TYPEC_MISC_REG, &misc);
++	state = st1 & CHGR_STATUS_MASK;
++
++	input = (uin & USBIN_PLUGIN_RT_STS_BIT) ||
++		(path & (USE_USBIN_BIT | USE_DCIN_BIT)) ||
++		(misc & TYPEC_VBUS_OK);
++
++	/* TCPM 的 tcpm-source-psy 携带 PD 合同电压/电流/类型 */
++	if (batt->pd_psy_name) {
++		struct power_supply *psy = power_supply_get_by_name(batt->pd_psy_name);
++		int ret;
++
++		if (psy) {
++			ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_ONLINE,
++							&pval);
++			if (!ret && pval.intval > 0) {
++				if (!power_supply_get_property(psy,
++							       POWER_SUPPLY_PROP_USB_TYPE,
++							       &pval))
++					pd_active = pval.intval >=
++						    POWER_SUPPLY_USB_TYPE_PD;
++				if (!power_supply_get_property(psy,
++							       POWER_SUPPLY_PROP_VOLTAGE_NOW,
++							       &pval))
++					uv = pval.intval;
++				if (!power_supply_get_property(psy,
++							       POWER_SUPPLY_PROP_CURRENT_NOW,
++							       &pval))
++					iua = pval.intval;
++			}
++			power_supply_put(psy);
++		}
++	}
++
++	/*
++	 * 输入电压 allowance：官方 smb5-lib.c
++	 * smblib_set_usb_pd_allowed_voltage()/smblib_set_prop_pd_active()
++	 * 按合同电压映射；未在线复位 FORCE_NULL（官方 smb5-lib.c:8600 拔线处理）。
++	 * 旧实现无条件写 FORCE_5V，9V PD 合同下输入路径放不开（path=0x02）。
++	 */
++	if (!input)
++		allowance = FORCE_NULL;
++	else if (!pd_active)
++		allowance = FORCE_5V;
++	else if (uv >= 11500000)
++		allowance = FORCE_12V;
++	else if (uv >= 8500000)
++		allowance = FORCE_9V;
++	else if (uv > 5500000)
++		allowance = CONTINUOUS;
++	else
++		allowance = FORCE_5V;
++
++	pm8150b_read(batt, CHGR_STATUS_7, &st7);
++	pm8150b_read(batt, CHGR_FLOAT_VOLTAGE_CFG_REG, &fv);
++	pm8150b_read(batt, ICL_MAX_STATUS_REG, &icl_max);
++	pm8150b_read(batt, AICL_STATUS_REG, &aicl);
++	pm8150b_read(batt, USBIN_CMD_IL_REG, &cmdil);
++	pm8150b_read(batt, USBIN_ADAPTER_ALLOW_OVERRIDE_REG, &allow);
++	pm8150b_read(batt, USBIN_OPTIONS_1_CFG_REG, &opt1);
++	pm8150b_read(batt, USBIN_ICL_OPTIONS_REG, &iclopt);
++	pm8150b_read(batt, USBIN_CURRENT_LIMIT_CFG_REG, &iclcfg);
++	pm8150b_read(batt, CHGR_CHARGING_PAUSE_CMD_REG, &pause_cmd);
++	pm8150b_read(batt, BATIF_INT_RT_STS_REG, &batif);
++	pm8150b_read(batt, MISC_THERMREG_SRC_CFG_REG, &trm_cfg);
++	pm8150b_read(batt, MISC_THERMREG_STATUS_REG, &trm_st);
++
++	pr_err("chgmon: st1=0x%02x st2=0x%02x path=0x%02x uin=0x%02x misc=0x%02x state=%u%s pd=%d uv=%d iua=%d\n",
++	       st1, st2, path, uin, misc, state,
++	       input ? " input-ok" : "", pd_active, uv, iua);
++	pr_err("chgmon2: st7=0x%02x fv=0x%02x(%dmV) iclmax=0x%02x aicl=0x%02x cmdil=0x%02x susp=%d allow=0x%02x opt1=0x%02x iclopt=0x%02x iclcfg=%d\n",
++	       st7, fv, 3600 + (fv & 0xff) * 10, icl_max, aicl, cmdil,
++	       !!(path & USBIN_SUSPEND_STS_BIT), allow, opt1, iclopt, iclcfg);
++	pr_err("chgmon3: pause_cmd=0x%02x batif=0x%02x(term_miss=%d therm_miss=%d) thermreg=0x%02x/0x%02x\n",
++	       pause_cmd, batif,
++	       !!(batif & BAT_TERMINAL_MISSING_BIT),
++	       !!(batif & BAT_THERM_OR_ID_MISSING_BIT),
++	       trm_cfg, trm_st);
++
++	/*
++	 * 插入时硬件往往已从 DISABLE 走到 PAUSE，2 秒轮询很容易错过
++	 * DISABLE 这个窗口。而拔线时会写入 FORCE_NULL，一旦错过插入窗口，
++	 * allowance 就一直停在 0，USBIN 通路全程关闭：PD 合同谈成、ICL
++	 * 也非零，但电池始终放电。因此只要输入有效且 allowance 与当前
++	 * 合同不符，就重跑一次配置序列（幂等，写入正确后不再触发）。
++	 */
++	if (input && (state == CHGR_DISABLE_CHARGE || allow != allowance)) {
++		/* 官方 smblib_usb_pd_adapter_allowance_override() */
++		pm8150b_write(batt, USBIN_ADAPTER_ALLOW_OVERRIDE_REG, allowance);
++
++		if (pd_active) {
++			/* 官方 smblib_set_prop_pd_active(): PD 激活后关 APSD */
++			regmap_update_bits(batt->regmap, USBIN_OPTIONS_1_CFG_REG,
++					   BC1P2_SRC_DETECT_BIT, 0);
++			/* 官方 smblib_icl_override(): 高电流模式 */
++			regmap_update_bits(batt->regmap, USBIN_ICL_OPTIONS_REG,
++					   USBIN_MODE_CHG_BIT, USBIN_MODE_CHG_BIT);
++			regmap_update_bits(batt->regmap, CMD_ICL_OVERRIDE_REG,
++					   ICL_OVERRIDE_BIT, 0);
++			/* 官方 qpnp-smb5.c usb_icl: 0x1370，步进 50mA，上限 5A */
++			pm8150b_write(batt, USBIN_CURRENT_LIMIT_CFG_REG,
++				      clamp(iua, 0, USBIN_ICL_MAX_UA) /
++					      USBIN_ICL_STEP_UA);
++			/* 官方 qpnp-smb5.c param.fv: 0x1070，步进 10mV。
++			 * 本机电池 4.4V 满压（OCV 表），官方范围 3.6~4.79V */
++			pm8150b_write(batt, CHGR_FLOAT_VOLTAGE_CFG_REG,
++				      (4400 - 3600) / 10);
++			pr_err("chgmon: PD 序列 allowance=0x%02x icl_cfg=%d\n",
++			       allowance,
++			       clamp(iua, 0, USBIN_ICL_MAX_UA) / USBIN_ICL_STEP_UA);
++		} else {
++			/* 非 PD 5V：维持原序列（实机已验证） */
++			pm8150b_write(batt, CMD_ICL_OVERRIDE_REG, ICL_OVERRIDE_BIT);
++			pm8150b_write(batt, USBIN_CMD_IL_REG, 0);
++			pm8150b_write(batt, CMD_APSD_REG, APSD_RERUN_BIT);
++		}
++		pm8150b_write(batt, CHGR_ENABLE_CMD, CHG_ENABLE_BIT);
++		if (!batt->chg_forced)
++			pr_err("chgmon: 充电序列已写入 (allowance=0x%02x)\n",
++			       allowance);
++		batt->chg_forced = true;
++	} else if (!input && batt->chg_forced) {
++		pm8150b_write(batt, USBIN_ADAPTER_ALLOW_OVERRIDE_REG, FORCE_NULL);
++		batt->chg_forced = false;
++	}
++
++	/* 喂充电看门狗：插件自启（1651 bit1），bite 超时会禁充（1653 bit7） */
++	pm8150b_write(batt, BARK_BITE_WDOG_PET_REG, BARK_BITE_WDOG_PET_BIT);
++
++	if (batt->battery_psy)
++		power_supply_changed(batt->battery_psy);
++
++	schedule_delayed_work(&batt->chg_work, msecs_to_jiffies(2000));
++}
++
+ static int pm8150b_ima_wait_ready(struct pm8150b_battery *batt)
+ {
+ 	unsigned int val;
+@@ -306,7 +519,11 @@ static int pm8150b_read_current_ua(struct pm8150b_battery *batt, int *current_ua
+ 	if (ret)
+ 		return ret;
+ 
+-	*current_ua = div_s64((s64)(s16)raw * FG_IBAT_NUMR, 1000);
++	/*
++	 * FG 硬件的 IBAT 原始符号是"负=充电"，而 power_supply ABI 约定
++	 * "正=充电、负=放电"（sysfs-class-power），这里取反对齐。
++	 */
++	*current_ua = -div_s64((s64)(s16)raw * FG_IBAT_NUMR, 1000);
+ 	return 0;
+ }
+ 
+@@ -386,14 +603,29 @@ static int pm8150b_read_capacity(struct pm8150b_battery *batt, int *capacity)
+  */
+ static int pm8150b_read_temperature(struct pm8150b_battery *batt, int *temp)
+ {
+-	u16 raw;
++	int millideg;
+ 	int ret;
+ 
+-	ret = pm8150b_ima_read_word(batt, FG_SRAM_BATT_TEMP, &raw);
+-	if (ret)
+-		return ret;
++	/*
++	 * 优先用 ADC5 的 CHG_TEMP 通道直读电池 NTC：本机 FG SRAM 的
++	 * BATT_TEMP 字读数偏高且不回落（实测恒 ~55°C），不可信。
++	 */
++	if (!IS_ERR_OR_NULL(batt->chg_temp_chan)) {
++		ret = iio_read_channel_processed(batt->chg_temp_chan, &millideg);
++		if (!ret) {
++			*temp = millideg / 100;	/* 毫度 -> 0.1 度 */
++			return 0;
++		}
++	}
+ 
+-	*temp = sign_extend32(raw, 9) * 100 / 40;
++	{
++		u16 raw;
++
++		ret = pm8150b_ima_read_word(batt, FG_SRAM_BATT_TEMP, &raw);
++		if (ret)
++			return ret;
++		*temp = sign_extend32(raw, 9) * 100 / 40;
++	}
+ 	return 0;
+ }
+ 
+@@ -683,11 +915,24 @@ static int pm8150b_battery_probe(struct platform_device *pdev)
+ 	if (!batt->regmap)
+ 		return dev_err_probe(dev, -ENODEV, "parent device has no regmap\n");
+ 
++	/* v107: 官方 smb5 经 usb psy 获取 PD 合同；这里显式指定 TCPM 的 psy 名 */
++	of_property_read_string(dev->of_node, "tcpm-psy-name", &batt->pd_psy_name);
++
+ 	batt->vbat_chan = devm_iio_channel_get(dev, "vbat");
+ 	if (IS_ERR(batt->vbat_chan))
+ 		return dev_err_probe(dev, PTR_ERR(batt->vbat_chan),
+ 				     "cannot get vbat channel\n");
+ 
++	/* 可选：ADC 直读电池 NTC（FG SRAM 温度字不可信时的替补） */
++	batt->chg_temp_chan = devm_iio_channel_get(dev, "chg_temp");
++	if (IS_ERR(batt->chg_temp_chan)) {
++		if (PTR_ERR(batt->chg_temp_chan) == -EPROBE_DEFER)
++			return dev_err_probe(dev, -EPROBE_DEFER,
++					     "chg_temp channel not ready\n");
++		dev_warn(dev, "no chg_temp channel, fallback to FG temp\n");
++		batt->chg_temp_chan = NULL;
++	}
++
+ 	psy_cfg.drv_data = batt;
+ 	psy_cfg.fwnode = dev_fwnode(dev);
+ 
+@@ -703,6 +948,9 @@ static int pm8150b_battery_probe(struct platform_device *pdev)
+ 		return dev_err_probe(dev, PTR_ERR(batt->usb_psy),
+ 				     "failed to register USB power_supply\n");
+ 
++	INIT_DELAYED_WORK(&batt->chg_work, pm8150b_chg_work);
++	schedule_delayed_work(&batt->chg_work, msecs_to_jiffies(3000));
++
+ 	platform_set_drvdata(pdev, batt);
+ 	dev_info(dev, "PM8150B battery and charger registered\n");
+ 	return 0;
+-- 
+2.34.1
+
