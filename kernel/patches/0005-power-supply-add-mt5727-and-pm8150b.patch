@@ -287,7 +287,7 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +...
 --- /dev/null
 +++ b/drivers/power/supply/mt5727.c
-@@ -0,0 +1,1360 @@
+@@ -0,0 +1,1421 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * MediaTek MT5727 wireless power transmitter.
@@ -312,6 +312,7 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +#include <linux/delay.h>
 +#include <linux/gpio/consumer.h>
 +#include <linux/i2c.h>
++#include <linux/input.h>
 +#include <linux/interrupt.h>
 +#include <linux/jiffies.h>
 +#include <linux/kobject.h>
@@ -454,6 +455,8 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +	struct gpio_desc *gpio_hall_kb;
 +	struct gpio_desc *gpio_hall_pen;
 +	struct gpio_desc *gpio_int;
++	struct input_dev *input;
++	bool tablet_mode;
 +	int irq;
 +	int hall_kb_irq;
 +	int hall_pen_irq;
@@ -1157,6 +1160,23 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +	kobject_uevent_env(&mt->client->dev.kobj, KOBJ_CHANGE, envp);
 +}
 +
++/*
++ * 键盘霍尔同时表示设备的形态：键盘吸附时按笔记本形态工作，取走后
++ * 切换为平板形态。KWin 与 libinput 通过 SW_TABLET_MODE 判断形态，
++ * 这里在同一个驱动内上报，避免用户态再请求一次 gpio121。
++ */
++static void mt5727_report_tablet_mode(struct mt5727 *mt, bool attached)
++{
++	bool tablet = !attached;
++
++	if (!mt->input || tablet == mt->tablet_mode)
++		return;
++
++	mt->tablet_mode = tablet;
++	input_report_switch(mt->input, SW_TABLET_MODE, tablet);
++	input_sync(mt->input);
++}
++
 +static void mt5727_hall_work(struct work_struct *work)
 +{
 +	struct mt5727 *mt = container_of(work, struct mt5727, hall_work.work);
@@ -1167,14 +1187,17 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +
 +	mutex_lock(&mt->lock);
 +
-+	if (!mt->auto_enabled)
-+		goto out;
-+
 +	/* GPIO 读取失败返回负值，不能按“在位”处理 */
 +	kb = mt->gpio_hall_kb &&
 +	     gpiod_get_value_cansleep(mt->gpio_hall_kb) > 0;
 +	pen = mt->gpio_hall_pen &&
 +	      gpiod_get_value_cansleep(mt->gpio_hall_pen) > 0;
++
++	/* 形态上报与发射自动控制无关，关闭 tx_auto 后仍然有效 */
++	mt5727_report_tablet_mode(mt, kb);
++
++	if (!mt->auto_enabled)
++		goto out;
 +
 +	if (!kb && !pen) {
 +		if (mt->tx_on)
@@ -1506,6 +1529,32 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +	return IRQ_HANDLED;
 +}
 +
++static int mt5727_register_input(struct mt5727 *mt)
++{
++	struct device *dev = &mt->client->dev;
++	int ret;
++
++	if (!mt->gpio_hall_kb)
++		return 0;
++
++	mt->input = devm_input_allocate_device(dev);
++	if (!mt->input)
++		return dev_err_probe(dev, -ENOMEM,
++				     "cannot allocate input device\n");
++
++	mt->input->name = "MT5727 Tablet Mode";
++	mt->input->phys = "mt5727/input0";
++	mt->input->id.bustype = BUS_I2C;
++
++	input_set_capability(mt->input, EV_SW, SW_TABLET_MODE);
++
++	ret = input_register_device(mt->input);
++	if (ret)
++		return dev_err_probe(dev, ret, "cannot register input device\n");
++
++	return 0;
++}
++
 +static int mt5727_probe(struct i2c_client *client)
 +{
 +	struct device *dev = &client->dev;
@@ -1573,6 +1622,18 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +				      &mt->hall_pen_irq);
 +	if (ret)
 +		return ret;
++
++	ret = mt5727_register_input(mt);
++	if (ret)
++		return ret;
++
++	/* 上报一次上电瞬间的形态，用户态打开设备即可取得初始状态 */
++	if (mt->input) {
++		int kb = gpiod_get_value_cansleep(mt->gpio_hall_kb);
++
++		if (kb >= 0)
++			mt5727_report_tablet_mode(mt, kb > 0);
++	}
 +
 +	mt->auto_enabled = mt->gpio_hall_kb || mt->gpio_hall_pen;
 +
