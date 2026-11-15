@@ -44,6 +44,25 @@ if [ ! -e /var/lib/loa/powerkey.conf ]; then
     chmod 644 /var/lib/loa/powerkey.conf
 fi
 
+# 合盖配置同样归当前用户所有，root 的 loa-lid 服务只读取。默认熄屏并
+# 在 5 分钟无操作后挂起。
+if [ ! -e /var/lib/loa/lid.conf ]; then
+    printf '%s\n' \
+        '# 保护盖合盖动作，由平板设置写入，loa-lid 服务读取。' \
+        'action=suspend' \
+        'delay_minutes=5' >/var/lib/loa/lid.conf
+    chown "$user:$group" /var/lib/loa/lid.conf
+    chmod 644 /var/lib/loa/lid.conf
+fi
+
+# 合盖由 loa-lid 处理，logind 只发布 LidClosed 状态，不执行动作。
+install -Dm644 "$script_dir/20-loa-lid-logind.conf" \
+    /etc/systemd/logind.conf.d/20-loa-lid.conf
+install -Dm755 "$script_dir/loa-lid" /usr/local/libexec/loa-lid
+install -Dm644 "$script_dir/loa-lid.service" /etc/systemd/system/loa-lid.service
+systemctl daemon-reload
+systemctl enable --now loa-lid.service
+
 install -Dm755 "$script_dir/loa-tabletd" /usr/local/libexec/loa-tabletd
 install -Dm755 "$script_dir/loa-tablet-notify" /usr/local/libexec/loa-tablet-notify
 install -Dm755 "$script_dir/loa-tablet-settings" /usr/local/bin/loa-tablet-settings

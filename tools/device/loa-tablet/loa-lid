@@ -1,0 +1,349 @@
+#!/usr/bin/python3
+"""保护盖合盖处理。
+
+服务独占保护盖的输入设备（EVIOCGRAB），因此合成器不会再收到合盖事件，
+熄屏与挂起完全由本服务按 /var/lib/loa/lid.conf 的配置执行。KWin 自带的
+合盖状态机在本机恢复时不会重新打开输出，独占输入可以避免两套逻辑竞争。
+
+合盖时立即关闭背光（bl_power 写入 4），并按配置决定是否在延迟后挂起。
+开盖时恢复背光；如果合盖期间发生了系统挂起，用 logind 的
+PrepareForSleep 通知在唤醒后重新确认屏幕状态。
+
+配置格式为 key=value：
+
+  action=suspend|screen_off|ignore
+  delay_minutes=0..60
+
+action 为 suspend 时熄屏并在 delay_minutes 分钟后挂起，0 表示立即挂起。
+screen_off 只熄屏。ignore 不做处理。
+"""
+
+import array
+import fcntl
+import logging
+import os
+import struct
+import subprocess
+
+from gi.repository import Gio, GLib
+
+logger = logging.getLogger("loa-lid")
+
+CONFIG_PATH = "/var/lib/loa/lid.conf"
+BL_POWER_PATH = "/sys/class/backlight/rt8555-backlight/bl_power"
+CONNECTOR_PATH = "/sys/class/drm/card0-DSI-1/enabled"
+
+MANAGER_INTERFACE = "org.freedesktop.login1.Manager"
+MANAGER_PATH = "/org/freedesktop/login1"
+
+ACTIONS = ("suspend", "screen_off", "ignore")
+DEFAULT_ACTION = "suspend"
+DEFAULT_DELAY_MINUTES = 5
+MAX_DELAY_MINUTES = 60
+
+EV_SW = 5
+SW_LID = 0
+
+# input_event 在 64 位平台上是两个 long、两个 u16 与一个 s32，共 24 字节。
+INPUT_EVENT = struct.Struct("llHHi")
+
+# 已经由本服务关闭屏幕。开盖时只有该值为真才恢复，避免把用户手动
+# 关闭的屏幕重新点亮。
+lid_handled = False
+suspend_source = 0
+lid_fd = -1
+
+
+def read_config():
+    """读取配置，缺失或无效的字段回落到默认值。"""
+    action = DEFAULT_ACTION
+    delay = DEFAULT_DELAY_MINUTES
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as file:
+            for line in file:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if key == "action" and value in ACTIONS:
+                    action = value
+                elif key == "delay_minutes":
+                    try:
+                        delay = int(value)
+                    except ValueError:
+                        continue
+    except FileNotFoundError:
+        pass
+    return action, max(0, min(delay, MAX_DELAY_MINUTES))
+
+
+def set_screen(state):
+    """切换内置屏幕的背光，state 为 on 或 off。"""
+    value = "0" if state == "on" else "4"
+    try:
+        with open(BL_POWER_PATH, "w", encoding="ascii") as file:
+            file.write(value)
+    except OSError:
+        logger.exception("写入 %s 失败", BL_POWER_PATH)
+
+
+def cancel_pending_suspend():
+    global suspend_source
+
+    if suspend_source:
+        GLib.source_remove(suspend_source)
+        suspend_source = 0
+
+
+def suspend_now():
+    global suspend_source
+
+    suspend_source = 0
+    logger.info("合盖延迟到期，进入挂起")
+    try:
+        subprocess.run(["systemctl", "suspend"], check=False, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        logger.exception("执行挂起失败")
+    return GLib.SOURCE_REMOVE
+
+
+def handle_lid_closed():
+    global lid_handled
+    global suspend_source
+
+    action, delay = read_config()
+    logger.info("合盖，动作 %s，延迟 %d 分钟", action, delay)
+    if action == "ignore":
+        return
+
+    lid_handled = True
+    set_screen("off")
+
+    if action != "suspend":
+        return
+
+    cancel_pending_suspend()
+    if delay == 0:
+        suspend_now()
+    else:
+        suspend_source = GLib.timeout_add_seconds(delay * 60, suspend_now)
+
+
+def handle_lid_opened():
+    global lid_handled
+
+    cancel_pending_suspend()
+    if not lid_handled:
+        return
+    lid_handled = False
+    logger.info("开盖，恢复显示")
+    set_screen("on")
+
+
+def eviocgbit(ev, size):
+    return (2 << 30) | (size << 16) | (0x45 << 8) | (0x20 + ev)
+
+
+def eviocgsw(size):
+    return (2 << 30) | (size << 16) | (0x45 << 8) | 0x1B
+
+
+EVIOCGRAB = (1 << 30) | (4 << 16) | (0x45 << 8) | 0x90
+
+
+def device_has_lid(fd):
+    """判断设备是否支持 EV_SW 与 SW_LID。"""
+    bits = array.array("B", [0] * 8)
+    try:
+        fcntl.ioctl(fd, eviocgbit(0, 8), bits)
+    except OSError:
+        return False
+    if not bits[0] & (1 << EV_SW):
+        return False
+    bits = array.array("B", [0] * 8)
+    try:
+        fcntl.ioctl(fd, eviocgbit(EV_SW, 8), bits)
+    except OSError:
+        return False
+    return bool(bits[0] & (1 << SW_LID))
+
+
+def open_lid_device():
+    """查找并独占合盖输入设备，返回文件描述符。"""
+    for index in range(64):
+        path = f"/dev/input/event{index}"
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        except OSError:
+            continue
+        if not device_has_lid(fd):
+            os.close(fd)
+            continue
+        try:
+            fcntl.ioctl(fd, EVIOCGRAB, 1)
+        except OSError:
+            logger.warning("%s 已被其它进程独占，稍后重试", path)
+            os.close(fd)
+            return -1
+        logger.info("已独占 %s", path)
+        return fd
+    return -1
+
+
+def read_lid_state(fd):
+    """读取当前开关位图，返回合盖状态。"""
+    bits = array.array("B", [0] * 8)
+    try:
+        fcntl.ioctl(fd, eviocgsw(8), bits)
+    except OSError:
+        return False
+    return bool(bits[0] & (1 << SW_LID))
+
+
+def on_lid_event(fd, _condition):
+    global lid_fd
+
+    while True:
+        try:
+            data = os.read(fd, INPUT_EVENT.size * 32)
+        except BlockingIOError:
+            return True
+        except OSError:
+            logger.warning("读取合盖设备失败，稍后重新打开")
+            os.close(fd)
+            lid_fd = -1
+            return False
+        for offset in range(0, len(data) - INPUT_EVENT.size + 1, INPUT_EVENT.size):
+            _sec, _usec, event_type, code, value = INPUT_EVENT.unpack_from(data, offset)
+            if event_type != EV_SW or code != SW_LID:
+                continue
+            if value:
+                handle_lid_closed()
+            else:
+                handle_lid_opened()
+    return True
+
+
+def ensure_lid_device():
+    """确保合盖设备已经打开并独占，随后由周期定时器检查。"""
+    global lid_fd
+
+    if lid_fd >= 0:
+        return True
+
+    fd = open_lid_device()
+    if fd < 0:
+        return True
+
+    lid_fd = fd
+    state = read_lid_state(fd)
+    logger.info("当前合盖状态 %d", state)
+    if state:
+        handle_lid_closed()
+
+    GLib.io_add_watch(fd, GLib.PRIORITY_DEFAULT, GLib.IO_IN, on_lid_event)
+    return True
+
+
+def internal_output_enabled():
+    try:
+        with open(CONNECTOR_PATH, encoding="ascii") as file:
+            return file.read().strip() == "enabled"
+    except OSError:
+        return True
+
+
+def session_classes():
+    """返回占用 seat 的会话类别集合。
+
+    root 的 SSH 会话同样属于 user 类，但没有 seat；只统计带 seat 的
+    会话，避免把远程调试会话当成已登录的桌面用户。
+    """
+    try:
+        result = subprocess.run(
+            ["loginctl", "list-sessions", "--no-legend"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    classes = set()
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        # SESSION UID USER SEAT LEADER CLASS ...
+        if len(fields) >= 6 and fields[3] != "-":
+            classes.add(fields[5])
+    return classes
+
+
+def restore_screen_after_resume():
+    """唤醒后修正屏幕状态。
+
+    合盖前写入的 off 可能在恢复时被复位，盖着盖子时就重新关闭。开盖
+    状态下如果登录界面的合成器没有恢复输出（greeter 会话没有
+    PowerDevil 或锁屏组件重新打开 DPMS），重启登录界面。
+    """
+    if lid_fd >= 0 and read_lid_state(lid_fd):
+        logger.info("唤醒后仍处于合盖状态，重新关闭屏幕")
+        set_screen("off")
+        return GLib.SOURCE_REMOVE
+
+    if internal_output_enabled():
+        return GLib.SOURCE_REMOVE
+
+    classes = session_classes()
+    if "user" in classes:
+        logger.warning("唤醒后内置输出未恢复，由用户会话处理")
+    elif "greeter" in classes:
+        logger.info("唤醒后登录界面未恢复输出，重启 plasmalogin")
+        try:
+            subprocess.run(
+                ["systemctl", "restart", "plasmalogin.service"],
+                check=False,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            logger.exception("重启 plasmalogin 失败")
+    return GLib.SOURCE_REMOVE
+
+
+def on_prepare_for_sleep(_connection, _sender, _path, _interface, _signal,
+                         params, _data):
+    (sleeping,) = params.unpack()
+    if not sleeping:
+        GLib.timeout_add_seconds(3, restore_screen_after_resume)
+
+
+def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="loa-lid: %(levelname)s %(message)s",
+    )
+
+    connection = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+    connection.signal_subscribe(
+        "org.freedesktop.login1",
+        MANAGER_INTERFACE,
+        "PrepareForSleep",
+        MANAGER_PATH,
+        None,
+        Gio.DBusSignalFlags.NONE,
+        on_prepare_for_sleep,
+        None,
+    )
+    logger.info("已订阅 logind 的唤醒通知")
+
+    ensure_lid_device()
+    # 设备尚未创建、暂时被占用或读取失败时周期性重新打开。
+    GLib.timeout_add_seconds(5, ensure_lid_device)
+
+    GLib.MainLoop().run()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -12,6 +12,8 @@ usage() {
   loa-tabletctl rotate normal|left|right|inverted
   loa-tabletctl key-bindings
   loa-tabletctl set-key-bindings <json>
+  loa-tabletctl lid-settings
+  loa-tabletctl set-lid-settings <json>
 EOF
 	exit 2
 }
@@ -62,6 +64,13 @@ key-bindings)
 set-key-bindings)
 	[ "$#" -ge 1 ] || usage
 	call SetKeyBindings "$1"
+	;;
+lid-settings)
+	call GetLidSettings
+	;;
+set-lid-settings)
+	[ "$#" -ge 1 ] || usage
+	call SetLidSettings "$1"
 	;;
 *)
 	usage

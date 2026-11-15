@@ -1,0 +1,14 @@
+[Unit]
+Description=LoA lid switch handler
+Documentation=file:///usr/local/libexec/loa-lid
+After=systemd-logind.service
+Wants=systemd-logind.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/libexec/loa-lid
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

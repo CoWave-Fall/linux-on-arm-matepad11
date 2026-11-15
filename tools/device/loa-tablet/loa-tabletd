@@ -66,9 +66,21 @@ INTROSPECTION_XML = """
     <method name="SetKeyBindings">
       <arg name="bindings" type="s" direction="in"/>
     </method>
+    <method name="GetLidSettings">
+      <arg name="settings" type="s" direction="out"/>
+    </method>
+    <method name="SetLidSettings">
+      <arg name="settings" type="s" direction="in"/>
+    </method>
   </interface>
 </node>
 """
+
+# 合盖处理由 root 的 loa-lid 服务读取该文件执行，本服务只负责读写。
+LID_SETTINGS_PATH = "/var/lib/loa/lid.conf"
+LID_ACTIONS = ("suspend", "screen_off", "ignore")
+DEFAULT_LID_SETTINGS = {"action": "suspend", "delayMinutes": 5}
+MAX_LID_DELAY_MINUTES = 60
 
 # KScreen 的 Rotation 枚举，见 kscreen/output.h。
 ROTATION_NAMES = {
@@ -319,6 +331,66 @@ def write_key_bindings(text):
         raise TabletError(f"写入 {KEYBINDINGS_PATH} 失败：{error}") from error
 
 
+def read_lid_settings():
+    """读取合盖配置，缺失或无效时返回默认值。"""
+    settings = dict(DEFAULT_LID_SETTINGS)
+    try:
+        with open(LID_SETTINGS_PATH, encoding="utf-8") as file:
+            for line in file:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if key == "action" and value in LID_ACTIONS:
+                    settings["action"] = value
+                elif key == "delay_minutes":
+                    try:
+                        delay = int(value)
+                    except ValueError:
+                        continue
+                    settings["delayMinutes"] = max(
+                        0, min(delay, MAX_LID_DELAY_MINUTES)
+                    )
+    except FileNotFoundError:
+        pass
+    return settings
+
+
+def write_lid_settings(text):
+    """校验并保存合盖配置。
+
+    文件由 root 的 loa-lid 服务在每次合盖时重新读取，写入后无需重启
+    服务。与组合键配置相同，先写临时文件再原子替换。
+    """
+    try:
+        settings = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise TabletError(f"合盖配置不是有效 JSON：{error}") from error
+    if not isinstance(settings, dict):
+        raise TabletError("合盖配置需要是 JSON 对象")
+
+    action = settings.get("action", DEFAULT_LID_SETTINGS["action"])
+    if action not in LID_ACTIONS:
+        raise TabletError(f"未知的合盖动作 {action}")
+    delay = settings.get("delayMinutes", DEFAULT_LID_SETTINGS["delayMinutes"])
+    if not isinstance(delay, int) or not 0 <= delay <= MAX_LID_DELAY_MINUTES:
+        raise TabletError(f"挂起延迟需要在 0 到 {MAX_LID_DELAY_MINUTES} 分钟之间")
+
+    content = "# 保护盖合盖动作，由平板设置写入，loa-lid 服务读取。\n"
+    content += f"action={action}\n"
+    content += f"delay_minutes={delay}\n"
+    temporary_path = f"{LID_SETTINGS_PATH}.tmp"
+    try:
+        with open(temporary_path, "w", encoding="utf-8") as file:
+            file.write(content)
+        os.chmod(temporary_path, 0o644)
+        os.replace(temporary_path, LID_SETTINGS_PATH)
+    except OSError as error:
+        raise TabletError(f"写入 {LID_SETTINGS_PATH} 失败：{error}") from error
+
+
 def handle_method(_connection, _sender, _path, _interface, method, parameters, invocation):
     """D-Bus 方法分发。异常转换为 D-Bus 错误回复。"""
     try:
@@ -343,6 +415,14 @@ def handle_method(_connection, _sender, _path, _interface, method, parameters, i
         elif method == "SetKeyBindings":
             (bindings,) = parameters.unpack()
             write_key_bindings(bindings)
+            invocation.return_value(None)
+        elif method == "GetLidSettings":
+            invocation.return_value(
+                GLib.Variant("(s)", (json.dumps(read_lid_settings()),))
+            )
+        elif method == "SetLidSettings":
+            (settings,) = parameters.unpack()
+            write_lid_settings(settings)
             invocation.return_value(None)
         else:
             invocation.return_dbus_error(

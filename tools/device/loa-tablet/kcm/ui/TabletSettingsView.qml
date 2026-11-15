@@ -27,6 +27,14 @@ ColumnLayout {
     property string screenshotCommand: "spectacle -b -f"
     property string powerMenuCommand: "qdbus6 org.kde.LogoutPrompt /LogoutPrompt org.kde.LogoutPrompt.promptAll"
     readonly property var keyActionLabels: ["无动作", "截屏", "电源菜单", "自定义命令"]
+    // 合盖配置，字段见 loa-tabletd 的 GetLidSettings。
+    property var lidSettings: ({ action: "suspend", delayMinutes: 5 })
+    // 程序化设置下拉框时抑制保存回环。
+    property bool lidSyncing: false
+    readonly property var lidActionValues: ["suspend", "screen_off", "ignore"]
+    readonly property var lidActionLabels: ["熄屏并挂起", "仅熄屏", "不处理"]
+    readonly property var lidDelayValues: [0, 1, 2, 5, 10, 15, 30, 60]
+    readonly property var lidDelayLabels: ["立即", "1 分钟", "2 分钟", "5 分钟", "10 分钟", "15 分钟", "30 分钟", "60 分钟"]
 
     // 两种宿主都把本组件放进 ColumnLayout，需要撑满可用宽度。
     Layout.fillWidth: true
@@ -171,6 +179,42 @@ ColumnLayout {
             (message) => { busy = false; reportError(message); });
     }
 
+    function indexOfValue(values, value) {
+        const index = values.indexOf(value);
+        return index >= 0 ? index : 0;
+    }
+
+    function applyLidSettings(settings) {
+        lidSyncing = true;
+        lidSettings = settings || ({ action: "suspend", delayMinutes: 5 });
+        lidActionCombo.currentIndex = indexOfValue(lidActionValues, lidSettings.action);
+        lidDelayCombo.currentIndex = indexOfValue(lidDelayValues, lidSettings.delayMinutes);
+        lidSyncing = false;
+    }
+
+    function refreshLidSettings() {
+        call("GetLidSettings", [], (value) => {
+            try {
+                view.applyLidSettings(JSON.parse(value));
+            } catch (error) {
+                view.reportError("合盖配置解析失败：" + error);
+            }
+        });
+    }
+
+    function saveLidSettings() {
+        if (busy || lidSyncing) {
+            return;
+        }
+        busy = true;
+        call("SetLidSettings", [new DBus.string(JSON.stringify({
+            action: view.lidActionValues[lidActionCombo.currentIndex],
+            delayMinutes: view.lidDelayValues[lidDelayCombo.currentIndex]
+        }))],
+            () => { busy = false; refreshLidSettings(); },
+            (message) => { busy = false; reportError(message); });
+    }
+
     function setAutoRotate(enabled) {
         busy = true;
         call("SetAutoRotate", [new DBus.bool(enabled)],
@@ -221,6 +265,7 @@ ColumnLayout {
     Component.onCompleted: {
         refresh();
         refreshKeyBindings();
+        refreshLidSettings();
     }
 
     Timer {
@@ -283,6 +328,35 @@ ColumnLayout {
             description: "使用环境光传感器调整背光，手动调整会记录为偏移"
             enabled: !view.busy && view.state.autoBrightness !== null
             onToggled: if (!view.syncing) view.setAutoBrightness(checked)
+        }
+    }
+
+    FormCard.FormHeader {
+        Layout.fillWidth: true
+        title: "保护盖"
+    }
+
+    FormCard.FormCard {
+        Layout.fillWidth: true
+        FormCard.FormComboBoxDelegate {
+            id: lidActionCombo
+            text: "合盖动作"
+            description: "合盖时立即关闭显示，可再按延迟挂起"
+            model: view.lidActionLabels
+            enabled: !view.busy
+            onActivated: view.saveLidSettings()
+        }
+        FormCard.FormDelegateSeparator {
+            visible: lidActionCombo.currentIndex === 0
+        }
+        FormCard.FormComboBoxDelegate {
+            id: lidDelayCombo
+            text: "挂起延迟"
+            description: "合盖后等待该时间再进入休眠"
+            model: view.lidDelayLabels
+            visible: lidActionCombo.currentIndex === 0
+            enabled: !view.busy
+            onActivated: view.saveLidSettings()
         }
     }
 
