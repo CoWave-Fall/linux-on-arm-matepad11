@@ -1,0 +1,15 @@
+[Unit]
+Description=Attach pstore_blk to the SD pstore partition
+# pstore_blk 编入内核时在 late_initcall 阶段解析块设备，此时 SD 卡尚未
+# 枚举完成。改以模块方式加载，等本地文件系统就绪后再绑定 loa-pstore 分区。
+# best_effort 必须开启：块设备的 pstore 写接口只提供该实现。
+After=local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/modprobe pstore_blk blkdev=/dev/disk/by-partlabel/loa-pstore best_effort=y
+
+[Install]
+WantedBy=multi-user.target
