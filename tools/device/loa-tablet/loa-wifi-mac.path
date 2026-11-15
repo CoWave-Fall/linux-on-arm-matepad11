@@ -1,0 +1,11 @@
+[Unit]
+Description=Watch DBY-W09 Wi-Fi MAC address policy changes
+# 设置界面连续保存时触发次数不受限；被触发的服务本身幂等。
+StartLimitIntervalSec=0
+
+[Path]
+PathChanged=/var/lib/loa/wifi-mac.conf
+Unit=loa-wifi-mac.service
+
+[Install]
+WantedBy=multi-user.target

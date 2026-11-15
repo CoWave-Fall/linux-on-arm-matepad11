@@ -1,0 +1,93 @@
+#!/bin/bash
+# 应用 Wi-Fi MAC 地址策略。
+#
+# 配置文件 /var/lib/loa/wifi-mac.conf 由平板设置（loa-tabletd）以当前
+# 桌面用户身份写入，本脚本以 root 运行。配置文件只需 mode 与 address
+# 两行，按行解析而不 source，避免执行配置文件中的任意命令。
+#
+# 地址通过 NetworkManager 的 wifi.cloned-mac-address 连接默认值应用。
+# 直接用 ip link set 改写的地址会在连接重新激活时被 mac80211 恢复成
+# 固件地址，实测在 NetworkManager 重新关联后失效。fixed 模式写入目标
+# 地址，dynamic 模式写入 permanent，让 NetworkManager 使用驱动地址。
+set -euo pipefail
+
+CONFIG_PATH=/var/lib/loa/wifi-mac.conf
+NM_CONF=/etc/NetworkManager/conf.d/50-loa-wifi-mac.conf
+INTERFACE=wlan0
+
+log() {
+	printf 'loa-wifi-mac: %s\n' "$*" >&2
+}
+
+read_value() {
+	sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$CONFIG_PATH" |
+		tail -n 1 | tr -d '[:space:]'
+}
+
+valid_mac() {
+	local address=$1 first
+	[[ $address =~ ^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$ ]] || return 1
+	# 首字节最低位为组播标志，接口地址不能使用组播或广播地址。
+	first=$((16#${address:0:2}))
+	(( (first & 1) == 0 )) || return 1
+	[[ $address != 00:00:00:00:00:00 ]] || return 1
+	return 0
+}
+
+[[ -e $CONFIG_PATH ]] || {
+	log "找不到 $CONFIG_PATH"
+	exit 1
+}
+
+mode=$(read_value mode)
+address=$(read_value address)
+
+case $mode in
+dynamic)
+	cloned_address=permanent
+	;;
+fixed)
+	[[ -n $address ]] || {
+		log "fixed 模式缺少 address"
+		exit 1
+	}
+	valid_mac "$address" || {
+		log "address 不是有效的单播 MAC：$address"
+		exit 1
+	}
+	cloned_address=$(printf '%s' "$address" | tr 'A-F' 'a-f')
+	;;
+*)
+	log "未知模式：${mode:-（空）}"
+	exit 1
+	;;
+esac
+
+content="# 由 loa-wifi-mac 根据 /var/lib/loa/wifi-mac.conf 生成。
+[connection]
+wifi.cloned-mac-address=$cloned_address"
+
+changed=0
+if [[ ! -e $NM_CONF ]] || [[ $(<"$NM_CONF") != "$content" ]]; then
+	install -d -m 755 "$(dirname "$NM_CONF")"
+	printf '%s\n' "$content" >"$NM_CONF.tmp"
+	chmod 644 "$NM_CONF.tmp"
+	mv "$NM_CONF.tmp" "$NM_CONF"
+	changed=1
+	log "写入 $NM_CONF：wifi.cloned-mac-address=$cloned_address"
+fi
+
+# 开机阶段服务先于 NetworkManager 运行，此时只写出默认配置，由
+# NetworkManager 启动时读取。运行中的实例需要重载配置，并重新激活当前
+# Wi-Fi 连接才能让新地址生效；重新激活会短暂断开 Wi-Fi。
+if systemctl is-active --quiet NetworkManager.service; then
+	nmcli general reload
+	if ((changed)); then
+		connection=$(nmcli -t -f NAME,TYPE,ACTIVE connection show |
+			awk -F: '$2 == "802-11-wireless" && $3 == "yes" { print $1; exit }')
+		if [[ -n $connection ]]; then
+			log "重新激活连接 $connection，$INTERFACE 新地址 $cloned_address"
+			nmcli connection up "$connection" >/dev/null
+		fi
+	fi
+fi

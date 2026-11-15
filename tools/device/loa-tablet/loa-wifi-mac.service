@@ -1,0 +1,15 @@
+[Unit]
+Description=Apply DBY-W09 Wi-Fi MAC address policy
+Documentation=file:///usr/local/libexec/loa-wifi-mac
+# 设置界面连续保存时 path 单元会多次触发，服务本身幂等，关闭启动限速。
+StartLimitIntervalSec=0
+Wants=sys-subsystem-net-devices-wlan0.device
+After=sys-subsystem-net-devices-wlan0.device
+Before=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/loa-wifi-mac
+
+[Install]
+WantedBy=multi-user.target

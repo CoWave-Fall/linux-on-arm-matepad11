@@ -72,6 +72,12 @@ INTROSPECTION_XML = """
     <method name="SetLidSettings">
       <arg name="settings" type="s" direction="in"/>
     </method>
+    <method name="GetWifiMac">
+      <arg name="settings" type="s" direction="out"/>
+    </method>
+    <method name="SetWifiMac">
+      <arg name="settings" type="s" direction="in"/>
+    </method>
   </interface>
 </node>
 """
@@ -81,6 +87,13 @@ LID_SETTINGS_PATH = "/var/lib/loa/lid.conf"
 LID_ACTIONS = ("suspend", "screen_off", "ignore")
 DEFAULT_LID_SETTINGS = {"action": "suspend", "delayMinutes": 5}
 MAX_LID_DELAY_MINUTES = 60
+
+# Wi-Fi 地址策略，由 root 的 loa-wifi-mac 服务在文件变化时应用。
+WIFI_MAC_PATH = "/var/lib/loa/wifi-mac.conf"
+WIFI_INTERFACE = "wlan0"
+WIFI_MAC_MODES = ("dynamic", "fixed")
+DEFAULT_WIFI_MAC = {"mode": "dynamic", "address": ""}
+MAC_ADDRESS_RE = re.compile(r"^[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}$")
 
 # KScreen 的 Rotation 枚举，见 kscreen/output.h。
 ROTATION_NAMES = {
@@ -391,6 +404,83 @@ def write_lid_settings(text):
         raise TabletError(f"写入 {LID_SETTINGS_PATH} 失败：{error}") from error
 
 
+def read_wifi_mac():
+    """读取 Wi-Fi 地址策略，并附带接口当前地址供前端显示。"""
+    settings = dict(DEFAULT_WIFI_MAC)
+    try:
+        with open(WIFI_MAC_PATH, encoding="utf-8") as file:
+            for line in file:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if key == "mode" and value in WIFI_MAC_MODES:
+                    settings["mode"] = value
+                elif key == "address":
+                    settings["address"] = value
+    except FileNotFoundError:
+        pass
+    try:
+        with open(f"/sys/class/net/{WIFI_INTERFACE}/address", encoding="utf-8") as file:
+            settings["currentAddress"] = file.read().strip()
+    except OSError:
+        settings["currentAddress"] = ""
+    return settings
+
+
+def validate_mac_address(value):
+    """校验单播 MAC 地址，返回小写形式。"""
+    if not MAC_ADDRESS_RE.match(value):
+        raise TabletError(f"MAC 地址格式无效：{value}")
+    first = int(value[:2], 16)
+    if first & 1:
+        raise TabletError(f"MAC 地址不能是组播地址：{value}")
+    if value == "00:00:00:00:00:00":
+        raise TabletError("MAC 地址不能全为零")
+    return value.lower()
+
+
+def write_wifi_mac(text):
+    """校验并保存 Wi-Fi 地址策略。
+
+    root 的 loa-wifi-mac 服务通过 path 单元监视该文件，写入后立即应用。
+    fixed 模式要求给出有效地址；dynamic 模式保留已填写的地址，方便再次
+    切换到 fixed 时复用。
+    """
+    try:
+        settings = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise TabletError(f"Wi-Fi 地址配置不是有效 JSON：{error}") from error
+    if not isinstance(settings, dict):
+        raise TabletError("Wi-Fi 地址配置需要是 JSON 对象")
+
+    mode = settings.get("mode", DEFAULT_WIFI_MAC["mode"])
+    if mode not in WIFI_MAC_MODES:
+        raise TabletError(f"未知的 Wi-Fi 地址模式 {mode}")
+    address = settings.get("address", "")
+    if not isinstance(address, str):
+        raise TabletError("address 需要是字符串")
+    address = address.strip()
+    if address:
+        address = validate_mac_address(address)
+    elif mode == "fixed":
+        raise TabletError("固定地址模式需要填写 MAC 地址")
+
+    content = "# Wi-Fi 地址策略，由平板设置写入，loa-wifi-mac 服务读取。\n"
+    content += f"mode={mode}\n"
+    content += f"address={address}\n"
+    temporary_path = f"{WIFI_MAC_PATH}.tmp"
+    try:
+        with open(temporary_path, "w", encoding="utf-8") as file:
+            file.write(content)
+        os.chmod(temporary_path, 0o644)
+        os.replace(temporary_path, WIFI_MAC_PATH)
+    except OSError as error:
+        raise TabletError(f"写入 {WIFI_MAC_PATH} 失败：{error}") from error
+
+
 def handle_method(_connection, _sender, _path, _interface, method, parameters, invocation):
     """D-Bus 方法分发。异常转换为 D-Bus 错误回复。"""
     try:
@@ -423,6 +513,14 @@ def handle_method(_connection, _sender, _path, _interface, method, parameters, i
         elif method == "SetLidSettings":
             (settings,) = parameters.unpack()
             write_lid_settings(settings)
+            invocation.return_value(None)
+        elif method == "GetWifiMac":
+            invocation.return_value(
+                GLib.Variant("(s)", (json.dumps(read_wifi_mac()),))
+            )
+        elif method == "SetWifiMac":
+            (settings,) = parameters.unpack()
+            write_wifi_mac(settings)
             invocation.return_value(None)
         else:
             invocation.return_dbus_error(

@@ -55,13 +55,33 @@ if [ ! -e /var/lib/loa/lid.conf ]; then
     chmod 644 /var/lib/loa/lid.conf
 fi
 
+# Wi-Fi 地址策略由 root 的 loa-wifi-mac 服务应用，配置文件归当前用户
+# 所有，默认使用驱动每次启动生成的地址。
+if [ ! -e /var/lib/loa/wifi-mac.conf ]; then
+    printf '%s\n' \
+        '# Wi-Fi 地址策略，由平板设置写入，loa-wifi-mac 服务读取。' \
+        'mode=dynamic' \
+        'address=' >/var/lib/loa/wifi-mac.conf
+    chown "$user:$group" /var/lib/loa/wifi-mac.conf
+    chmod 644 /var/lib/loa/wifi-mac.conf
+fi
+
 # 合盖由 loa-lid 处理，logind 只发布 LidClosed 状态，不执行动作。
 install -Dm644 "$script_dir/20-loa-lid-logind.conf" \
     /etc/systemd/logind.conf.d/20-loa-lid.conf
 install -Dm755 "$script_dir/loa-lid" /usr/local/libexec/loa-lid
 install -Dm644 "$script_dir/loa-lid.service" /etc/systemd/system/loa-lid.service
+install -Dm755 "$script_dir/loa-wifi-mac" /usr/local/libexec/loa-wifi-mac
+install -Dm644 "$script_dir/loa-wifi-mac.service" \
+    /etc/systemd/system/loa-wifi-mac.service
+install -Dm644 "$script_dir/loa-wifi-mac.path" \
+    /etc/systemd/system/loa-wifi-mac.path
 systemctl daemon-reload
 systemctl enable --now loa-lid.service
+systemctl enable loa-wifi-mac.service
+systemctl enable --now loa-wifi-mac.path
+# path 单元只负责后续变化，本次安装后立即应用一次当前配置。
+systemctl start loa-wifi-mac.service
 
 install -Dm755 "$script_dir/loa-tabletd" /usr/local/libexec/loa-tabletd
 install -Dm755 "$script_dir/loa-tablet-notify" /usr/local/libexec/loa-tablet-notify

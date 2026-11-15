@@ -35,6 +35,10 @@ ColumnLayout {
     readonly property var lidActionLabels: ["熄屏并挂起", "仅熄屏", "不处理"]
     readonly property var lidDelayValues: [0, 1, 2, 5, 10, 15, 30, 60]
     readonly property var lidDelayLabels: ["立即", "1 分钟", "2 分钟", "5 分钟", "10 分钟", "15 分钟", "30 分钟", "60 分钟"]
+    // Wi-Fi 地址策略，字段见 loa-tabletd 的 GetWifiMac。
+    property var wifiMac: ({ mode: "dynamic", address: "", currentAddress: "" })
+    // 程序化设置开关与地址时抑制保存回环。
+    property bool wifiSyncing: false
 
     // 两种宿主都把本组件放进 ColumnLayout，需要撑满可用宽度。
     Layout.fillWidth: true
@@ -215,6 +219,48 @@ ColumnLayout {
             (message) => { busy = false; reportError(message); });
     }
 
+    function applyWifiMac(settings) {
+        wifiSyncing = true;
+        wifiMac = settings || ({ mode: "dynamic", address: "", currentAddress: "" });
+        fixedMacSwitch.checked = wifiMac.mode === "fixed";
+        if (!fixedMacField.fieldActiveFocus) {
+            fixedMacField.text = wifiMac.address || "";
+        }
+        wifiSyncing = false;
+    }
+
+    function refreshWifiMac() {
+        call("GetWifiMac", [], (value) => {
+            try {
+                view.applyWifiMac(JSON.parse(value));
+            } catch (error) {
+                view.reportError("Wi-Fi 地址配置解析失败：" + error);
+            }
+        });
+    }
+
+    function saveWifiMac() {
+        if (busy || wifiSyncing) {
+            return;
+        }
+        const mode = fixedMacSwitch.checked ? "fixed" : "dynamic";
+        const address = mode === "fixed"
+            ? fixedMacField.text
+            : (wifiMac.address || "");
+        busy = true;
+        call("SetWifiMac", [new DBus.string(JSON.stringify({ mode: mode, address: address }))],
+            () => { busy = false; refreshWifiMac(); },
+            (message) => { busy = false; reportError(message); });
+    }
+
+    function toggleWifiMac(enabled) {
+        // 首次启用固定地址时用当前地址作为草稿，用户可直接修改。
+        if (enabled && !fixedMacField.text) {
+            fixedMacField.text = wifiMac.currentAddress || "";
+        }
+        saveWifiMac();
+    }
+
     function setAutoRotate(enabled) {
         busy = true;
         call("SetAutoRotate", [new DBus.bool(enabled)],
@@ -266,13 +312,17 @@ ColumnLayout {
         refresh();
         refreshKeyBindings();
         refreshLidSettings();
+        refreshWifiMac();
     }
 
     Timer {
         interval: 2000
         running: true
         repeat: true
-        onTriggered: if (!view.busy) view.refresh()
+        onTriggered: if (!view.busy) {
+            view.refresh();
+            view.refreshWifiMac();
+        }
     }
 
     FormCard.FormHeader {
@@ -357,6 +407,33 @@ ColumnLayout {
             visible: lidActionCombo.currentIndex === 0
             enabled: !view.busy
             onActivated: view.saveLidSettings()
+        }
+    }
+
+    FormCard.FormHeader {
+        Layout.fillWidth: true
+        title: "无线网络"
+    }
+
+    FormCard.FormCard {
+        Layout.fillWidth: true
+        FormCard.FormSwitchDelegate {
+            id: fixedMacSwitch
+            text: "固定 MAC 地址"
+            description: "关闭时使用驱动每次启动生成的地址"
+            enabled: !view.busy
+            onToggled: if (!view.wifiSyncing) view.toggleWifiMac(checked)
+        }
+        FormCard.FormDelegateSeparator {
+            visible: fixedMacSwitch.checked
+        }
+        FormCard.FormTextFieldDelegate {
+            id: fixedMacField
+            visible: fixedMacSwitch.checked
+            label: "MAC 地址"
+            placeholderText: "aa:bb:cc:dd:ee:ff"
+            enabled: !view.busy
+            onEditingFinished: if (!view.wifiSyncing) view.saveWifiMac()
         }
     }
 
@@ -452,6 +529,11 @@ ColumnLayout {
         FormCard.FormTextDelegate {
             text: "缩放"
             description: view.state.scale ? Math.round(view.state.scale * 100) + "%" : "未知"
+        }
+        FormCard.FormDelegateSeparator {}
+        FormCard.FormTextDelegate {
+            text: "Wi-Fi MAC"
+            description: view.wifiMac.currentAddress || "未知"
         }
     }
 
