@@ -14,8 +14,12 @@
 | `0005-power-supply-add-mt5727-and-pm8150b.patch` | MT5727 无线供电与 PM8150B 电池驱动、绑定与 Kconfig / Makefile |
 | `0006-drm-panel-nt36523-add-dby-w09.patch` | NT36523 面板的 DBY-W09 描述、初始化序列与供电 |
 | `0007-drm-msm-dsi-phy-7nm-add-own-pll.patch` | 从 PHY 使用本地 PLL 产生位时钟 |
+| `0008-sound-soc-qcom-add-speaker-tdm-and-mic.patch` | 扬声器 TDM 通路、麦克风采集与 32 bit 媒体格式 |
+| `0009-media-venus-extend-eos-quirk-to-firmware-1.0.96.patch` | Venus 解码结束地址的固件差异 |
+| `0010-sound-soc-qcom-add-afe-calibration-and-topology.patch` | AFE 校准块与自定义拓扑，`sm8250.dtsi` 增加 `q6core` 标签 |
 
-补丁顺序固定：`0001` 为 `0002` 提供 `&psci` 标签，其余补丁相互独立。
+补丁顺序固定：`0001` 为 `0002` 提供 `&psci` 标签，`0002` 为 `0010`
+提供 `&q6core` 标签，其余补丁相互独立。
 
 ## 配置
 
@@ -23,6 +27,8 @@
 
 - `CONFIG_LOCALVERSION="-loa"`，内核版本为 `7.3.1-loa`。
 - 触摸、显示、电源、无线与传感器驱动全部编入内核。
+- 音频服务（APR、QDSP6、WCD938x 与 SoundWire macro）与 Venus 解码
+  编入内核，固件由根文件系统提供。
 - `CONFIG_EXTRA_FIRMWARE` 包含触摸固件与 ath11k 校准数据。
 - `CONFIG_DEBUG_FS` 供 `bt-awake` 调整蓝牙空闲休眠延迟。
 

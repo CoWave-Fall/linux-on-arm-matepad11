@@ -24,6 +24,19 @@
 | `mt5727-bt-link.service` | 附件吸附后给蓝牙上电 |
 | `pen-link-keepalive.service` | 维持笔的厂商通知订阅 |
 | `qca-bt-rebind.service` | 根文件系统就绪后重新绑定蓝牙 UART |
+| `dby-adsp-firmware.service` | 根文件系统就绪后重新绑定 ADSP |
+| `dby-venus-firmware.service` | 根文件系统就绪后触发 Venus probe |
+| `loa-smartpa.service` | 初始化 TFA9874 并随播放上下电 |
+| `loa-charge-led.service` | 按供电与电池状态设置通知灯 |
+| `pstore-blk.service` | 把 `pstore_blk` 绑定到 `loa-pstore` 分区 |
+
+## 音频
+
+| 文件 | 作用 |
+|:--|:--|
+| `etc/asound.conf` | 扬声器 PCM 的 2 声道定义 |
+| `usr/local/sbin/loa-smartpa.py` | 功放初始化与槽位分配 |
+| `usr/share/alsa/ucm2/` | HiFi 场景的 Speaker 与 Mic 设备 |
 
 ## 蓝牙
 

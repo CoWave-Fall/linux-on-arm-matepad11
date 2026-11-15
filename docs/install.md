@@ -1,6 +1,6 @@
 # 操作全流程
 
-更新时间：2026-11-14 21:05 +08:00
+更新时间：2026-11-15 21:20 +08:00
 
 本文从已解锁并完成备份的设备开始，依次完成 U-Boot 构建、recovery 刷写、
 SD 卡根文件系统、内核启动、系统配置与桌面安装。全程保留 HarmonyOS 的
@@ -142,11 +142,16 @@ lsblk -o NAME,SIZE,TYPE,MODEL
 
 ```bash
 sudo sgdisk --clear --new=1:0:0 --typecode=1:8300 \
-  --change-name=1:archroot /dev/sdX
+  --change-name=1:archroot \
+  --new=2:0:+8M --typecode=2:8300 \
+  --change-name=2:loa-pstore /dev/sdX
 sudo mkfs.f2fs -l archroot /dev/sdX1
 ```
 
 分区标号 `archroot` 与内核启动参数 `root=PARTLABEL=archroot` 对应。
+
+第二个分区 `loa-pstore` 供 pstore 保存崩溃前的内核日志，长度取 4096 字节
+的整数倍。分区缺失时 `pstore-blk.service` 报错，其余功能照常运行。
 
 下载 Arch Linux ARM 根文件系统并解压：
 
@@ -356,7 +361,8 @@ Python 服务已由 `scripts/install-rootfs.sh` 安装到
 ```bash
 ssh root@10.0.0.2 'systemctl daemon-reload &&
   systemctl enable --now dby-powerkey loa-pen bt-awake \
-    mt5727-bt-link pen-link-keepalive'
+    mt5727-bt-link pen-link-keepalive dby-adsp-firmware dby-venus-firmware \
+    loa-smartpa loa-charge-led'
 ```
 
 ### 平板设置
@@ -368,6 +374,20 @@ ssh root@10.0.0.2 \
 
 安装脚本在设备上编译 KCM，需要 `cmake`、`ninja` 与
 `extra-cmake-modules`。
+
+### 音频
+
+音频需要 PipeWire 的 ALSA 兼容层与设备的功放配置：
+
+```bash
+pacman -S pipewire pipewire-pulse pipewire-alsa wireplumber
+systemctl enable --now loa-smartpa
+extract-odm-audio.sh
+```
+
+`extract-odm-audio.sh` 从 super 分区的 odm 逻辑分区提取四颗功放的
+初始化序列，需要 `lpunpack`（`android-tools`）与 `fsck.erofs`。
+使用方式见 [音频](audio.md)。
 
 ## 14. 部署上游组件
 
@@ -537,7 +557,8 @@ KWin 的自动亮度曲线只能在手动调亮度时按当前照度逐点学习
 ```bash
 systemctl enable --now systemd-networkd systemd-resolved sshd NetworkManager \
   bluetooth qca-bt-rebind dby-powerkey dby-slpi-firmware hexagonrpcd-sdsp \
-  loa-pen bt-awake mt5727-bt-link pen-link-keepalive power-profiles-daemon \
+  loa-pen bt-awake mt5727-bt-link pen-link-keepalive dby-adsp-firmware \
+  dby-venus-firmware loa-smartpa loa-charge-led power-profiles-daemon \
   plasmalogin
 ```
 

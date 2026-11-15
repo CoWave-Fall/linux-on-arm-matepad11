@@ -1,6 +1,6 @@
 # 固件清单
 
-更新时间：2026-11-10 22:41 +8
+更新时间：2026-11-15 21:20 +08:00
 
 本仓库省略厂商二进制文件，只记录文件位置、用途与校验值。构建前请从
 设备自身的 vendor 分区取得对应文件，放入下表的目标位置。设备原厂系统
@@ -60,6 +60,10 @@ python3 tools/host/ath11k-board-data.py container \
 | `/lib/firmware/qcom/sm8250/a650_zap.b02` | 同上 | 分片 |
 | `/lib/firmware/qcom/sm8250/dby-w09/slpi.mdt` | vendor 分区 | SLPI 主固件 |
 | `/lib/firmware/qcom/sm8250/dby-w09/slpi.b00..b21` | vendor 分区 | SLPI 分片 |
+| `/lib/firmware/qcom/sm8250/dby-w09/adsp.mdt` | modem 分区 `image/` | ADSP 主固件 |
+| `/lib/firmware/qcom/sm8250/dby-w09/adsp.b00..b18` | 同上 | ADSP 分片 |
+| `/lib/firmware/qcom/sm8250/dby-w09/venus.mdt` | 同上 | Venus 主固件 |
+| `/lib/firmware/qcom/sm8250/dby-w09/venus.b00..b10`、`b19` | 同上 | Venus 分片 |
 | `/usr/share/qcom/sm8250/HUAWEI/dby-w09/sensors/` | vendor 分区的 `/vendor/etc/sensors/` 与 `/mnt/vendor/persist/sensors/registry/` | 传感器配置与注册表 |
 | `/usr/share/qcom/sm8250/HUAWEI/dby-w09/socinfo` | 符号链接到 `/sys/devices/soc0` | 由服务创建 |
 
@@ -71,6 +75,12 @@ python3 tools/host/ath11k-board-data.py container \
 - `persist/file1`
 - `persist/file2`
 - `sns_reg.conf`
+
+## 设备自带音频配置
+
+四颗 TFA9874 的初始化序列随 ODM 分区提供，由
+`tools/device/extract-odm-audio.sh` 提取到 `/etc/loa-smartpa/`。
+提取方式与使用说明见 [音频](audio.md)。
 
 ## 发行版软件包
 
