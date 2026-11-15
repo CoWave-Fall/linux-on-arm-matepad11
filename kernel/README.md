@@ -14,8 +14,12 @@
 | `0005-power-supply-add-mt5727-and-pm8150b.patch` | MT5727 无线供电与 PM8150B 电池驱动、绑定与 Kconfig / Makefile |
 | `0006-drm-panel-nt36523-add-dby-w09.patch` | NT36523 面板的 DBY-W09 描述、初始化序列与供电 |
 | `0007-drm-msm-dsi-phy-7nm-add-own-pll.patch` | 从 PHY 使用本地 PLL 产生位时钟 |
+| `0008-power-supply-pm8150b-pd-charging.patch` | PM8150B 按 PD 合同重配输入通路并重新使能充电 |
+| `0009-arm64-dts-qcom-dby-w09-typec-otg-pd.patch` | Type-C 控制器、PDO、DP alt-mode、FSA4480 与 USB OTG |
 
 补丁顺序固定：`0001` 为 `0002` 提供 `&psci` 标签，其余补丁相互独立。
+`0008` 修改 `0005` 引入的充电驱动，`0009` 修改 `0002` 引入的板级 DTS，
+二者须排在其后。
 
 ## 配置
 
