@@ -122,6 +122,6 @@ KDE Plasma 与 freedreno（Mesa）。
 感谢 BlueZ、libssc 与 power-profiles-daemon 的维护者，仓库为它们附带
 补丁。
 
-版本：v0.0.1
+版本：v0.0.2-pre.1
 
-记录时间：2026-11-15 21:20 +08:00
+记录时间：2026-11-15 21:34 +08:00
