@@ -1,6 +1,6 @@
 # 支持情况与已知限制
 
-更新时间：2026-11-15 21:34 +08:00
+更新时间：2026-11-16 21:41 +08:00
 
 ## 验证环境
 
@@ -10,7 +10,7 @@
 | SoC | Qualcomm SM8250，Adreno 650 |
 | 原厂系统 | HarmonyOS 4.2（Android 12） |
 | 固件版本 | `DBY-W09 4.2.0.213(C00E100)` |
-| 内核 | Linux 7.3.1，`7.3.1-loa` |
+| 内核 | Linux 7.3.4，`7.3.4-loa` |
 | U-Boot | 2026.10 |
 | 根文件系统 | Arch Linux ARM aarch64，f2fs |
 | 桌面 | KDE Plasma 6.8.2，Wayland |

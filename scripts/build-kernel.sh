@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
-# 构建 Linux 7.3.1 的 DBY-W09 内核与设备树。
+# 构建 Linux 7.3.4 的 DBY-W09 内核与设备树。
 #
 # 用法：scripts/build-kernel.sh [--clean]
-#   --clean  删除 build/linux-7.3.1 后重新解压、打补丁并编译
+#   --clean  删除 build/linux-7.3.4 后重新解压、打补丁并编译
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
-version=7.3.1
+version=7.3.4
 src="$root/build/linux-$version"
 out="$root/out"
 cross=${CROSS_COMPILE:-aarch64-linux-gnu-}

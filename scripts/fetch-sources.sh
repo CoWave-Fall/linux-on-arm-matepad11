@@ -10,14 +10,14 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 build="$root/build"
 mkdir -p "$build"
 
-linux_version=7.3.1
+linux_version=7.3.4
 uboot_version=2026.10
 linux_tar="linux-$linux_version.tar.xz"
 uboot_tar="u-boot-$uboot_version.tar.gz"
 linux_url="https://cdn.kernel.org/pub/linux/kernel/v7.x/$linux_tar"
 uboot_url="https://github.com/u-boot/u-boot/archive/refs/tags/v$uboot_version.tar.gz"
 
-linux_sha256=fa595aad93734f829c963c2a90ef7c3673224fd7fdae7b49406e397cde2de231
+linux_sha256=b11b6df8295e8e991ff040b71aaa4994a8b55caa23b6b092907f195b5840fd1f
 uboot_sha256=f943a88389c8fd70a6b0d061a88267465e143c7ca6ea2b75837ab20f5b60c739
 
 force=0

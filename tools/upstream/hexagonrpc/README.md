@@ -26,7 +26,7 @@ DBY-W09 的传感器运行在 SDSP（主线中的 SLPI，`0x5c00000`）。固件
 源码取 `linux-msm/hexagonrpc` 的 `598b591`。先导出目标内核头：
 
 ```bash
-make -C build/linux-7.3.1 ARCH=arm64 headers_install \
+make -C build/linux-7.3.4 ARCH=arm64 headers_install \
   INSTALL_HDR_PATH=$PWD/build/kheaders
 ```
 

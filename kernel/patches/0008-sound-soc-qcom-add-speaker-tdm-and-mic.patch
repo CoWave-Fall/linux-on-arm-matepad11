@@ -1,7 +1,7 @@
 From: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 Subject: [PATCH] sound: soc: qcom: add speaker TDM path and WCD938x capture
 
-Applied to Linux 7.3.1.
+Applied to Linux 7.3.4.
 
 Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 
@@ -90,7 +90,7 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  struct q6afe {
  	struct apr_device *apr;
  	struct device *dev;
-@@ -396,6 +440,9 @@
+@@ -397,6 +441,9 @@
  	wait_queue_head_t wait;
  	struct list_head port_list;
  	spinlock_t port_list_lock;
@@ -100,7 +100,7 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  };
  
  struct afe_port_cmd_device_start {
-@@ -416,6 +463,19 @@
+@@ -417,6 +464,19 @@
  	u16 reserved;
  } __packed;
  
@@ -120,7 +120,7 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  struct afe_svc_cmd_set_param {
  	uint32_t payload_size;
  	uint32_t payload_address_lsw;
-@@ -431,6 +491,35 @@
+@@ -432,6 +492,35 @@
  	u32 mem_map_handle;
  } __packed;
  
@@ -156,7 +156,7 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  struct afe_param_id_hdmi_multi_chan_audio_cfg {
  	u32 hdmi_cfg_minor_version;
  	u16 datatype;
-@@ -646,10 +735,46 @@
+@@ -647,10 +736,46 @@
  	u16	ch_mapping[AFE_PORT_MAX_AUDIO_CHAN_CNT];
  } __packed;
  
@@ -204,7 +204,7 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  	struct aprv2_ibasic_rsp_result_t result;
  	int token;
  	int id;
-@@ -1004,6 +1129,8 @@
+@@ -1005,6 +1130,8 @@
  	return ret;
  }
  
@@ -213,7 +213,7 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  static int q6afe_callback(struct apr_device *adev, const struct apr_resp_pkt *data)
  {
  	struct q6afe *afe = dev_get_drvdata(&adev->dev);
-@@ -1023,9 +1150,11 @@
+@@ -1025,9 +1152,11 @@
  		}
  		switch (res->opcode) {
  		case AFE_PORT_CMD_SET_PARAM_V2:
@@ -225,7 +225,7 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  			port = q6afe_find_port(afe, hdr->token);
  			if (port) {
  				port->result = *res;
-@@ -1042,6 +1171,18 @@
+@@ -1044,6 +1173,18 @@
  		}
  	}
  		break;
@@ -242,9 +242,9 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +		wake_up(&afe->wait);
 +		break;
  	case AFE_CMD_RSP_REMOTE_LPASS_CORE_HW_VOTE_REQUEST:
+ 		vote_res = data->payload;
  		afe->result.opcode = hdr->opcode;
- 		afe->result.status = res->status;
-@@ -1151,6 +1292,11 @@
+@@ -1155,6 +1296,11 @@
  	pdata->param_id = param_id;
  	pdata->param_size = psize;
  
@@ -256,7 +256,7 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  	ret = afe_apr_send_pkt(afe, pkt, port, AFE_SVC_CMD_SET_PARAM);
  	if (ret)
  		dev_err(afe->dev, "AFE set params failed %d\n", ret);
-@@ -1165,11 +1311,11 @@
+@@ -1169,11 +1315,11 @@
  			       psize, port->token);
  }
  
@@ -271,7 +271,7 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  	struct q6afe *afe = port->afe;
  	struct apr_pkt *pkt;
  	u16 port_id = port->id;
-@@ -1193,18 +1339,26 @@
+@@ -1197,18 +1343,26 @@
  	pkt->hdr.src_port = 0;
  	pkt->hdr.dest_port = 0;
  	pkt->hdr.token = port->token;
@@ -301,7 +301,7 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  	if (ret)
  		dev_err(afe->dev, "AFE enable for port 0x%x failed %d\n",
  		       port_id, ret);
-@@ -1212,10 +1366,177 @@
+@@ -1216,10 +1370,177 @@
  	return ret;
  }
  
@@ -480,7 +480,7 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  				       AFE_PARAM_ID_LPAIF_CLK_CONFIG,
  				       AFE_MODULE_AUDIO_DEV_INTERFACE,
  				       sizeof(*cfg));
-@@ -1231,7 +1552,7 @@
+@@ -1235,7 +1556,7 @@
  static int q6afe_set_digital_codec_core_clock(struct q6afe_port *port,
  					      struct afe_digital_clk_cfg *cfg)
  {
@@ -489,7 +489,7 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  				       AFE_PARAM_ID_INT_DIGITAL_CDC_CLK_CONFIG,
  				       AFE_MODULE_AUDIO_DEV_INTERFACE,
  				       sizeof(*cfg));
-@@ -1306,10 +1627,19 @@
+@@ -1310,10 +1631,19 @@
  		break;
  	}
  
@@ -509,7 +509,7 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  /**
   * q6afe_port_stop() - Stop a afe port
   *
-@@ -1395,6 +1725,7 @@
+@@ -1399,6 +1729,7 @@
  			     struct q6afe_tdm_cfg *cfg)
  {
  	union afe_port_config *pcfg = &port->port_cfg;
@@ -517,7 +517,7 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  
  	pcfg->tdm_cfg.tdm_cfg_minor_version = AFE_API_VERSION_TDM_CONFIG;
  	pcfg->tdm_cfg.num_channels = cfg->num_channels;
-@@ -1404,19 +1735,53 @@
+@@ -1408,19 +1739,53 @@
  	pcfg->tdm_cfg.sync_mode = cfg->sync_mode;
  	pcfg->tdm_cfg.sync_src = cfg->sync_src;
  	pcfg->tdm_cfg.nslots_per_frame = cfg->nslots_per_frame;
@@ -575,7 +575,7 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  }
  EXPORT_SYMBOL_GPL(q6afe_tdm_port_prepare);
  
-@@ -1442,7 +1807,7 @@
+@@ -1446,7 +1811,7 @@
  
  	usb_dev.cfg_minor_version = AFE_API_MINOR_VERSION_USB_AUDIO_CONFIG;
  	usb_dev.dev_token = (cardidx << 16) | (pcmidx << 8);
@@ -584,7 +584,7 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  				      AFE_PARAM_ID_USB_AUDIO_DEV_PARAMS,
  				      AFE_MODULE_AUDIO_DEV_INTERFACE,
  				      sizeof(usb_dev));
-@@ -1471,7 +1836,7 @@
+@@ -1475,7 +1840,7 @@
  
  	lpcm_fmt.cfg_minor_version = AFE_API_MINOR_VERSION_USB_AUDIO_CONFIG;
  	lpcm_fmt.endian = pcfg->usb_cfg.endian;
@@ -593,7 +593,7 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  				      AFE_PARAM_ID_USB_AUDIO_DEV_LPCM_FMT,
  				      AFE_MODULE_AUDIO_DEV_INTERFACE, sizeof(lpcm_fmt));
  	if (ret) {
-@@ -1482,7 +1847,7 @@
+@@ -1486,7 +1851,7 @@
  
  	svc_int.cfg_minor_version = AFE_API_MINOR_VERSION_USB_AUDIO_CONFIG;
  	svc_int.svc_interval = pcfg->usb_cfg.service_interval;
@@ -602,7 +602,7 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  				      AFE_PARAM_ID_USB_AUDIO_SVC_INTERVAL,
  				      AFE_MODULE_AUDIO_DEV_INTERFACE, sizeof(svc_int));
  	if (ret)
-@@ -1699,6 +2064,111 @@
+@@ -1703,6 +2068,111 @@
  		dma_cfg->active_channels_mask = (1 << cfg->num_channels) - 1;
  }
  EXPORT_SYMBOL_GPL(q6afe_cdc_dma_port_prepare);
@@ -714,7 +714,7 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  /**
   * q6afe_port_start() - Start a afe port
   *
-@@ -1715,7 +2185,48 @@
+@@ -1719,7 +2189,48 @@
  	struct apr_pkt *pkt;
  	int pkt_size;
  
@@ -764,7 +764,7 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  				       AFE_MODULE_AUDIO_DEV_INTERFACE,
  				       sizeof(port->port_cfg));
  	if (ret) {
-@@ -1723,16 +2234,27 @@
+@@ -1727,16 +2238,27 @@
  			port_id, ret);
  		return ret;
  	}
@@ -794,7 +794,7 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  	}
  
  	pkt_size = APR_HDR_SIZE + sizeof(*start);
-@@ -1755,11 +2277,20 @@
+@@ -1759,11 +2281,20 @@
  	start->port_id = port_id;
  
  	ret = afe_apr_send_pkt(afe, pkt, port, AFE_PORT_CMD_DEVICE_START);
@@ -817,7 +817,7 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  }
  EXPORT_SYMBOL_GPL(q6afe_port_start);
  
-@@ -1772,22 +2303,28 @@
+@@ -1776,22 +2307,28 @@
   * Return: Will be an error pointer on error or a valid afe port
   * on success.
   */
@@ -852,7 +852,7 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  		return port;
  	}
  
-@@ -1853,7 +2390,7 @@
+@@ -1857,7 +2394,7 @@
  		cfg_type = AFE_PARAM_ID_USB_AUDIO_CONFIG;
  		break;
  	default:
@@ -861,12 +861,12 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  		return ERR_PTR(-EINVAL);
  	}
  
-@@ -1873,7 +2410,22 @@
+@@ -1877,7 +2414,22 @@
  		list_add_tail(&port->node, &afe->port_list);
  
  	return port;
 +}
- 
++
 +/**
 + * q6afe_port_get_from_id() - Get port instance from a port id
 + *
@@ -879,12 +879,12 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 +struct q6afe_port *q6afe_port_get_from_id(struct device *dev, int id)
 +{
 +	struct q6afe *afe = dev_get_drvdata(dev->parent);
-+
+ 
 +	return q6afe_port_alloc(afe, id);
  }
  EXPORT_SYMBOL_GPL(q6afe_port_get_from_id);
  
-@@ -1964,6 +2516,26 @@
+@@ -1970,6 +2522,26 @@
  {
  	struct q6afe *afe;
  	struct device *dev = &adev->dev;
@@ -911,7 +911,7 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  
  	afe = devm_kzalloc(dev, sizeof(*afe), GFP_KERNEL);
  	if (!afe)
-@@ -1978,6 +2550,7 @@
+@@ -1984,6 +2556,7 @@
  	spin_lock_init(&afe->port_list_lock);
  
  	dev_set_drvdata(dev, afe);
@@ -1166,7 +1166,7 @@ Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
  	} else if (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {
  		ret = q6asm_enc_cfg_blk_pcm_format_support(prtd->audio_client,
  							   prtd->stream_id,
-@@ -509,6 +514,21 @@
+@@ -508,6 +513,21 @@
  	case SNDRV_PCM_FORMAT_S24_LE:
  		prtd->bits_per_sample = 24;
  		break;

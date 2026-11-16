@@ -1,7 +1,7 @@
 From: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 Subject: [PATCH] sound: soc: qcom: add AFE calibration and custom topology support
 
-Applied to Linux 7.3.1.
+Applied to Linux 7.3.4.
 
 Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 

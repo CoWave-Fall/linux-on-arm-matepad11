@@ -1,6 +1,6 @@
 # 内核
 
-基于 Linux 7.3.1。`patches/` 中的补丁按编号顺序应用，`defconfig` 为
+基于 Linux 7.3.4。`patches/` 中的补丁按编号顺序应用，`defconfig` 为
 `arch/arm64/configs/dby-w09_defconfig` 的内容。
 
 ## 补丁
@@ -25,7 +25,7 @@
 
 `defconfig` 的关键项：
 
-- `CONFIG_LOCALVERSION="-loa"`，内核版本为 `7.3.1-loa`。
+- `CONFIG_LOCALVERSION="-loa"`，内核版本为 `7.3.4-loa`。
 - 触摸、显示、电源、无线与传感器驱动全部编入内核。
 - 音频服务（APR、QDSP6、WCD938x 与 SoundWire macro）与 Venus 解码
   编入内核，固件由根文件系统提供。

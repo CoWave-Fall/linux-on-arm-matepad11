@@ -1,7 +1,7 @@
 From: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 Subject: [PATCH] drm/msm/dsi/phy: allow a slave 7nm PHY to use its own PLL
 
-Applied to Linux 7.3.1.
+Applied to Linux 7.3.4.
 
 Signed-off-by: CoWave Fall <105500745+CoWave-Fall@users.noreply.github.com>
 
