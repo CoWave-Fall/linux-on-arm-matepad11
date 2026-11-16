@@ -1,6 +1,6 @@
 # 操作全流程
 
-更新时间：2026-11-16 21:41 +08:00
+更新时间：2026-11-16 22:22 +08:00
 
 本文从已解锁并完成备份的设备开始，依次完成 U-Boot 构建、recovery 刷写、
 SD 卡根文件系统、内核启动、系统配置与桌面安装。全程保留 HarmonyOS 的
@@ -573,7 +573,7 @@ systemctl --failed
 ```bash
 uname -a
 cat /sys/class/drm/card0-DSI-1/status
-cat /sys/class/backlight/rt8555/max_brightness
+cat /sys/class/backlight/rt8555-backlight/max_brightness
 cat /sys/class/power_supply/battery/capacity
 ip -4 addr show wlan0
 bluetoothctl show
